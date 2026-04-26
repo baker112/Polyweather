@@ -1,0 +1,281 @@
+"""CLI entry point: `we <command>`
+
+All commands are deterministic given their inputs.
+The single datetime.now() injection point is here; never call it in pipeline code.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import sys
+from datetime import date, datetime, timezone
+from typing import Annotated, Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+app = typer.Typer(name="we", help="Weather Edge — ensemble forecast → Polymarket edge CLI")
+ingest_app = typer.Typer(help="Ingest forecast or observation data")
+app.add_typer(ingest_app, name="ingest")
+
+_console = Console()
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+
+# ─── Ingest commands ──────────────────────────────────────────────────────────
+
+@ingest_app.command("forecasts")
+def ingest_forecasts(
+    station: Annotated[str, typer.Option("--station", "-s", help="ICAO station code")] = "EGLL",
+    init: Annotated[
+        Optional[str], typer.Option("--init", help="Init datetime ISO (e.g. 2026-04-25T12:00Z)")
+    ] = None,
+) -> None:
+    """Fetch ECMWF HRES+ENS and GEFS forecasts for a given init cycle."""
+    from weather_edge.config import get_station
+    from weather_edge.ingest import ecmwf, gefs
+    from weather_edge.store import parquet as store
+
+    now_utc = datetime.now(timezone.utc)
+    if init:
+        init_dt = datetime.fromisoformat(init.replace("Z", "+00:00"))
+    else:
+        from weather_edge.pipeline.lock import _most_recent_12z
+        init_dt = _most_recent_12z(now_utc)
+
+    cfg = get_station(station)
+    _console.print(f"Ingesting forecasts for [bold]{station}[/bold] init=[bold]{init_dt}[/bold]")
+
+    for model_name, fetch_fn in [("ecmwf", ecmwf.ingest_forecasts), ("gefs", gefs.ingest_forecasts)]:
+        try:
+            df = fetch_fn(init_dt, cfg)
+            df = df.with_columns([
+                __import__("polars").lit(cfg.icao).alias("station"),
+                __import__("polars").lit(init_dt.replace(tzinfo=timezone.utc)).alias("init_datetime"),
+            ])
+            path = store.write_forecasts(df, model_name, init_dt, station)
+            _console.print(f"  [green]{model_name}[/green]: {len(df)} rows → {path}")
+        except Exception as exc:
+            _console.print(f"  [red]{model_name} failed[/red]: {exc}")
+
+
+@ingest_app.command("observations")
+def ingest_observations(
+    station: Annotated[str, typer.Option("--station", "-s")] = "EGLL",
+    start: Annotated[str, typer.Option("--start", help="Start date YYYY-MM-DD")] = "",
+    end: Annotated[str, typer.Option("--end", help="End date YYYY-MM-DD")] = "",
+) -> None:
+    """Fetch METAR observations from Iowa Mesonet ASOS."""
+    from weather_edge.config import get_station
+    from weather_edge.ingest.metar import fetch_observations
+    from weather_edge.store import parquet as store
+
+    if not start or not end:
+        _console.print("[red]--start and --end are required[/red]")
+        raise typer.Exit(1)
+
+    start_d = date.fromisoformat(start)
+    end_d = date.fromisoformat(end)
+    cfg = get_station(station)
+
+    _console.print(f"Fetching observations for [bold]{station}[/bold] {start_d} → {end_d}")
+    df = asyncio.run(fetch_observations(cfg, start_d, end_d))
+    if df.is_empty():
+        _console.print("[yellow]No data returned[/yellow]")
+        return
+    path = store.write_observations(df, station)
+    _console.print(f"[green]{len(df)} rows[/green] → {path}")
+
+
+# ─── Fit EMOS ─────────────────────────────────────────────────────────────────
+
+@app.command("fit-emos")
+def fit_emos_cmd(
+    station: Annotated[str, typer.Option("--station", "-s")] = "EGLL",
+    lead: Annotated[int, typer.Option("--lead", help="Lead hours (24, 48, 72)")] = 24,
+    as_of: Annotated[
+        Optional[str], typer.Option("--as-of", help="Date YYYY-MM-DD (default: today)")
+    ] = None,
+) -> None:
+    """Fit EMOS parameters on the rolling 60-day training window."""
+    from weather_edge.postprocess.emos import assemble_training_pairs, fit_emos
+    from weather_edge.store import parquet as store
+
+    as_of_d = date.fromisoformat(as_of) if as_of else date.today()
+    _console.print(f"Fitting EMOS for [bold]{station}[/bold] lead=[bold]{lead}h[/bold] as_of={as_of_d}")
+
+    pairs = assemble_training_pairs(station, lead, as_of_d)
+    if not pairs:
+        _console.print("[red]No training pairs found — ingest observations first[/red]")
+        raise typer.Exit(1)
+
+    params = fit_emos(pairs, station, lead)
+    store.write_emos_params(params.model_dump(), station, lead, params.valid_from, model=None)
+
+    _console.print(f"[green]Fitted on {params.n_samples} samples[/green]")
+    _console.print(f"  a={params.a:.4f}  b={params.b:.4f}  c={params.c:.4f}  d={params.d:.4f}")
+    _console.print(f"  train CRPS: {params.train_crps:.4f}")
+
+
+@app.command("fit-emos-bma")
+def fit_emos_bma_cmd(
+    station: Annotated[str, typer.Option("--station", "-s")] = "EGLL",
+    lead: Annotated[int, typer.Option("--lead", help="Lead hours (24, 48, 72)")] = 24,
+    as_of: Annotated[
+        Optional[str], typer.Option("--as-of", help="Date YYYY-MM-DD (default: today)")
+    ] = None,
+) -> None:
+    """Fit per-model EMOS for BMA (Phase 2). Stores separate params for ecmwf and gefs."""
+    from weather_edge.postprocess.emos import fit_emos_per_model
+    from weather_edge.store import parquet as store
+
+    as_of_d = date.fromisoformat(as_of) if as_of else date.today()
+    _console.print(
+        f"Fitting per-model EMOS (BMA) for [bold]{station}[/bold] lead=[bold]{lead}h[/bold] as_of={as_of_d}"
+    )
+
+    model_params = fit_emos_per_model(station, lead, as_of_d)
+    if not model_params:
+        _console.print("[red]Insufficient per-model data — ingest more forecasts first[/red]")
+        raise typer.Exit(1)
+
+    for model_name, params in model_params.items():
+        store.write_emos_params(params.model_dump(), station, lead, params.valid_from, model=model_name)
+        _console.print(f"  [green]{model_name}[/green]: n={params.n_samples} CRPS={params.train_crps:.4f}  "
+                       f"a={params.a:.3f} b={params.b:.3f} c={params.c:.3f} d={params.d:.3f}")
+
+
+# ─── Lock picks ───────────────────────────────────────────────────────────────
+
+@app.command("lock")
+def lock_cmd(
+    station: Annotated[str, typer.Option("--station", "-s")] = "EGLL",
+    date_str: Annotated[
+        Optional[str], typer.Option("--date", help="Target date YYYY-MM-DD (default: tomorrow)")
+    ] = None,
+    all_stations: Annotated[
+        bool, typer.Option("--all-stations", help="Run for all configured stations")
+    ] = False,
+) -> None:
+    """Run the full pipeline and lock picks for the target date."""
+    from weather_edge.config import load_stations
+    from weather_edge.exceptions import AlreadyLockedError, IngestError
+    from weather_edge.pipeline.lock import lock_picks
+    import datetime as _dt
+
+    now_utc = datetime.now(timezone.utc)
+    target_date = (
+        date.fromisoformat(date_str) if date_str
+        else (now_utc + _dt.timedelta(days=1)).date()
+    )
+
+    stations_to_run = list(load_stations().keys()) if all_stations else [station]
+
+    for station_id in stations_to_run:
+        _console.print(f"Locking picks for [bold]{station_id}[/bold] date=[bold]{target_date}[/bold]")
+        try:
+            result = lock_picks(target_date, station_id, now_utc)
+        except AlreadyLockedError as exc:
+            _console.print(f"  [yellow]{exc}[/yellow]")
+            continue
+        except (IngestError, Exception) as exc:
+            _console.print(f"  [red]Pipeline failed: {exc}[/red]")
+            continue
+
+        mode = result.provenance.get("mode", "pooled")
+        _console.print(f"  μ={result.mu:.2f}°C  σ={result.sigma:.2f}°C  mode=[cyan]{mode}[/cyan]")
+
+        if result.picks:
+            table = Table(title=f"Locked Picks — {station_id}", show_header=True)
+            table.add_column("Bracket")
+            table.add_column("Side")
+            table.add_column("Model %", justify="right")
+            table.add_column("Market %", justify="right")
+            table.add_column("Edge", justify="right")
+            for pick in result.picks:
+                table.add_row(
+                    pick.bracket_label,
+                    pick.side,
+                    f"{pick.model_prob*100:.1f}",
+                    f"{pick.market_prob*100:.1f}",
+                    f"{pick.edge*100:+.1f}",
+                )
+            _console.print(table)
+        else:
+            _console.print(f"  [yellow]No edge — {result.no_edge_reason}[/yellow]")
+
+
+# ─── Backtest ─────────────────────────────────────────────────────────────────
+
+@app.command("backtest")
+def backtest_cmd(
+    station: Annotated[str, typer.Option("--station", "-s")] = "EGLL",
+    start: Annotated[str, typer.Option("--start")] = "",
+    end: Annotated[str, typer.Option("--end")] = "",
+) -> None:
+    """Replay historical dates through the full pipeline and score results."""
+    from weather_edge.pipeline.backtest import backtest
+
+    if not start or not end:
+        _console.print("[red]--start and --end are required[/red]")
+        raise typer.Exit(1)
+
+    start_d = date.fromisoformat(start)
+    end_d = date.fromisoformat(end)
+
+    _console.print(f"Backtesting [bold]{station}[/bold] {start_d} → {end_d}")
+    df = backtest(station, start_d, end_d)
+
+    if df.is_empty():
+        _console.print("[yellow]No results[/yellow]")
+        return
+
+    n_days = len(df)
+    n_picks = int(df.filter(__import__("polars").col("pick_label").is_not_null()).height)
+    mean_crps_val = df.drop_nulls(subset=["crps"])["crps"].mean()
+    _console.print(f"\n  Days: {n_days}  |  Picks: {n_picks}  |  Mean CRPS: {mean_crps_val:.4f}")
+
+
+# ─── Report ───────────────────────────────────────────────────────────────────
+
+@app.command("report")
+def report_cmd(
+    station: Annotated[str, typer.Option("--station", "-s")] = "EGLL",
+    start: Annotated[str, typer.Option("--start")] = "",
+    end: Annotated[Optional[str], typer.Option("--end")] = None,
+    output_dir: Annotated[Optional[str], typer.Option("--output-dir")] = None,
+) -> None:
+    """Generate calibration report: reliability diagram, PIT, Brier, P&L."""
+    from weather_edge.eval.brier import compute_report, plot_clv_distribution, plot_pnl_curve
+    from weather_edge.eval.calibration import plot_pit_histogram, plot_reliability_diagram
+
+    if not start:
+        _console.print("[red]--start is required[/red]")
+        raise typer.Exit(1)
+
+    start_d = date.fromisoformat(start)
+    end_d = date.fromisoformat(end) if end else date.today()
+
+    import os
+    odir = output_dir or "."
+
+    _console.print(f"Generating report for [bold]{station}[/bold] {start_d} → {end_d}")
+
+    summary = compute_report(station, start_d, end_d)
+    _console.print(summary)
+
+    plot_reliability_diagram(station, start_d, end_d,
+                             output_path=os.path.join(odir, f"{station}_reliability.png"))
+    plot_pit_histogram(station, start_d, end_d,
+                       output_path=os.path.join(odir, f"{station}_pit.png"))
+    plot_pnl_curve(station, start_d, end_d,
+                   output_path=os.path.join(odir, f"{station}_pnl.png"))
+    plot_clv_distribution(station, start_d, end_d,
+                          output_path=os.path.join(odir, f"{station}_clv.png"))
+
+    _console.print(f"[green]Plots saved to {odir}[/green]")
+
+
+if __name__ == "__main__":
+    app()

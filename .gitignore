@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.grib2
+*.grib
+*.idx
+data/
+logs/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.venv/
+venv/
+*.parquet

@@ -1,0 +1,49 @@
+EGLL:
+  name: London Heathrow
+  lat: 51.4775
+  lon: -0.4614
+  timezone: Europe/London
+  unit: celsius
+  market_slug_pattern: "highest-temperature-in-london-on-{date}"
+  resolution_field: "daily_max_metar_local"  # confirmed in docs/RESOLUTION.md after Phase 0
+  lock_time_utc: "18:00"
+
+EHAM:
+  name: Amsterdam Schiphol
+  lat: 52.3086
+  lon: 4.7639
+  timezone: Europe/Amsterdam
+  unit: celsius
+  market_slug_pattern: "highest-temperature-in-amsterdam-on-{date}"  # verify against live Polymarket
+  resolution_field: "daily_max_metar_local"  # pending Phase 0 verification
+  lock_time_utc: "18:00"
+
+EDDF:
+  name: Frankfurt Airport
+  lat: 50.0379
+  lon: 8.5622
+  timezone: Europe/Berlin
+  unit: celsius
+  market_slug_pattern: "highest-temperature-in-frankfurt-on-{date}"  # verify against live Polymarket
+  resolution_field: "daily_max_metar_local"  # pending Phase 0 verification
+  lock_time_utc: "18:00"
+
+LFPG:
+  name: Paris Charles de Gaulle
+  lat: 49.0097
+  lon: 2.5479
+  timezone: Europe/Paris
+  unit: celsius
+  market_slug_pattern: "highest-temperature-in-paris-on-{date}"  # verify against live Polymarket
+  resolution_field: "daily_max_metar_local"  # pending Phase 0 verification
+  lock_time_utc: "18:00"
+
+KJFK:
+  name: New York JFK
+  lat: 40.6413
+  lon: -73.7781
+  timezone: America/New_York
+  unit: celsius
+  market_slug_pattern: "highest-temperature-in-new-york-city-on-{date}"  # verify against live Polymarket
+  resolution_field: "daily_max_metar_local"  # pending Phase 0 verification
+  lock_time_utc: "18:00"

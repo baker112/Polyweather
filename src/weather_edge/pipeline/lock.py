@@ -1,0 +1,382 @@
+"""Main pipeline orchestrator.
+
+lock_picks(date, station, now_utc) → LockedPicks
+
+Stages:
+  1. ingest_forecasts  (ECMWF + GEFS)
+  2. ingest_observations  (Iowa Mesonet, used for EMOS training)
+  3. fit_emos / load cached EmosParams
+  4. predict_pdf
+  5. fetch_market
+  6. compute_edges → lock_picks
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
+
+import polars as pl
+
+from weather_edge.config import StationConfig, get_station, load_thresholds
+from weather_edge.exceptions import AlreadyLockedError, EmosError, IngestError, MarketError
+from weather_edge.models import (
+    BracketSpec,
+    Candidate,
+    EmosParams,
+    LockedPicks,
+    MarketSnapshot,
+    PredictedDistribution,
+)
+from weather_edge.postprocess.emos import (
+    assemble_training_pairs,
+    bucket_lead_hours,
+    compute_brackets,
+    fit_emos,
+    fit_emos_per_model,
+    predict_pdf,
+)
+from weather_edge.store import parquet as store
+
+_logger = logging.getLogger(__name__)
+
+_DEFAULT_LEAD_HOURS = 24  # primary lead bucket for the 12z run targeting D+1
+
+
+def lock_picks(
+    target_date: date,
+    station_id: str,
+    now_utc: datetime,
+) -> LockedPicks:
+    """Orchestrate stages 1-6 and write immutable picks file.
+
+    Raises AlreadyLockedError if picks already exist for this (date, station).
+    """
+    from weather_edge.logging import log_event
+
+    if store.picks_exist(station_id, target_date):
+        raise AlreadyLockedError(f"Picks already locked for {station_id} on {target_date}")
+
+    station = get_station(station_id)
+    t0 = time.monotonic()
+
+    provenance: dict[str, Any] = {}
+
+    # ── Stage 1: Ingest forecasts ─────────────────────────────────────────────
+    init_dt = _most_recent_12z(now_utc)
+    provenance["init_dt"] = init_dt.isoformat()
+    forecast_dfs: list[pl.DataFrame] = []
+
+    try:
+        from weather_edge.ingest import ecmwf
+        df_ecmwf = _load_or_fetch_forecasts("ecmwf", init_dt, station, ecmwf.ingest_forecasts)
+        forecast_dfs.append(df_ecmwf)
+        provenance["ecmwf_members"] = int(df_ecmwf.filter(pl.col("valid_date") == target_date).height)
+    except (IngestError, Exception) as exc:
+        _logger.warning("ECMWF ingest failed: %s", exc)
+        provenance["ecmwf_error"] = str(exc)
+
+    try:
+        from weather_edge.ingest import gefs
+        df_gefs = _load_or_fetch_forecasts("gefs", init_dt, station, gefs.ingest_forecasts)
+        forecast_dfs.append(df_gefs)
+        provenance["gefs_members"] = int(df_gefs.filter(pl.col("valid_date") == target_date).height)
+    except (IngestError, Exception) as exc:
+        _logger.warning("GEFS ingest failed: %s", exc)
+        provenance["gefs_error"] = str(exc)
+
+    if not forecast_dfs:
+        raise IngestError("All forecast sources failed")
+
+    all_forecasts = pl.concat(forecast_dfs)
+    lead_hours = bucket_lead_hours(
+        int((datetime(target_date.year, target_date.month, target_date.day, 12, tzinfo=timezone.utc)
+             - init_dt.replace(tzinfo=timezone.utc)).total_seconds() // 3600)
+    )
+
+    target_fcs = all_forecasts.filter(
+        (pl.col("valid_date") == target_date) & (pl.col("lead_hours") == lead_hours)
+    )
+    ensemble_values = target_fcs["daily_max_c"].to_list()
+    if not ensemble_values:
+        raise IngestError(f"No forecast values for {target_date} at lead={lead_hours}h")
+
+    provenance["ensemble_size"] = len(ensemble_values)
+    log_event("ingest_forecasts", station_id, "ok",
+              (time.monotonic() - t0) * 1000, ensemble_size=len(ensemble_values))
+
+    # ── Stage 3+4: EMOS fit + predict PDF (BMA mixture when per-model params exist) ──
+    t1 = time.monotonic()
+
+    # Separate per-model forecast values for BMA path
+    model_values: dict[str, list[float]] = {}
+    for _model in ("ecmwf", "gefs"):
+        _mdf = all_forecasts.filter(
+            (pl.col("model") == _model)
+            & (pl.col("valid_date") == target_date)
+            & (pl.col("lead_hours") == lead_hours)
+        )
+        if not _mdf.is_empty():
+            model_values[_model] = _mdf["daily_max_c"].to_list()
+
+    dist = _stage3_4(
+        station_id, lead_hours, now_utc, target_date, ensemble_values, model_values, provenance
+    )
+    log_event("fit_emos", station_id, "ok",
+              (time.monotonic() - t1) * 1000,
+              mode=provenance.get("mode", "pooled"),
+              **{k: v for k, v in provenance.items() if k.startswith("emos")})
+
+    store.write_prediction(
+        {"mu": dist.mu, "sigma": dist.sigma, "station": station_id, "date": str(target_date)},
+        station_id, target_date,
+    )
+    provenance["mu"] = dist.mu
+    provenance["sigma"] = dist.sigma
+
+    # ── Stage 5: Fetch market ─────────────────────────────────────────────────
+    t2 = time.monotonic()
+    slug = station.market_slug_pattern.format(date=target_date.strftime("%Y-%m-%d"))
+    try:
+        snapshot = asyncio.run(_fetch_and_persist_market(slug, station_id, target_date))
+    except (MarketError, Exception) as exc:
+        _logger.warning("Market fetch failed: %s", exc)
+        log_event("fetch_market", station_id, "error",
+                  (time.monotonic() - t2) * 1000, error=str(exc))
+        return _no_pick(target_date, station_id, now_utc, dist, f"market_error: {exc}", provenance)
+
+    log_event("fetch_market", station_id, "ok",
+              (time.monotonic() - t2) * 1000, implied_sum=snapshot.implied_sum)
+
+    # ── Stage 6: Compute edges ────────────────────────────────────────────────
+    brackets = [BracketSpec(label=o.label, low=o.low, high=o.high) for o in snapshot.outcomes]
+    bracket_probs = compute_brackets(dist, brackets)
+    candidates = compute_edges(bracket_probs, snapshot, now_utc)
+
+    candidates.sort(key=lambda c: abs(c.edge), reverse=True)
+    picks = candidates[:1]  # Phase 1: max 1 pick per city per day
+
+    no_edge_reason: str | None = None
+    if not picks:
+        failing = _summarise_failures(candidates if candidates else [], bracket_probs, snapshot)
+        no_edge_reason = f"no_edge — gates: {failing}"
+        _logger.info("%s %s: %s", station_id, target_date, no_edge_reason)
+
+    result = LockedPicks(
+        date=target_date,
+        station=station_id,
+        locked_at=now_utc,
+        mu=dist.mu,
+        sigma=dist.sigma,
+        picks=picks,
+        no_edge_reason=no_edge_reason,
+        provenance=provenance,
+    )
+
+    store.write_picks(result.model_dump(), station_id, target_date)
+    log_event("lock_picks", station_id, "ok",
+              (time.monotonic() - t0) * 1000, n_picks=len(picks))
+    return result
+
+
+# ─── Edge detection ───────────────────────────────────────────────────────────
+
+def compute_edges(
+    bracket_probs: list[Any],  # list[BracketProb]
+    snapshot: MarketSnapshot,
+    now_utc: datetime,
+) -> list[Candidate]:
+    thresholds = load_thresholds()
+    freshness_cutoff = now_utc - timedelta(minutes=thresholds.market_freshness_minutes)
+
+    outcome_map = {o.label: o for o in snapshot.outcomes}
+    candidates: list[Candidate] = []
+
+    for bp in bracket_probs:
+        if bp.label not in outcome_map:
+            continue
+        outcome = outcome_map[bp.label]
+
+        edge = bp.model_prob - outcome.mid
+        gates = {
+            "min_edge": abs(edge) >= thresholds.min_edge,
+            "max_spread": outcome.spread <= thresholds.max_spread,
+            "min_liquidity": outcome.liquidity >= thresholds.min_liquidity,
+            "max_raw_prob": bp.model_prob <= thresholds.max_raw_prob,
+            "market_fresh": snapshot.fetched_at >= freshness_cutoff,
+        }
+
+        candidates.append(Candidate(
+            bracket_label=bp.label,
+            low=bp.low,
+            high=bp.high,
+            model_prob=bp.model_prob,
+            market_prob=outcome.mid,
+            edge=edge,
+            side="YES" if edge > 0 else "NO",
+            spread=outcome.spread,
+            liquidity=outcome.liquidity,
+            gates=gates,
+            raw_values={
+                "edge": edge,
+                "spread": outcome.spread,
+                "liquidity": outcome.liquidity,
+                "model_prob": bp.model_prob,
+            },
+        ))
+
+    return [c for c in candidates if all(c.gates.values())]
+
+
+# ─── Stage 3+4 helper — pooled EMOS or BMA mixture ───────────────────────────
+
+def _stage3_4(
+    station_id: str,
+    lead_hours: int,
+    now_utc: datetime,
+    target_date: date,
+    ensemble_values: list[float],
+    model_values: dict[str, list[float]],
+    provenance: dict[str, Any],
+) -> Any:
+    """Return a PredictedDistribution (pooled) or BMAMixture (per-model).
+
+    BMA path: used when per-model EMOS params exist for ≥2 models.
+    Falls back to pooled EMOS if per-model params are missing or insufficient.
+    """
+    # Attempt to load per-model EMOS params (Phase 2 path)
+    per_model: dict[str, EmosParams] = {}
+    for model in ("ecmwf", "gefs"):
+        raw = store.read_emos_params(station_id, lead_hours, now_utc, model=model)
+        if raw is not None and model in model_values and len(model_values[model]) >= 3:
+            per_model[model] = EmosParams(**raw)
+
+    if len(per_model) >= 2:
+        from weather_edge.postprocess.bma import (
+            compute_bma_weights,
+            predict_pdf_bma,
+            rolling_model_crps,
+        )
+        model_crps = rolling_model_crps(station_id, lead_hours, now_utc.date())
+        # Equal weights if CRPS history is unavailable (first few days after setup)
+        weights = (
+            compute_bma_weights(model_crps)
+            if model_crps
+            else {m: 1.0 / len(per_model) for m in per_model}
+        )
+        model_data = [
+            (model, model_values[model], params)
+            for model, params in per_model.items()
+        ]
+        provenance["mode"] = "bma"
+        provenance["bma_weights"] = {m: round(w, 4) for m, w in weights.items()}
+        _logger.info("Stage 3+4: BMA mixture (%d models, weights=%s)", len(per_model), weights)
+        return predict_pdf_bma(model_data, weights, target_date, station_id, lead_hours)
+
+    # Pooled fallback (Phase 1 path)
+    emos_params = _get_pooled_emos_params(station_id, lead_hours, now_utc)
+    provenance["mode"] = "pooled"
+    provenance["emos_n_samples"] = emos_params.n_samples
+    provenance["emos_train_crps"] = emos_params.train_crps
+    _logger.info("Stage 3+4: pooled EMOS (n=%d)", emos_params.n_samples)
+    return predict_pdf(ensemble_values, emos_params, target_date)
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _most_recent_12z(now_utc: datetime) -> datetime:
+    """Return the most recent 12z init cycle before now_utc."""
+    today_12z = now_utc.replace(hour=12, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+    if now_utc.replace(tzinfo=timezone.utc) >= today_12z:
+        return today_12z
+    yesterday = now_utc - timedelta(days=1)
+    return yesterday.replace(hour=12, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+
+
+def _load_or_fetch_forecasts(
+    model: str,
+    init_dt: datetime,
+    station: StationConfig,
+    fetch_fn: Any,
+) -> pl.DataFrame:
+    cached = store.read_forecasts(model, init_dt, station.icao)
+    if cached is not None:
+        _logger.info("%s forecasts: loaded from cache", model)
+        return cached
+    df = fetch_fn(init_dt, station)
+    df = df.with_columns([
+        pl.lit(station.icao).alias("station"),
+        pl.lit(init_dt.replace(tzinfo=timezone.utc)).alias("init_datetime"),
+    ])
+    store.write_forecasts(df, model, init_dt, station.icao)
+    return df
+
+
+def _get_pooled_emos_params(station_id: str, lead_hours: int, now_utc: datetime) -> EmosParams:
+    """Load or fit pooled (all-model) EMOS params."""
+    raw = store.read_emos_params(station_id, lead_hours, now_utc, model=None)
+    if raw is not None:
+        return EmosParams(**raw)
+    pairs = assemble_training_pairs(station_id, lead_hours, now_utc.date())
+    if not pairs:
+        raise EmosError(f"No training data for {station_id} lead={lead_hours}h")
+    params = fit_emos(pairs, station_id, lead_hours)
+    store.write_emos_params(params.model_dump(), station_id, lead_hours, params.valid_from, model=None)
+    return params
+
+
+async def _fetch_and_persist_market(
+    slug: str, station_id: str, target_date: date
+) -> MarketSnapshot:
+    from weather_edge.market.polymarket import fetch_market
+    snapshot = await fetch_market(slug, station_id, target_date)
+    store.write_market_snapshot(snapshot.model_dump(), station_id, target_date)
+    return snapshot
+
+
+def _no_pick(
+    target_date: date,
+    station_id: str,
+    now_utc: datetime,
+    dist: PredictedDistribution,
+    reason: str,
+    provenance: dict[str, Any],
+) -> LockedPicks:
+    result = LockedPicks(
+        date=target_date,
+        station=station_id,
+        locked_at=now_utc,
+        mu=dist.mu,
+        sigma=dist.sigma,
+        picks=[],
+        no_edge_reason=reason,
+        provenance=provenance,
+    )
+    store.write_picks(result.model_dump(), station_id, target_date)
+    return result
+
+
+def _summarise_failures(
+    all_candidates: list[Candidate],
+    bracket_probs: list[Any],
+    snapshot: MarketSnapshot,
+) -> str:
+    thresholds = load_thresholds()
+    outcome_map = {o.label: o for o in snapshot.outcomes}
+    failures: list[str] = []
+
+    for bp in bracket_probs:
+        if bp.label not in outcome_map:
+            continue
+        outcome = outcome_map[bp.label]
+        edge = bp.model_prob - outcome.mid
+        if abs(edge) < thresholds.min_edge:
+            failures.append(f"{bp.label}: edge={edge:+.3f}<{thresholds.min_edge}")
+        if outcome.spread > thresholds.max_spread:
+            failures.append(f"{bp.label}: spread={outcome.spread:.3f}>{thresholds.max_spread}")
+        if outcome.liquidity < thresholds.min_liquidity:
+            failures.append(f"{bp.label}: liq=${outcome.liquidity:.0f}<${thresholds.min_liquidity:.0f}")
+
+    return "; ".join(failures) if failures else "all edges below threshold"
