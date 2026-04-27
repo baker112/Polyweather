@@ -332,12 +332,13 @@ def _stage3_4(
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _most_recent_12z(now_utc: datetime) -> datetime:
-    """Return the most recent 12z init cycle before now_utc."""
-    today_12z = now_utc.replace(hour=12, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-    if now_utc.replace(tzinfo=timezone.utc) >= today_12z:
+    """Return the most recent 12z init cycle that is available (~7h publication lag)."""
+    now_utc = now_utc.replace(tzinfo=timezone.utc)
+    today_12z = now_utc.replace(hour=12, minute=0, second=0, microsecond=0)
+    if now_utc >= today_12z + timedelta(hours=7):
         return today_12z
     yesterday = now_utc - timedelta(days=1)
-    return yesterday.replace(hour=12, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+    return yesterday.replace(hour=12, minute=0, second=0, microsecond=0)
 
 
 def _load_or_fetch_forecasts(
