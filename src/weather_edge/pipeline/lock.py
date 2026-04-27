@@ -161,7 +161,7 @@ def lock_picks(
     candidates = compute_edges(bracket_probs, snapshot, now_utc)
 
     candidates.sort(key=lambda c: abs(c.edge), reverse=True)
-    picks = candidates[:1]  # Phase 1: max 1 pick per city per day
+    picks = candidates  # all qualifying brackets
 
     no_edge_reason: str | None = None
     if not picks:

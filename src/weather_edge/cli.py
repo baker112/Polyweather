@@ -31,8 +31,14 @@ def ingest_forecasts(
     init: Annotated[
         Optional[str], typer.Option("--init", help="Init datetime ISO (e.g. 2026-04-25T12:00Z)")
     ] = None,
+    step: Annotated[
+        Optional[int], typer.Option("--step", help="Single GEFS step to download (hours). Omit for all steps.")
+    ] = None,
 ) -> None:
-    """Fetch ECMWF HRES+ENS and GEFS forecasts for a given init cycle."""
+    """Fetch ECMWF HRES+ENS and GEFS forecasts for a given init cycle.
+
+    Use --step 24 for a fast single-step GEFS download (~30s vs ~15min for all steps).
+    """
     from weather_edge.config import get_station
     from weather_edge.ingest import ecmwf, gefs
     from weather_edge.store import parquet as store
@@ -45,11 +51,15 @@ def ingest_forecasts(
         init_dt = _most_recent_12z(now_utc)
 
     cfg = get_station(station)
+    gefs_steps = [step] if step is not None else None
     _console.print(f"Ingesting forecasts for [bold]{station}[/bold] init=[bold]{init_dt}[/bold]")
 
     for model_name, fetch_fn in [("ecmwf", ecmwf.ingest_forecasts), ("gefs", gefs.ingest_forecasts)]:
         try:
-            df = fetch_fn(init_dt, cfg)
+            if model_name == "gefs" and gefs_steps is not None:
+                df = fetch_fn(init_dt, cfg, steps=gefs_steps)
+            else:
+                df = fetch_fn(init_dt, cfg)
             df = df.with_columns([
                 __import__("polars").lit(cfg.icao).alias("station"),
                 __import__("polars").lit(init_dt.replace(tzinfo=timezone.utc)).alias("init_datetime"),
@@ -128,13 +138,16 @@ def backfill_cmd(
     while current <= end_d:
         init_dt = _init_datetime_for(current, lead)
 
-        # Skip if already cached
+        # Skip if data for this specific valid_date already exists in the parquet
         existing = store.read_forecasts("gefs", init_dt, station)
         if existing is not None:
-            _console.print(f"  [dim]{current}  init={init_dt.strftime('%Y-%m-%dT%HZ')}  (cached)[/dim]")
-            n_skipped += 1
-            current += _dt.timedelta(days=1)
-            continue
+            import polars as _pl
+            has_date = existing.filter(_pl.col("valid_date") == current).height > 0
+            if has_date:
+                _console.print(f"  [dim]{current}  init={init_dt.strftime('%Y-%m-%dT%HZ')}  (cached)[/dim]")
+                n_skipped += 1
+                current += _dt.timedelta(days=1)
+                continue
 
         _console.print(f"  {current}  init={init_dt.strftime('%Y-%m-%dT%HZ')} ... ", end="")
         try:
@@ -379,6 +392,68 @@ def report_cmd(
                           output_path=os.path.join(odir, f"{station}_clv.png"))
 
     _console.print(f"[green]Plots saved to {odir}[/green]")
+
+
+# ─── Resolve ──────────────────────────────────────────────────────────────────
+
+@app.command("resolve")
+def resolve_cmd(
+    station: Annotated[str, typer.Option("--station", "-s")] = "EGLC",
+    date_str: Annotated[Optional[str], typer.Option("--date", help="Date YYYY-MM-DD")] = None,
+    start: Annotated[Optional[str], typer.Option("--start")] = None,
+    end: Annotated[Optional[str], typer.Option("--end")] = None,
+    force: Annotated[bool, typer.Option("--force", help="Re-fetch even if already resolved")] = False,
+) -> None:
+    """Fetch resolved market outcome and compute P&L against locked picks."""
+    from weather_edge.pipeline.resolve import resolve_date, resolve_range
+    import datetime as _dt
+
+    if date_str:
+        dates = [date.fromisoformat(date_str)]
+    elif start:
+        start_d = date.fromisoformat(start)
+        end_d = date.fromisoformat(end) if end else date.today()
+        from datetime import timedelta
+        dates = []
+        cur = start_d
+        while cur <= end_d:
+            dates.append(cur)
+            cur += _dt.timedelta(days=1)
+    else:
+        import datetime as _dt2
+        dates = [(_dt2.datetime.now(timezone.utc) - _dt.timedelta(days=1)).date()]
+
+    for d in dates:
+        import asyncio as _asyncio
+        rec = _asyncio.run(resolve_date(station, d, force=force))
+        if not rec["resolved"]:
+            _console.print(f"  {d}: [yellow]not resolved yet[/yellow]")
+            continue
+        pnl = rec["total_pnl_per_unit"]
+        color = "green" if pnl >= 0 else "red"
+        _console.print(f"  {d}: resolved=[bold]{rec['resolved_label']}[/bold]  P&L=[{color}]{pnl:+.4f}[/{color}] per unit")
+        for p in rec.get("picks_pnl", []):
+            icon = "+" if p["correct"] else "-"
+            _console.print(f"    {icon} {p['bracket_label']} {p['side']} @ {p['entry_price']:.3f} -> pnl={p['pnl_per_unit']:+.4f}")
+
+
+# ─── Scheduler ────────────────────────────────────────────────────────────────
+
+@app.command("scheduler")
+def scheduler_cmd(
+    stations: Annotated[Optional[str], typer.Option("--stations", help="Comma-separated station list")] = "EGLC",
+) -> None:
+    """Start the daily pipeline scheduler (blocking). Runs ingest/lock/resolve automatically."""
+    from weather_edge.pipeline.scheduler import start as start_scheduler
+
+    station_list = [s.strip() for s in (stations or "EGLC").split(",")]
+    _console.print(f"Starting scheduler for stations: [bold]{', '.join(station_list)}[/bold]")
+    _console.print("  17:30z - ingest forecasts")
+    _console.print("  18:00z - lock picks for D+1")
+    _console.print("  02:00z - ingest observations + resolve yesterday")
+    _console.print("  Sun 03:00z - re-fit EMOS + QRF")
+    _console.print("[yellow]Press Ctrl+C to stop[/yellow]")
+    start_scheduler(station_list)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,9 @@ def write_forecasts(df: pl.DataFrame, model: str, init_dt: datetime, station: st
         / f"init_hour={hour_str}"
         / f"station={station}"
     ) / "data.parquet"
+    if path.exists():
+        existing = pl.read_parquet(path)
+        df = pl.concat([existing, df]).unique(subset=["member_id", "valid_date"], keep="last").sort("valid_date")
     df.write_parquet(path)
     return path
 
@@ -159,6 +162,51 @@ def write_picks(record: dict[str, Any], station: str, target_date: date) -> Path
     with open(path, "w") as f:
         json.dump(record, f, default=str, indent=2)
     return path
+
+
+def read_picks(station: str, target_date: date) -> dict[str, Any] | None:
+    path = _DATA_DIR / "picks" / f"date={target_date}" / f"station={station}" / "picks.json"
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def read_all_picks(station: str) -> list[dict[str, Any]]:
+    base = _DATA_DIR / "picks"
+    records = []
+    for p in sorted(base.glob(f"date=*/station={station}/picks.json")):
+        with open(p) as f:
+            records.append(json.load(f))
+    return records
+
+
+# ─── Resolutions ──────────────────────────────────────────────────────────────
+
+def write_resolution(record: dict[str, Any], station: str, target_date: date) -> Path:
+    path = _ensure(_DATA_DIR / "resolutions" / f"station={station}" / f"date={target_date}") / "resolution.json"
+    with open(path, "w") as f:
+        json.dump(record, f, default=str, indent=2)
+    return path
+
+
+def read_resolution(station: str, target_date: date) -> dict[str, Any] | None:
+    path = _DATA_DIR / "resolutions" / f"station={station}" / f"date={target_date}" / "resolution.json"
+    if not path.exists():
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def read_all_resolutions(station: str) -> list[dict[str, Any]]:
+    base = _DATA_DIR / "resolutions" / f"station={station}"
+    if not base.exists():
+        return []
+    records = []
+    for p in sorted(base.glob("date=*/resolution.json")):
+        with open(p) as f:
+            records.append(json.load(f))
+    return records
 
 
 # ─── Backtest results ─────────────────────────────────────────────────────────

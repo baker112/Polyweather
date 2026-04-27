@@ -92,6 +92,6 @@ class LockedPicks(BaseModel):
     locked_at: datetime
     mu: float
     sigma: float
-    picks: list[Candidate]  # at most 1 in Phase 1
+    picks: list[Candidate]
     no_edge_reason: str | None
     provenance: dict[str, Any]
