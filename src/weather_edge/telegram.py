@@ -41,8 +41,12 @@ def send(text: str) -> None:
         _logger.warning("Telegram send failed: %s", exc)
 
 
-def start_command_listener(get_status: Callable[[], str]) -> None:
-    """Start a daemon thread that answers /status commands sent to the bot."""
+def start_command_listener(handlers: dict[str, Callable[[], str]]) -> None:
+    """Start a daemon thread that dispatches bot commands to handler functions.
+
+    handlers: mapping of command string (e.g. "/status") to a zero-arg callable
+    that returns the reply text.
+    """
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         return
@@ -61,16 +65,21 @@ def start_command_listener(get_status: Callable[[], str]) -> None:
                     offset = update["update_id"] + 1
                     msg = update.get("message", {})
                     cmd = msg.get("text", "").strip().lower().split("@")[0]
-                    if cmd == "/status":
+                    if cmd in handlers:
                         chat = msg["chat"]["id"]
+                        try:
+                            reply = handlers[cmd]()
+                        except Exception as exc:
+                            reply = f"Error running {cmd}: {exc}"
                         httpx.post(
                             f"https://api.telegram.org/bot{token}/sendMessage",
-                            json={"chat_id": chat, "text": get_status(), "parse_mode": "HTML"},
+                            json={"chat_id": chat, "text": reply, "parse_mode": "HTML"},
                             timeout=10,
                         )
             except Exception as exc:
                 _logger.warning("Telegram listener error: %s", exc)
                 time.sleep(5)
 
+    cmds = ", ".join(handlers)
     threading.Thread(target=_listen, daemon=True, name="telegram-listener").start()
-    _logger.info("Telegram /status listener started")
+    _logger.info("Telegram command listener started — commands: %s", cmds)

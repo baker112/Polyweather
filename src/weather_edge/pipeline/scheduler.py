@@ -137,6 +137,78 @@ def _resolve_and_observe_job(station_id: str) -> None:
         _tg.send(f"Resolution FAILED: {station_id} {yesterday}\n{exc}")
 
 
+def _execute_job(station_id: str) -> None:
+    """Place orders for tomorrow's locked picks. Dry-run unless LIVE_TRADING=true."""
+    import asyncio
+    import os
+    from datetime import timedelta
+
+    from weather_edge.config import get_station
+    from weather_edge.execution import bankroll as br
+    from weather_edge.execution.polymarket_exec import MIN_ORDER_USDC, place_order, save_execution
+    from weather_edge.market.polymarket import fetch_market
+    from weather_edge.models import LockedPicks, MarketSnapshot
+    from weather_edge.store import parquet as store
+
+    dry_run = os.getenv("LIVE_TRADING", "false").lower() != "true"
+    now_utc = datetime.now(timezone.utc)
+    target_date = (now_utc + timedelta(days=1)).date()
+
+    picks_data = store.read_picks(station_id, target_date)
+    if not picks_data or not picks_data.get("picks"):
+        _logger.info("No picks to execute for %s %s", station_id, target_date)
+        return
+
+    locked = LockedPicks(**picks_data)
+
+    try:
+        bankroll = br.load()
+    except FileNotFoundError:
+        _tg.send(f"Execute FAILED {station_id}: bankroll not initialised. Run: we init-bankroll --usdc <amount>")
+        return
+
+    avail = br.available(bankroll)
+    cfg = get_station(station_id)
+    slug = cfg.market_slug_pattern.format(
+        date=target_date.strftime("%Y-%m-%d"),
+        month_lower=target_date.strftime("%B").lower(),
+        day=target_date.day,
+        year=target_date.year,
+    )
+
+    try:
+        snapshot = asyncio.run(fetch_market(slug, station_id, target_date))
+        store.write_market_snapshot(snapshot.model_dump(), station_id, target_date)
+    except Exception as exc:
+        _tg.send(f"Execute FAILED {station_id}: market fetch error\n{exc}")
+        return
+
+    outcome_map = {o.label: o for o in snapshot.outcomes}
+    records = []
+    total_staked = 0.0
+
+    for pick in locked.picks:
+        outcome = outcome_map.get(pick.bracket_label)
+        if outcome is None:
+            continue
+        usdc_stake = round(pick.kelly_fraction * avail, 2)
+        if usdc_stake < MIN_ORDER_USDC:
+            _logger.info("Skipping %s: stake $%.2f below minimum", pick.bracket_label, usdc_stake)
+            continue
+        try:
+            rec = place_order(pick, outcome, usdc_stake, dry_run=dry_run)
+            records.append(rec)
+            total_staked += usdc_stake
+        except Exception as exc:
+            _logger.error("Order failed %s %s: %s", station_id, pick.bracket_label, exc)
+            _tg.send(f"Order FAILED {station_id} {pick.bracket_label}: {exc}")
+
+    if records and not dry_run:
+        br.reserve(bankroll, total_staked)
+    if records:
+        save_execution(station_id, target_date, records)
+
+
 def _closing_snapshot_job(station_id: str) -> None:
     """Snapshot the market price at ~01:00z for closing-line value tracking."""
     import asyncio
@@ -213,6 +285,10 @@ def start(stations: list[str]) -> None:
             args=[station_id], id=f"lock_{station_id}", name=f"Lock {station_id}",
         )
         sched.add_job(
+            _execute_job, CronTrigger(hour=18, minute=5),
+            args=[station_id], id=f"execute_{station_id}", name=f"Execute {station_id}",
+        )
+        sched.add_job(
             _closing_snapshot_job, CronTrigger(hour=1, minute=0),
             args=[station_id], id=f"clv_{station_id}", name=f"CLV snapshot {station_id}",
         )
@@ -228,9 +304,12 @@ def start(stations: list[str]) -> None:
     _logger.info("Scheduler started for stations: %s", stations)
     _logger.info("Jobs: ingest@17:30z, lock@18:00z, resolve+obs@02:00z, refit@Sun03:00z")
 
+    import os as _os
+
     def _status() -> str:
         now = datetime.now(timezone.utc)
-        lines = [f"Scheduler running — {now.strftime('%Y-%m-%d %H:%M')} UTC", ""]
+        live = _os.getenv("LIVE_TRADING", "false").lower() == "true"
+        lines = [f"Scheduler running — {now.strftime('%Y-%m-%d %H:%M')} UTC", f"Mode: {'LIVE' if live else 'dry-run'}", ""]
         for job in sched.get_jobs():
             next_run = job.next_run_time
             if next_run:
@@ -241,6 +320,81 @@ def start(stations: list[str]) -> None:
                 lines.append(f"{job.name}: not scheduled")
         return "\n".join(lines)
 
-    _tg.start_command_listener(_status)
-    _tg.send(f"Scheduler started — stations: {', '.join(stations)}\nSend /status to check next job times.")
+    def _picks() -> str:
+        from datetime import timedelta
+        from weather_edge.models import LockedPicks
+        from weather_edge.store import parquet as store
+        now = datetime.now(timezone.utc)
+        target_date = (now + timedelta(days=1)).date()
+        lines = [f"Picks for {target_date}:"]
+        found = False
+        for sid in stations:
+            data = store.read_picks(sid, target_date)
+            if data is None:
+                lines.append(f"  {sid}: not locked yet")
+                continue
+            locked = LockedPicks(**data)
+            if locked.picks:
+                for p in locked.picks:
+                    lines.append(f"  {sid} {p.side} {p.bracket_label}  edge={p.edge:+.3f}  kelly={p.kelly_fraction*100:.1f}%")
+                found = True
+            else:
+                lines.append(f"  {sid}: no edge ({locked.no_edge_reason or 'all below threshold'})")
+        return "\n".join(lines)
+
+    def _bankroll() -> str:
+        from weather_edge.execution import bankroll as br
+        try:
+            b = br.load()
+            avail = br.available(b)
+            return (
+                f"Bankroll\n"
+                f"  Current: ${b['current_usdc']:.2f}\n"
+                f"  Reserved: ${b.get('reserved_usdc', 0):.2f}\n"
+                f"  Available: ${avail:.2f}\n"
+                f"  Total P&L: ${b.get('total_pnl', 0):+.2f}\n"
+                f"  Trades: {b.get('n_trades', 0)}"
+            )
+        except FileNotFoundError:
+            return "Bankroll not initialised. Run: we init-bankroll --usdc <amount>"
+
+    def _pnl() -> str:
+        from datetime import timedelta
+        from weather_edge.execution.polymarket_exec import load_executions
+        now = datetime.now(timezone.utc)
+        lines = ["P&L last 7 days:"]
+        total_pnl = 0.0
+        total_staked = 0.0
+        n = 0
+        for days_ago in range(1, 8):
+            d = (now - timedelta(days=days_ago)).date()
+            for sid in stations:
+                for e in load_executions(sid, d):
+                    if e.get("dry_run"):
+                        continue
+                    stake = float(e.get("usdc_stake", 0))
+                    pnl = float(e.get("pnl", 0))
+                    total_staked += stake
+                    total_pnl += pnl
+                    n += 1
+        lines.append(f"  Trades: {n}")
+        lines.append(f"  Staked: ${total_staked:.2f}")
+        lines.append(f"  P&L: ${total_pnl:+.2f}")
+        if total_staked > 0:
+            lines.append(f"  ROI: {total_pnl/total_staked*100:+.1f}%")
+        lines.append("\n(Use bankroll for settled totals)")
+        return "\n".join(lines)
+
+    _tg.start_command_listener({
+        "/status": _status,
+        "/picks": _picks,
+        "/bankroll": _bankroll,
+        "/pnl": _pnl,
+    })
+    live_mode = _os.getenv("LIVE_TRADING", "false").lower() == "true"
+    _tg.send(
+        f"Scheduler started — stations: {', '.join(stations)}\n"
+        f"Mode: {'LIVE' if live_mode else 'dry-run'}\n"
+        f"Commands: /status /picks /bankroll /pnl"
+    )
     sched.start()
