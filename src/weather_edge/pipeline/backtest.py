@@ -38,10 +38,13 @@ def backtest(
 
     current = start
     while current <= end:
+        # Operationally the pipeline runs the evening BEFORE target_date to
+        # predict D+1. So init_dt = (current - 1 day) at 12z, giving lead=24h.
+        # Setting lock_time one day earlier achieves this via _most_recent_12z.
         lock_time = datetime(
             current.year, current.month, current.day,
             lock_hour_utc, 0, 0, tzinfo=timezone.utc,
-        )
+        ) - timedelta(days=1)
         _logger.info("Backtest %s %s", station_id, current)
 
         try:

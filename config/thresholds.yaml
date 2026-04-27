@@ -3,3 +3,4 @@ max_spread: 0.04
 min_liquidity: 500
 max_raw_prob: 0.85
 market_freshness_minutes: 10
+max_kelly_fraction: 0.25

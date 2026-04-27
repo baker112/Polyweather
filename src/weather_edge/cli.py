@@ -320,8 +320,9 @@ def lock_cmd(
             table.add_column("Edge", justify="right")
             table.add_column("Kelly %", justify="right")
             for pick in result.picks:
+                label = pick.bracket_label.replace("°", "deg")
                 table.add_row(
-                    pick.bracket_label,
+                    label,
                     pick.side,
                     f"{pick.model_prob*100:.1f}",
                     f"{pick.market_prob*100:.1f}",
@@ -416,14 +417,23 @@ def resolve_cmd(
     date_str: Annotated[Optional[str], typer.Option("--date", help="Date YYYY-MM-DD")] = None,
     start: Annotated[Optional[str], typer.Option("--start")] = None,
     end: Annotated[Optional[str], typer.Option("--end")] = None,
+    all_dates: Annotated[bool, typer.Option("--all", help="Resolve all dates with locked picks")] = False,
     force: Annotated[bool, typer.Option("--force", help="Re-fetch even if already resolved")] = False,
 ) -> None:
     """Fetch resolved market outcome and compute P&L against locked picks."""
     from weather_edge.pipeline.resolve import resolve_date, resolve_range
+    from weather_edge.store import parquet as store
     import datetime as _dt
 
     if date_str:
         dates = [date.fromisoformat(date_str)]
+    elif all_dates:
+        all_picks = store.read_all_picks(station)
+        dates = sorted(date.fromisoformat(p["date"]) for p in all_picks)
+        if not dates:
+            _console.print("[yellow]No locked picks found[/yellow]")
+            return
+        _console.print(f"Resolving {len(dates)} locked dates for [bold]{station}[/bold]")
     elif start:
         start_d = date.fromisoformat(start)
         end_d = date.fromisoformat(end) if end else date.today()

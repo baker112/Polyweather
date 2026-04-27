@@ -28,6 +28,7 @@ class ThresholdsConfig(BaseModel):
     min_liquidity: float
     max_raw_prob: float
     market_freshness_minutes: int
+    max_kelly_fraction: float = 0.25
 
 
 @lru_cache(maxsize=1)

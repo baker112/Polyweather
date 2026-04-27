@@ -145,6 +145,18 @@ def write_market_snapshot(record: dict[str, Any], station: str, target_date: dat
     return path
 
 
+def read_market_snapshot(station: str, target_date: date) -> dict[str, Any] | None:
+    """Return the most recent cached market snapshot for (station, date), or None."""
+    snap_dir = _DATA_DIR / "market_snapshots" / f"station={station}" / f"date={target_date}"
+    if not snap_dir.exists():
+        return None
+    files = sorted(snap_dir.glob("*.json"))
+    if not files:
+        return None
+    with open(files[-1]) as f:
+        return json.load(f)
+
+
 # ─── Picks ────────────────────────────────────────────────────────────────────
 
 def picks_exist(station: str, target_date: date) -> bool:

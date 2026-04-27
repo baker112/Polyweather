@@ -58,11 +58,18 @@ def ingest_forecasts(
     except ImportError as exc:
         raise IngestError("s3fs not installed") from exc
 
-    fs = s3fs.S3FileSystem(anon=True)
+    fs = s3fs.S3FileSystem(
+        anon=True,
+        client_kwargs={"connect_timeout": 15, "read_timeout": 60},
+    )
     tz = zoneinfo.ZoneInfo(station.timezone)
     date_str = init_dt.strftime("%Y%m%d")
     hour_str = f"{init_dt.hour:02d}"
-    prefix = f"{_BUCKET}/gefs.{date_str}/{hour_str}/atmos/pgrb2sp25"
+    base = f"{_BUCKET}/gefs.{date_str}/{hour_str}/atmos"
+
+    # pgrb2sp25 (subset) exists for recent runs; pgrb2ap25 for older/archived runs.
+    # Try subset first, fall back to the full product.
+    _PRODUCTS = [("pgrb2sp25", "pgrb2s"), ("pgrb2ap25", "pgrb2a")]
 
     steps_to_fetch = steps if steps is not None else _STEPS
 
@@ -76,15 +83,17 @@ def ingest_forecasts(
             step_str = f"{step:03d}"
 
             for member_id in range(31):
-                if member_id == 0:
-                    fname = f"gec00.t{hour_str}z.pgrb2s.0p25.f{step_str}"
-                else:
-                    fname = f"gep{member_id:02d}.t{hour_str}z.pgrb2s.0p25.f{step_str}"
-
-                key = f"{prefix}/{fname}"
+                mem_pfx = "gec00" if member_id == 0 else f"gep{member_id:02d}"
                 tmp_path = Path(tmpdir) / f"m{member_id:02d}_f{step_str}.grib2"
 
-                temp_c = _fetch_tmp_field(fs, key, tmp_path, station.lat, station.lon)
+                temp_c = None
+                for prod_dir, prod_sfx in _PRODUCTS:
+                    fname = f"{mem_pfx}.t{hour_str}z.{prod_sfx}.0p25.f{step_str}"
+                    key = f"{base}/{prod_dir}/{fname}"
+                    temp_c = _fetch_tmp_field(fs, key, tmp_path, station.lat, station.lon)
+                    if temp_c is not None:
+                        break  # found data in this product, no need to try fallback
+
                 if temp_c is not None:
                     prev = day_max[member_id].get(local_day, -999.0)
                     day_max[member_id][local_day] = max(prev, temp_c)

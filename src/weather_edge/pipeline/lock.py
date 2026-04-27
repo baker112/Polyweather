@@ -144,13 +144,29 @@ def lock_picks(
         day=target_date.day,
         year=target_date.year,
     )
-    try:
-        snapshot = asyncio.run(_fetch_and_persist_market(slug, station_id, target_date))
-    except (MarketError, Exception) as exc:
-        _logger.warning("Market fetch failed: %s", exc)
-        log_event("fetch_market", station_id, "error",
-                  (time.monotonic() - t2) * 1000, error=str(exc))
-        return _no_pick(target_date, station_id, now_utc, dist, f"market_error: {exc}", provenance)
+
+    snapshot: MarketSnapshot | None = None
+
+    # For historical dates (backtest), load cached snapshot before live fetch.
+    # Live lock always fetches fresh to respect the market_freshness gate.
+    is_historical = target_date < now_utc.date()
+    if is_historical:
+        cached_raw = store.read_market_snapshot(station_id, target_date)
+        if cached_raw is not None:
+            try:
+                snapshot = MarketSnapshot(**cached_raw)
+                _logger.info("Market: loaded from cache for %s %s", station_id, target_date)
+            except Exception:
+                snapshot = None
+
+    if snapshot is None:
+        try:
+            snapshot = asyncio.run(_fetch_and_persist_market(slug, station_id, target_date))
+        except (MarketError, Exception) as exc:
+            _logger.warning("Market fetch failed: %s", exc)
+            log_event("fetch_market", station_id, "error",
+                      (time.monotonic() - t2) * 1000, error=str(exc))
+            return _no_pick(target_date, station_id, now_utc, dist, f"market_error: {exc}", provenance)
 
     log_event("fetch_market", station_id, "ok",
               (time.monotonic() - t2) * 1000, implied_sum=snapshot.implied_sum)
@@ -213,11 +229,12 @@ def compute_edges(
             "market_fresh": snapshot.fetched_at >= freshness_cutoff,
         }
 
-        # Full Kelly fraction: f* = |edge| / price_of_losing_side
+        # Full Kelly fraction: f* = |edge| / price_of_losing_side, capped at max_kelly_fraction
         if edge > 0:  # YES bet
             kelly = edge / (1.0 - outcome.mid) if outcome.mid < 1.0 else 0.0
         else:  # NO bet
             kelly = abs(edge) / outcome.mid if outcome.mid > 0.0 else 0.0
+        kelly = min(kelly, thresholds.max_kelly_fraction)
 
         candidates.append(Candidate(
             bracket_label=bp.label,
@@ -356,6 +373,7 @@ def _get_pooled_emos_params(station_id: str, lead_hours: int, now_utc: datetime)
     pairs = assemble_training_pairs(station_id, lead_hours, now_utc.date())
     if pairs:
         params = fit_emos(pairs, station_id, lead_hours)
+        store.write_emos_params(params.model_dump(), station_id, lead_hours, params.valid_from, model=None)
     else:
         _logger.warning(
             "No training pairs for %s lead=%dh — using identity EMOS bootstrap",
@@ -368,8 +386,6 @@ def _get_pooled_emos_params(station_id: str, lead_hours: int, now_utc: datetime)
             n_samples=0, train_crps=float("nan"),
             valid_from=now_utc,
         )
-
-    store.write_emos_params(params.model_dump(), station_id, lead_hours, params.valid_from, model=None)
     return params
 
 
