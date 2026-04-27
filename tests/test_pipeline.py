@@ -151,6 +151,79 @@ def test_edge_detection_no_pick_when_stale_market() -> None:
     assert len(candidates) == 0
 
 
+def test_place_order_bankroll_guard_raises() -> None:
+    """place_order raises ValueError when stake exceeds available bankroll."""
+    from weather_edge.execution.polymarket_exec import place_order
+
+    pick = Candidate(
+        bracket_label="22°C to 25°C",
+        low=22.0,
+        high=25.0,
+        model_prob=0.65,
+        market_prob=0.35,
+        edge=0.30,
+        side="YES",
+        spread=0.02,
+        liquidity=1500.0,
+        kelly_fraction=0.10,
+        gates={"min_edge": True},
+        raw_values={},
+    )
+    outcome = MarketOutcome(
+        label="22°C to 25°C",
+        low=22.0,
+        high=25.0,
+        best_bid=0.34,
+        best_ask=0.36,
+        mid=0.35,
+        spread=0.02,
+        liquidity=1500.0,
+        token_id="tok_abc",
+    )
+    # available = current_usdc − reserved_usdc = 10 − 8 = 2; stake of 5 should fail
+    bankroll_data = {"current_usdc": 10.0, "reserved_usdc": 8.0}
+    with patch("weather_edge.execution.bankroll.load", return_value=bankroll_data):
+        with pytest.raises(ValueError, match="exceeds available bankroll"):
+            place_order(pick, outcome, usdc_stake=5.0, dry_run=False)
+
+
+def test_place_order_bankroll_guard_passes_dry_run() -> None:
+    """Bankroll guard is skipped in dry_run mode even if bankroll is exhausted."""
+    from weather_edge.execution.polymarket_exec import place_order
+
+    pick = Candidate(
+        bracket_label="22°C to 25°C",
+        low=22.0,
+        high=25.0,
+        model_prob=0.65,
+        market_prob=0.35,
+        edge=0.30,
+        side="YES",
+        spread=0.02,
+        liquidity=1500.0,
+        kelly_fraction=0.10,
+        gates={"min_edge": True},
+        raw_values={},
+    )
+    outcome = MarketOutcome(
+        label="22°C to 25°C",
+        low=22.0,
+        high=25.0,
+        best_bid=0.34,
+        best_ask=0.36,
+        mid=0.35,
+        spread=0.02,
+        liquidity=1500.0,
+        token_id="tok_abc",
+    )
+    bankroll_data = {"current_usdc": 10.0, "reserved_usdc": 8.0}
+    with patch("weather_edge.execution.bankroll.load", return_value=bankroll_data), \
+         patch("weather_edge.telegram.send"):
+        # dry_run=True must not raise even though stake > available
+        record = place_order(pick, outcome, usdc_stake=5.0, dry_run=True)
+    assert record["dry_run"] is True
+
+
 def test_lock_picks_idempotency() -> None:
     """Calling lock_picks twice raises AlreadyLockedError on the second call."""
     import importlib

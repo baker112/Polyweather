@@ -94,6 +94,18 @@ def place_order(
             "Increase bankroll or wait for higher Kelly signal."
         )
 
+    if not dry_run:
+        from weather_edge.execution import bankroll as _bankroll
+        try:
+            b = _bankroll.load()
+            avail = _bankroll.available(b)
+            if usdc_stake > avail:
+                raise ValueError(
+                    f"Stake ${usdc_stake:.2f} exceeds available bankroll ${avail:.2f}"
+                )
+        except FileNotFoundError:
+            _logger.warning("Bankroll not initialised — skipping bankroll guard")
+
     if pick.side == "YES":
         token_id = outcome.token_id
         price = round(outcome.mid, 2)
