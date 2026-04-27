@@ -105,13 +105,13 @@ async def _get_outcomes(
             continue
 
         yes_token_id = token_ids[0]
+        no_token_id = token_ids[1] if len(token_ids) > 1 else ""
         label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
 
         try:
             book = await _get_book(client, yes_token_id)
         except Exception as exc:
             _logger.warning("CLOB book failed for token %s: %s", yes_token_id[:16], exc)
-            # Fall back to outcomePrices
             outcome = _outcome_from_prices(mkt)
             if outcome is not None:
                 outcomes.append(outcome)
@@ -128,6 +128,7 @@ async def _get_outcomes(
             spread=book["spread"],
             liquidity=book["liquidity"],
             token_id=yes_token_id,
+            no_token_id=no_token_id,
         ))
 
     if not outcomes:

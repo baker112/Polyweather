@@ -59,7 +59,8 @@ class MarketOutcome(BaseModel):
     mid: float
     spread: float
     liquidity: float
-    token_id: str
+    token_id: str       # YES token
+    no_token_id: str = ""  # NO token (clobTokenIds[1])
 
 
 class MarketSnapshot(BaseModel):

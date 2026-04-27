@@ -461,6 +461,189 @@ def resolve_cmd(
             _console.print(f"    {icon} {p['bracket_label']} {p['side']} @ {p['entry_price']:.3f} -> pnl={p['pnl_per_unit']:+.4f}")
 
 
+# ─── Execution ────────────────────────────────────────────────────────────────
+
+@app.command("init-bankroll")
+def init_bankroll_cmd(
+    usdc: Annotated[float, typer.Option("--usdc", help="Starting USDC amount")] = 10.0,
+) -> None:
+    """Initialise the bankroll tracker with a starting USDC balance."""
+    from weather_edge.execution import bankroll
+    b = bankroll.init(usdc)
+    _console.print(f"[green]Bankroll initialised: ${b['initial_usdc']:.2f} USDC[/green]")
+    _console.print(f"  File: data/bankroll.json")
+
+
+@app.command("setup-clob")
+def setup_clob_cmd() -> None:
+    """Derive Polymarket CLOB API credentials from POLYMARKET_PK and print env vars.
+
+    Set POLYMARKET_PK first, then run this once to get your API key/secret/passphrase.
+    """
+    from weather_edge.execution.polymarket_exec import derive_api_creds
+    _console.print("Deriving CLOB API credentials from POLYMARKET_PK...")
+    try:
+        creds = derive_api_creds()
+    except Exception as exc:
+        _console.print(f"[red]Failed: {exc}[/red]")
+        raise typer.Exit(1)
+    _console.print("[green]Add these to your shell profile (.bashrc / .env):[/green]")
+    for k, v in creds.items():
+        _console.print(f"  export {k}={v}")
+
+
+@app.command("execute")
+def execute_cmd(
+    station: Annotated[str, typer.Option("--station", "-s")] = "EGLC",
+    date_str: Annotated[str, typer.Option("--date", help="Date YYYY-MM-DD")] = "",
+    dry_run: Annotated[bool, typer.Option("--dry-run/--live", help="Simulate only (default: dry-run)")] = True,
+    yes: Annotated[bool, typer.Option("--yes", "-y", help="Skip confirmation prompt")] = False,
+) -> None:
+    """Place live orders for locked picks. Reads picks from data/picks/.
+
+    Always runs in --dry-run mode by default. Pass --live to submit real orders.
+    Requires POLYMARKET_PK (and CLOB_API_KEY/CLOB_SECRET/CLOB_PASS_PHRASE for live).
+    """
+    import json as _json
+    from pathlib import Path
+    from weather_edge.execution import bankroll as br
+    from weather_edge.execution.polymarket_exec import (
+        MIN_ORDER_USDC, place_order, save_execution,
+    )
+    from weather_edge.models import LockedPicks, MarketOutcome
+    from weather_edge.store import parquet as store
+
+    if not date_str:
+        _console.print("[red]--date is required[/red]")
+        raise typer.Exit(1)
+
+    target_date = date.fromisoformat(date_str)
+
+    # Load picks
+    picks_data = store.read_picks(station, target_date)
+    if picks_data is None:
+        _console.print(f"[red]No picks found for {station} {target_date}. Run `we lock` first.[/red]")
+        raise typer.Exit(1)
+
+    locked = LockedPicks(**picks_data)
+    if not locked.picks:
+        _console.print(f"[yellow]No qualifying picks for {station} {target_date}: {locked.no_edge_reason}[/yellow]")
+        raise typer.Exit(0)
+
+    # Load bankroll
+    try:
+        bankroll = br.load()
+    except FileNotFoundError:
+        _console.print("[red]Bankroll not initialised. Run: we init-bankroll --usdc 10.0[/red]")
+        raise typer.Exit(1)
+
+    avail = br.available(bankroll)
+    _console.print(f"Bankroll: ${bankroll['current_usdc']:.2f} USDC  (available: ${avail:.2f})")
+
+    # Load market snapshot for token IDs — fetch fresh if missing or stale (no NO tokens)
+    from weather_edge.models import MarketSnapshot
+    from weather_edge.config import get_station as _get_station
+    snap_raw = store.read_market_snapshot(station, target_date)
+    _need_fresh = snap_raw is None or not any(
+        o.get("no_token_id") for o in snap_raw.get("outcomes", [])
+    )
+    if _need_fresh:
+        _console.print("[dim]Fetching fresh market snapshot...[/dim]")
+        _cfg = _get_station(station)
+        _slug = _cfg.market_slug_pattern.format(
+            date=target_date.strftime("%Y-%m-%d"),
+            month_lower=target_date.strftime("%B").lower(),
+            day=target_date.day,
+            year=target_date.year,
+        )
+        try:
+            import asyncio as _asyncio
+            from weather_edge.market.polymarket import fetch_market
+            _snap = _asyncio.run(fetch_market(_slug, station, target_date))
+            store.write_market_snapshot(_snap.model_dump(), station, target_date)
+            snapshot = _snap
+        except Exception as _exc:
+            _console.print(f"[red]Market fetch failed: {_exc}[/red]")
+            raise typer.Exit(1)
+    else:
+        snapshot = MarketSnapshot(**snap_raw)
+    outcome_map = {o.label: o for o in snapshot.outcomes}
+
+    # Build order table
+    table = Table(title=f"Orders — {station} {target_date}", show_header=True)
+    table.add_column("Bracket")
+    table.add_column("Side")
+    table.add_column("Edge")
+    table.add_column("Kelly")
+    table.add_column("Price")
+    table.add_column("Stake (USDC)")
+    table.add_column("OK?")
+
+    order_rows = []
+    for pick in locked.picks:
+        outcome = outcome_map.get(pick.bracket_label)
+        if outcome is None:
+            _console.print(f"[yellow]Skipping {pick.bracket_label}: not in current snapshot[/yellow]")
+            continue
+
+        usdc_stake = round(pick.kelly_fraction * avail, 2)
+        price = outcome.mid if pick.side == "YES" else (1.0 - outcome.mid)
+        ok = usdc_stake >= MIN_ORDER_USDC
+
+        table.add_row(
+            pick.bracket_label,
+            f"[green]{pick.side}[/green]" if pick.side == "YES" else f"[red]{pick.side}[/red]",
+            f"{pick.edge:+.3f}",
+            f"{pick.kelly_fraction*100:.1f}%",
+            f"{price:.3f}",
+            f"${usdc_stake:.2f}",
+            "[green]YES[/green]" if ok else f"[red]NO (min ${MIN_ORDER_USDC:.0f})[/red]",
+        )
+        if ok:
+            order_rows.append((pick, outcome, usdc_stake))
+
+    _console.print(table)
+
+    if not order_rows:
+        _console.print(f"[yellow]All orders below minimum ${MIN_ORDER_USDC:.2f} USDC. Increase bankroll or wait for larger Kelly signal.[/yellow]")
+        raise typer.Exit(0)
+
+    mode_tag = "[yellow]DRY RUN[/yellow]" if dry_run else "[bold red]LIVE — REAL MONEY[/bold red]"
+    _console.print(f"\nMode: {mode_tag}")
+
+    if not yes:
+        confirm = typer.prompt(
+            f"Submit {len(order_rows)} order(s)? [yes/no]",
+            default="no",
+        )
+        if confirm.strip().lower() not in ("yes", "y"):
+            _console.print("[yellow]Aborted.[/yellow]")
+            raise typer.Exit(0)
+
+    records = []
+    total_staked = 0.0
+    for pick, outcome, usdc_stake in order_rows:
+        try:
+            rec = place_order(pick, outcome, usdc_stake, dry_run=dry_run)
+            records.append(rec)
+            total_staked += usdc_stake
+            status = rec["status"]
+            _console.print(
+                f"  [green]{'[DRY]' if dry_run else '[LIVE]'}[/green] "
+                f"{pick.side} {pick.bracket_label} ${usdc_stake:.2f} @ {rec['price']:.3f} — {status}"
+            )
+        except Exception as exc:
+            _console.print(f"  [red]FAILED {pick.bracket_label}: {exc}[/red]")
+
+    if records and not dry_run:
+        br.reserve(bankroll, total_staked)
+
+    path = save_execution(station, target_date, records)
+    _console.print(f"\n[green]Saved execution record: {path}[/green]")
+    if dry_run:
+        _console.print("[dim]Re-run with --live to submit real orders.[/dim]")
+
+
 # ─── Scheduler ────────────────────────────────────────────────────────────────
 
 @app.command("scheduler")

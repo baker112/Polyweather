@@ -29,6 +29,7 @@ dependencies = [
     "streamlit>=1.35.0",
     "plotly>=5.22.0",
     "apscheduler>=3.10.0",
+    "py-clob-client>=0.16.0",
 ]
 
 [project.optional-dependencies]
