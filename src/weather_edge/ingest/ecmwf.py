@@ -137,7 +137,9 @@ def _extract_rows(
         method="linear",
     ) - 273.15  # K → °C
 
-    _logger.info("t2m after interp: dims=%s shape=%s", t2m.dims, t2m.shape)
+    _logger.info("t2m after interp: dims=%s shape=%s first3=%s", t2m.dims, t2m.shape, t2m.values[:3])
+    _logger.info("lon coord sample: %s", ds["t2m"].longitude.values[-5:])
+    _logger.info("lat coord sample: %s", ds["t2m"].latitude.values[:5])
 
     rows: list[dict[str, Any]] = []
 
