@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(pip install *)",
-      "Bash(python -m pytest tests/ -v)"
+      "Bash(python -m pytest tests/ -v)",
+      "WebSearch",
+      "Bash(python -c ' *)",
+      "Bash(echo \"CLI importable: $?\")",
+      "WebFetch(domain:polymarket.com)",
+      "Bash(python *)"
     ]
   }
 }

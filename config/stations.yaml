@@ -1,11 +1,22 @@
+EGLC:
+  name: London City Airport
+  lat: 51.5053
+  lon: 0.0553
+  timezone: Europe/London
+  unit: celsius
+  market_slug_pattern: "highest-temperature-in-london-on-{month_lower}-{day}-{year}"
+  resolution_field: "daily_max_metar_local_wholedeg"
+  lock_time_utc: "18:00"
+
+# EGLL kept for forecast interpolation reference; Polymarket resolves against EGLC
 EGLL:
   name: London Heathrow
   lat: 51.4775
   lon: -0.4614
   timezone: Europe/London
   unit: celsius
-  market_slug_pattern: "highest-temperature-in-london-on-{date}"
-  resolution_field: "daily_max_metar_local"  # confirmed in docs/RESOLUTION.md after Phase 0
+  market_slug_pattern: "highest-temperature-in-london-on-{month_lower}-{day}-{year}"
+  resolution_field: "daily_max_metar_local"
   lock_time_utc: "18:00"
 
 EHAM:
@@ -14,8 +25,8 @@ EHAM:
   lon: 4.7639
   timezone: Europe/Amsterdam
   unit: celsius
-  market_slug_pattern: "highest-temperature-in-amsterdam-on-{date}"  # verify against live Polymarket
-  resolution_field: "daily_max_metar_local"  # pending Phase 0 verification
+  market_slug_pattern: "highest-temperature-in-amsterdam-on-{month_lower}-{day}-{year}"
+  resolution_field: "daily_max_metar_local"
   lock_time_utc: "18:00"
 
 EDDF:
@@ -24,8 +35,8 @@ EDDF:
   lon: 8.5622
   timezone: Europe/Berlin
   unit: celsius
-  market_slug_pattern: "highest-temperature-in-frankfurt-on-{date}"  # verify against live Polymarket
-  resolution_field: "daily_max_metar_local"  # pending Phase 0 verification
+  market_slug_pattern: "highest-temperature-in-frankfurt-on-{month_lower}-{day}-{year}"
+  resolution_field: "daily_max_metar_local"
   lock_time_utc: "18:00"
 
 LFPG:
@@ -34,8 +45,8 @@ LFPG:
   lon: 2.5479
   timezone: Europe/Paris
   unit: celsius
-  market_slug_pattern: "highest-temperature-in-paris-on-{date}"  # verify against live Polymarket
-  resolution_field: "daily_max_metar_local"  # pending Phase 0 verification
+  market_slug_pattern: "highest-temperature-in-paris-on-{month_lower}-{day}-{year}"
+  resolution_field: "daily_max_metar_local"
   lock_time_utc: "18:00"
 
 KJFK:
@@ -44,6 +55,6 @@ KJFK:
   lon: -73.7781
   timezone: America/New_York
   unit: celsius
-  market_slug_pattern: "highest-temperature-in-new-york-city-on-{date}"  # verify against live Polymarket
-  resolution_field: "daily_max_metar_local"  # pending Phase 0 verification
+  market_slug_pattern: "highest-temperature-in-new-york-city-on-{month_lower}-{day}-{year}"
+  resolution_field: "daily_max_metar_local"
   lock_time_utc: "18:00"

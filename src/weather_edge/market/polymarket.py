@@ -1,9 +1,18 @@
 """Polymarket CLOB API client.
 
-Market discovery: GET https://gamma-api.polymarket.com/markets?slug={slug}
-Order book:       GET https://clob.polymarket.com/book?token_id={token_id}
+Discovery:  GET https://gamma-api.polymarket.com/events?slug={event_slug}
+            Each temperature bracket is a binary YES/NO market inside the event.
+            The YES token price = market probability for that bracket.
+
+Order book: GET https://clob.polymarket.com/book?token_id={yes_token_id}
 
 No authentication required for public read operations.
+
+Bracket parsing notes:
+  Polymarket London markets resolve against Wunderground integer °C values.
+  A Wunderground-reported N°C corresponds to actual ∈ [N−0.5, N+0.5), so we
+  shift bracket boundaries by ±0.5°C when building bracket low/high for the
+  continuous EMOS/BMA/QRF distributions. See docs/RESOLUTION.md for details.
 """
 from __future__ import annotations
 
@@ -22,31 +31,29 @@ _CLOB_URL = "https://clob.polymarket.com"
 _TIMEOUT = 30.0
 _logger = logging.getLogger(__name__)
 
-# Polymarket overround sanity bounds
 _OVERROUND_MIN = 0.9
 _OVERROUND_MAX = 1.2
 
-# Pattern to extract bracket bounds from outcome labels, e.g. "21°C to 23°C", "Above 28°C", "Below 15°C"
-_BRACKET_RE = re.compile(
-    r"(?:above\s*([\d.]+)|below\s*([\d.]+)|([\d.]+)\s*(?:°c|c|to|-)\s*([\d.]+))",
-    re.IGNORECASE,
-)
-
 
 async def fetch_market(slug: str, station: str, target_date: date) -> MarketSnapshot:
-    """Fetch a Polymarket market by slug and return a fully hydrated MarketSnapshot."""
+    """Fetch a Polymarket temperature event by slug and return a MarketSnapshot.
+
+    The slug is the *event* slug (e.g. 'highest-temperature-in-london-on-april-27-2026').
+    All bracket sub-markets are fetched and their CLOB books queried.
+    """
     async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
-        market_data = await _get_market(client, slug)
-        outcomes = await _get_outcomes(client, market_data)
+        event = await _get_event(client, slug)
+        outcomes = await _get_outcomes(client, event)
 
     implied_sum = sum(o.mid for o in outcomes)
     if not (_OVERROUND_MIN <= implied_sum <= _OVERROUND_MAX):
         raise MarketError(
-            f"Market {slug!r} implied sum {implied_sum:.3f} outside [{_OVERROUND_MIN}, {_OVERROUND_MAX}]"
+            f"Event {slug!r} implied sum {implied_sum:.3f} outside "
+            f"[{_OVERROUND_MIN}, {_OVERROUND_MAX}]"
         )
 
     return MarketSnapshot(
-        market_id=str(market_data.get("id", "")),
+        market_id=str(event.get("id", "")),
         slug=slug,
         station=station,
         target_date=target_date,
@@ -56,34 +63,60 @@ async def fetch_market(slug: str, station: str, target_date: date) -> MarketSnap
     )
 
 
-async def _get_market(client: httpx.AsyncClient, slug: str) -> dict[str, Any]:
-    resp = await client.get(f"{_GAMMA_URL}/markets", params={"slug": slug})
+# ─── Event + market discovery ─────────────────────────────────────────────────
+
+async def _get_event(client: httpx.AsyncClient, slug: str) -> dict[str, Any]:
+    """Fetch a Polymarket event by slug from the Gamma API events endpoint."""
+    resp = await client.get(f"{_GAMMA_URL}/events", params={"slug": slug})
     resp.raise_for_status()
     data: list[dict[str, Any]] = resp.json()
     if not data:
-        raise MarketError(f"No market found for slug {slug!r}")
-    return data[0]
+        raise MarketError(f"No event found for slug {slug!r}")
+    event = data[0]
+    if not event.get("markets"):
+        raise MarketError(f"Event {slug!r} has no bracket markets")
+    return event
 
 
-async def _get_outcomes(client: httpx.AsyncClient, market: dict[str, Any]) -> list[MarketOutcome]:
-    """Fetch order books for all tokens and build MarketOutcome objects."""
-    tokens: list[dict[str, Any]] = market.get("tokens", [])
-    if not tokens:
-        # Fallback: try clob_token_ids / outcomes fields
-        token_ids: list[str] = market.get("clob_token_ids", [])
-        outcome_labels: list[str] = market.get("outcomes", [])
-        tokens = [
-            {"token_id": tid, "outcome": label}
-            for tid, label in zip(token_ids, outcome_labels)
-        ]
+async def _get_outcomes(
+    client: httpx.AsyncClient,
+    event: dict[str, Any],
+) -> list[MarketOutcome]:
+    """Build MarketOutcome objects for each bracket market in the event.
 
+    Each bracket market in event['markets'] is a binary YES/NO market.
+    YES token id = clobTokenIds[0]; YES price = market probability for the bracket.
+    """
+    markets: list[dict[str, Any]] = event.get("markets", [])
     outcomes: list[MarketOutcome] = []
-    for token in tokens:
-        token_id: str = str(token.get("token_id", ""))
-        label: str = str(token.get("outcome", ""))
-        if not token_id:
+
+    for mkt in markets:
+        if not mkt.get("active", True) or mkt.get("closed", False):
             continue
-        book = await _get_book(client, token_id)
+        if not mkt.get("enableOrderBook", True):
+            # AMM-only market — use outcomePrices as fallback
+            outcome = _outcome_from_prices(mkt)
+            if outcome is not None:
+                outcomes.append(outcome)
+            continue
+
+        token_ids: list[str] = _parse_json_list(mkt.get("clobTokenIds", "[]"))
+        if not token_ids:
+            continue
+
+        yes_token_id = token_ids[0]
+        label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
+
+        try:
+            book = await _get_book(client, yes_token_id)
+        except Exception as exc:
+            _logger.warning("CLOB book failed for token %s: %s", yes_token_id[:16], exc)
+            # Fall back to outcomePrices
+            outcome = _outcome_from_prices(mkt)
+            if outcome is not None:
+                outcomes.append(outcome)
+            continue
+
         low, high = _parse_bracket(label)
         outcomes.append(MarketOutcome(
             label=label,
@@ -94,14 +127,38 @@ async def _get_outcomes(client: httpx.AsyncClient, market: dict[str, Any]) -> li
             mid=book["mid"],
             spread=book["spread"],
             liquidity=book["liquidity"],
-            token_id=token_id,
+            token_id=yes_token_id,
         ))
 
     if not outcomes:
-        raise MarketError("No outcomes found in market")
+        raise MarketError("No active outcomes found in event")
 
     return sorted(outcomes, key=lambda o: (o.low is None, o.low or 0.0))
 
+
+def _outcome_from_prices(mkt: dict[str, Any]) -> MarketOutcome | None:
+    """Build a MarketOutcome from outcomePrices when CLOB is unavailable."""
+    prices = _parse_json_list(mkt.get("outcomePrices", "[]"))
+    token_ids = _parse_json_list(mkt.get("clobTokenIds", "[]"))
+    label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
+    if not prices or not label:
+        return None
+    yes_price = float(prices[0])
+    low, high = _parse_bracket(label)
+    return MarketOutcome(
+        label=label,
+        low=low,
+        high=high,
+        best_bid=yes_price,
+        best_ask=yes_price,
+        mid=yes_price,
+        spread=0.0,
+        liquidity=float(mkt.get("liquidityNum", 0.0)),
+        token_id=str(token_ids[0]) if token_ids else "",
+    )
+
+
+# ─── CLOB order book ──────────────────────────────────────────────────────────
 
 async def _get_book(client: httpx.AsyncClient, token_id: str) -> dict[str, float]:
     resp = await client.get(f"{_CLOB_URL}/book", params={"token_id": token_id})
@@ -113,11 +170,8 @@ async def _get_book(client: httpx.AsyncClient, token_id: str) -> dict[str, float
 
     best_bid = max((float(b["price"]) for b in bids), default=0.0)
     best_ask = min((float(a["price"]) for a in asks), default=1.0)
-
     mid = (best_bid + best_ask) / 2.0
     spread = best_ask - best_bid
-
-    # Liquidity = total resting bid value (a simple proxy for depth)
     liquidity = sum(float(b["price"]) * float(b["size"]) for b in bids)
 
     return {
@@ -129,29 +183,55 @@ async def _get_book(client: httpx.AsyncClient, token_id: str) -> dict[str, float
     }
 
 
+# ─── Bracket parsing ──────────────────────────────────────────────────────────
+
 def _parse_bracket(label: str) -> tuple[float | None, float | None]:
-    """Extract (low, high) temperature bounds from a bracket label string.
+    """Extract (low, high) bracket bounds from a Polymarket temperature outcome label.
+
+    Applies ±0.5°C boundary adjustment to account for Wunderground's integer rounding
+    (reported N°C → actual ∈ [N−0.5, N+0.5)).
 
     Examples:
-      "Below 15°C"       → (None, 15.0)
-      "15°C to 17°C"     → (15.0, 17.0)
-      "Above 28°C"       → (28.0, None)
+      "15°C or below"  → (None, 15.5)
+      "16°C"           → (15.5, 16.5)
+      "25°C or higher" → (24.5, None)
+      "16°C to 18°C"   → (16.0, 18.0)  (range — no shift applied)
     """
-    label_lower = label.lower().strip()
+    s = label.lower().strip()
+    nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", s)]
 
-    if "below" in label_lower or "under" in label_lower:
-        nums = re.findall(r"[\d.]+", label_lower)
-        if nums:
-            return None, float(nums[0])
+    is_lower_tail = any(kw in s for kw in ("below", "under", "or below", "or lower", "or less"))
+    is_upper_tail = any(kw in s for kw in ("above", "over", "or higher", "or above", "or more"))
 
-    if "above" in label_lower or "over" in label_lower:
-        nums = re.findall(r"[\d.]+", label_lower)
-        if nums:
-            return float(nums[0]), None
+    if is_lower_tail and nums:
+        return None, nums[0] + 0.5  # "15°C or below" → (None, 15.5)
 
-    nums = re.findall(r"[\d.]+", label_lower)
+    if is_upper_tail and nums:
+        return nums[0] - 0.5, None  # "25°C or higher" → (24.5, None)
+
+    if len(nums) == 1:
+        # Exact single integer bracket: "16°C" → (15.5, 16.5)
+        return nums[0] - 0.5, nums[0] + 0.5
+
     if len(nums) >= 2:
-        return float(nums[0]), float(nums[1])
+        # Explicit range — no rounding adjustment needed
+        return nums[0], nums[1]
 
-    _logger.warning("Could not parse bracket from label: %r", label)
+    _logger.warning("Could not parse bracket bounds from label: %r", label)
     return None, None
+
+
+# ─── Utility ──────────────────────────────────────────────────────────────────
+
+def _parse_json_list(value: Any) -> list[str]:
+    """Parse a JSON string or list into a Python list of strings."""
+    import json
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return [str(v) for v in parsed] if isinstance(parsed, list) else []
+        except json.JSONDecodeError:
+            return []
+    return []

@@ -18,6 +18,8 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.optimize import minimize  # type: ignore[import-untyped]
 
+from typing import Any
+
 from weather_edge.models import BracketProb, BracketSpec, EmosParams, PredictedDistribution
 from weather_edge.postprocess.crps import mean_crps
 
@@ -116,7 +118,7 @@ def predict_pdf(
 # ─── Bracket probabilities ────────────────────────────────────────────────────
 
 def compute_brackets(
-    distribution: PredictedDistribution,
+    distribution: Any,  # PredictedDistribution | BMAMixture | QRFDistribution
     brackets: list[BracketSpec],
 ) -> list[BracketProb]:
     """Compute bracket probabilities with floor and renormalisation."""

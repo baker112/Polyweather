@@ -138,7 +138,12 @@ def lock_picks(
 
     # ── Stage 5: Fetch market ─────────────────────────────────────────────────
     t2 = time.monotonic()
-    slug = station.market_slug_pattern.format(date=target_date.strftime("%Y-%m-%d"))
+    slug = station.market_slug_pattern.format(
+        date=target_date.strftime("%Y-%m-%d"),
+        month_lower=target_date.strftime("%B").lower(),
+        day=target_date.day,
+        year=target_date.year,
+    )
     try:
         snapshot = asyncio.run(_fetch_and_persist_market(slug, station_id, target_date))
     except (MarketError, Exception) as exc:
@@ -241,11 +246,27 @@ def _stage3_4(
     model_values: dict[str, list[float]],
     provenance: dict[str, Any],
 ) -> Any:
-    """Return a PredictedDistribution (pooled) or BMAMixture (per-model).
+    """Return a PredictedDistribution, BMAMixture, or QRFDistribution.
 
-    BMA path: used when per-model EMOS params exist for ≥2 models.
-    Falls back to pooled EMOS if per-model params are missing or insufficient.
+    Priority order:
+      Phase 3 — QRF (if fitted params exist on disk)
+      Phase 2 — BMA mixture (if per-model EMOS params exist for ≥2 models)
+      Phase 1 — Pooled EMOS fallback
     """
+    # ── Phase 3: QRF ─────────────────────────────────────────────────────────
+    qrf_data = store.read_qrf_params(station_id, lead_hours, now_utc)
+    if qrf_data is not None:
+        from weather_edge.postprocess.qrf import predict_qrf
+        forest = qrf_data["forest"]
+        X_train = qrf_data["X_train"]
+        y_train = qrf_data["y_train"]
+        provenance["mode"] = "qrf"
+        provenance["qrf_n_train"] = int(qrf_data["meta"].get("n_samples", len(y_train)))
+        _logger.info("Stage 3+4: QRF (n=%d)", provenance["qrf_n_train"])
+        return predict_qrf(forest, X_train, y_train, ensemble_values,
+                           target_date, station_id, lead_hours)
+
+    # ── Phase 2: BMA ─────────────────────────────────────────────────────────
     # Attempt to load per-model EMOS params (Phase 2 path)
     per_model: dict[str, EmosParams] = {}
     for model in ("ecmwf", "gefs"):
@@ -315,14 +336,32 @@ def _load_or_fetch_forecasts(
 
 
 def _get_pooled_emos_params(station_id: str, lead_hours: int, now_utc: datetime) -> EmosParams:
-    """Load or fit pooled (all-model) EMOS params."""
+    """Load or fit pooled (all-model) EMOS params.
+
+    If no historical forecast+obs pairs exist yet, bootstraps with the identity
+    EMOS transform (a=0, b=1, c=0.5, d=1) so the pipeline can still run and
+    fetch the market. Replace once ≥30 training pairs accumulate.
+    """
     raw = store.read_emos_params(station_id, lead_hours, now_utc, model=None)
     if raw is not None:
         return EmosParams(**raw)
+
     pairs = assemble_training_pairs(station_id, lead_hours, now_utc.date())
-    if not pairs:
-        raise EmosError(f"No training data for {station_id} lead={lead_hours}h")
-    params = fit_emos(pairs, station_id, lead_hours)
+    if pairs:
+        params = fit_emos(pairs, station_id, lead_hours)
+    else:
+        _logger.warning(
+            "No training pairs for %s lead=%dh — using identity EMOS bootstrap",
+            station_id, lead_hours,
+        )
+        params = EmosParams(
+            a=0.0, b=1.0, c=0.5, d=1.0,
+            station=station_id, lead_hours=lead_hours,
+            fitted_at=now_utc, training_window_days=0,
+            n_samples=0, train_crps=float("nan"),
+            valid_from=now_utc,
+        )
+
     store.write_emos_params(params.model_dump(), station_id, lead_hours, params.valid_from, model=None)
     return params
 

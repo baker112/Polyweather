@@ -25,6 +25,7 @@ dependencies = [
     "s3fs>=2024.3.0",
     "matplotlib>=3.8.0",
     "ecmwf-opendata>=0.3.0",
+    "scikit-learn>=1.4.0",
 ]
 
 [project.optional-dependencies]

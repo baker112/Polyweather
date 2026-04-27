@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import pickle
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -52,7 +53,7 @@ def write_observations(df: pl.DataFrame, station: str) -> Path:
     path = _ensure(_DATA_DIR / "observations" / f"station={station}") / "data.parquet"
     if path.exists():
         existing = pl.read_parquet(path)
-        df = pl.concat([existing, df]).unique(subset=["station", "date"]).sort("date")
+        df = pl.concat([existing, df]).unique(subset=["station", "date"], keep="last").sort("date")
     df.write_parquet(path)
     return path
 
@@ -179,6 +180,52 @@ def read_backtest_results(station: str, start: date, end: date) -> pl.DataFrame:
         pl.read_parquet(path)
         .filter(pl.col("date").is_between(start, end))
     )
+
+
+# ─── QRF params ───────────────────────────────────────────────────────────────
+
+def write_qrf_params(
+    forest: Any,
+    X_train: Any,
+    y_train: Any,
+    meta: dict[str, Any],
+    station: str,
+    lead_hours: int,
+    valid_from: datetime,
+) -> Path:
+    """Persist QRF forest + training arrays as a pickle alongside a JSON metadata file."""
+    ts = valid_from.strftime("%Y%m%dT%H%M%S")
+    base = _ensure(_DATA_DIR / "qrf_params" / f"station={station}" / f"lead_hours={lead_hours}")
+
+    payload = {"forest": forest, "X_train": X_train, "y_train": y_train, "meta": meta}
+    pkl_path = base / f"{ts}.pkl"
+    with open(pkl_path, "wb") as f:
+        pickle.dump(payload, f)
+
+    json_path = base / f"{ts}.json"
+    with open(json_path, "w") as f:
+        json.dump(meta, f, indent=2)
+
+    return pkl_path
+
+
+def read_qrf_params(
+    station: str,
+    lead_hours: int,
+    as_of: datetime,
+) -> dict[str, Any] | None:
+    """Return {'forest', 'X_train', 'y_train', 'meta'} or None (backtest-safe: valid_from ≤ as_of)."""
+    base = _DATA_DIR / "qrf_params" / f"station={station}" / f"lead_hours={lead_hours}"
+    if not base.exists():
+        return None
+    as_of_str = as_of.strftime("%Y%m%dT%H%M%S")
+    candidates = [f for f in base.glob("*.pkl") if f.stem <= as_of_str]
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda f: f.stem)
+    with open(latest, "rb") as f:
+        result: dict[str, Any] = pickle.load(f)
+    return result
 
 
 # ─── DuckDB analytics ─────────────────────────────────────────────────────────

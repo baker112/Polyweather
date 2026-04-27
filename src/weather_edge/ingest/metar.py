@@ -6,7 +6,7 @@ Free, no auth required.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 import polars as pl
@@ -28,15 +28,19 @@ async def fetch_observations(
 
     Columns: station (str), date (date), daily_max_c (f64), source (str), fetched_at (datetime)
     """
+    # Iowa Mesonet's day2 is UTC-exclusive (returns data through day2-1T23:59 UTC).
+    # Request one extra day so the full local end date is captured after tz conversion.
+    api_end = end + timedelta(days=1)
+
     params = {
         "station": station.icao,
         "data": "tmpf",  # temperature in Fahrenheit
         "year1": str(start.year),
         "month1": str(start.month),
         "day1": str(start.day),
-        "year2": str(end.year),
-        "month2": str(end.month),
-        "day2": str(end.day),
+        "year2": str(api_end.year),
+        "month2": str(api_end.month),
+        "day2": str(api_end.day),
         "tz": "UTC",
         "format": "onlycomma",
         "latlon": "no",
@@ -79,12 +83,27 @@ async def fetch_observations(
     if not rows:
         return pl.DataFrame(schema=_schema())
 
-    df = pl.DataFrame(rows, schema={"date": pl.Date, "tmpc": pl.Float64})
+    df = pl.DataFrame(rows, schema={"date": pl.Date, "tmpc": pl.Float64}, orient="row")
     now = datetime.now(timezone.utc)
-    return (
+
+    # Polymarket resolves against whole-degree Celsius (Wunderground rounds to nearest integer).
+    # Store both the raw continuous max and the rounded value; use rounded for bracket matching.
+    resolution_field = getattr(station, "resolution_field", "daily_max_metar_local")
+    use_whole_deg = "wholedeg" in resolution_field
+
+    result = (
         df.group_by("date")
         .agg(pl.col("tmpc").max().alias("daily_max_c"))
+        .filter(pl.col("date") <= end)  # drop any dates beyond end from the +1-day buffer
         .sort("date")
+    )
+    if use_whole_deg:
+        result = result.with_columns(
+            pl.col("daily_max_c").round(0).alias("daily_max_c")
+        )
+
+    return (
+        result
         .with_columns([
             pl.lit(station.icao).alias("station"),
             pl.lit("iowa_mesonet_asos").alias("source"),

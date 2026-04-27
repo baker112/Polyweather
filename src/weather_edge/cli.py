@@ -15,7 +15,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-app = typer.Typer(name="we", help="Weather Edge — ensemble forecast → Polymarket edge CLI")
+app = typer.Typer(name="we", help="Weather Edge — ensemble forecast -> Polymarket edge CLI")
 ingest_app = typer.Typer(help="Ingest forecast or observation data")
 app.add_typer(ingest_app, name="ingest")
 
@@ -55,7 +55,7 @@ def ingest_forecasts(
                 __import__("polars").lit(init_dt.replace(tzinfo=timezone.utc)).alias("init_datetime"),
             ])
             path = store.write_forecasts(df, model_name, init_dt, station)
-            _console.print(f"  [green]{model_name}[/green]: {len(df)} rows → {path}")
+            _console.print(f"  [green]{model_name}[/green]: {len(df)} rows -> {path}")
         except Exception as exc:
             _console.print(f"  [red]{model_name} failed[/red]: {exc}")
 
@@ -79,13 +79,80 @@ def ingest_observations(
     end_d = date.fromisoformat(end)
     cfg = get_station(station)
 
-    _console.print(f"Fetching observations for [bold]{station}[/bold] {start_d} → {end_d}")
+    _console.print(f"Fetching observations for [bold]{station}[/bold] {start_d} to {end_d}")
     df = asyncio.run(fetch_observations(cfg, start_d, end_d))
     if df.is_empty():
         _console.print("[yellow]No data returned[/yellow]")
         return
     path = store.write_observations(df, station)
-    _console.print(f"[green]{len(df)} rows[/green] → {path}")
+    _console.print(f"[green]{len(df)} rows[/green] -> {path}")
+
+
+# ─── Backfill ─────────────────────────────────────────────────────────────────
+
+@app.command("backfill")
+def backfill_cmd(
+    station: Annotated[str, typer.Option("--station", "-s")] = "EGLC",
+    start: Annotated[str, typer.Option("--start", help="Start date YYYY-MM-DD")] = "",
+    end: Annotated[str, typer.Option("--end", help="End date YYYY-MM-DD")] = "",
+    lead: Annotated[int, typer.Option("--lead", help="Lead hours to backfill")] = 24,
+    step: Annotated[int, typer.Option("--step", help="Single forecast step to download (hours)")] = 24,
+) -> None:
+    """Backfill GEFS forecasts for a date range using a single forecast step.
+
+    For each valid date D, downloads the init cycle at D-{lead}h with steps=[{step}].
+    Skips dates already cached. Use --step 24 for a lightweight ~15 MB/day backfill.
+    """
+    import datetime as _dt
+
+    from weather_edge.config import get_station
+    from weather_edge.ingest import gefs as gefs_ingest
+    from weather_edge.postprocess.emos import _init_datetime_for
+    from weather_edge.store import parquet as store
+
+    if not start or not end:
+        _console.print("[red]--start and --end are required[/red]")
+        raise typer.Exit(1)
+
+    start_d = date.fromisoformat(start)
+    end_d = date.fromisoformat(end)
+    cfg = get_station(station)
+
+    _console.print(
+        f"Backfilling GEFS for [bold]{station}[/bold] "
+        f"{start_d} -> {end_d}  lead={lead}h  step=f{step:03d}"
+    )
+
+    n_fetched = n_skipped = n_failed = 0
+    current = start_d
+    while current <= end_d:
+        init_dt = _init_datetime_for(current, lead)
+
+        # Skip if already cached
+        existing = store.read_forecasts("gefs", init_dt, station)
+        if existing is not None:
+            _console.print(f"  [dim]{current}  init={init_dt.strftime('%Y-%m-%dT%HZ')}  (cached)[/dim]")
+            n_skipped += 1
+            current += _dt.timedelta(days=1)
+            continue
+
+        _console.print(f"  {current}  init={init_dt.strftime('%Y-%m-%dT%HZ')} ... ", end="")
+        try:
+            df = gefs_ingest.ingest_forecasts(init_dt, cfg, steps=[step])
+            store.write_forecasts(df, "gefs", init_dt, station)
+            _console.print(f"[green]{len(df)} rows[/green]")
+            n_fetched += 1
+        except Exception as exc:
+            _console.print(f"[red]FAILED: {exc}[/red]")
+            n_failed += 1
+
+        current += _dt.timedelta(days=1)
+
+    _console.print(
+        f"\nDone: [green]{n_fetched} fetched[/green]  "
+        f"[dim]{n_skipped} skipped[/dim]  "
+        f"[red]{n_failed} failed[/red]"
+    )
 
 
 # ─── Fit EMOS ─────────────────────────────────────────────────────────────────
@@ -116,6 +183,43 @@ def fit_emos_cmd(
     _console.print(f"[green]Fitted on {params.n_samples} samples[/green]")
     _console.print(f"  a={params.a:.4f}  b={params.b:.4f}  c={params.c:.4f}  d={params.d:.4f}")
     _console.print(f"  train CRPS: {params.train_crps:.4f}")
+
+
+@app.command("fit-qrf")
+def fit_qrf_cmd(
+    station: Annotated[str, typer.Option("--station", "-s")] = "EGLL",
+    lead: Annotated[int, typer.Option("--lead", help="Lead hours (24, 48, 72)")] = 24,
+    as_of: Annotated[
+        Optional[str], typer.Option("--as-of", help="Date YYYY-MM-DD (default: today)")
+    ] = None,
+    window: Annotated[int, typer.Option("--window", help="Training window days")] = 60,
+) -> None:
+    """Fit a Quantile Regression Forest (Phase 3) on the rolling training window."""
+    from datetime import datetime, timezone
+
+    from weather_edge.postprocess.qrf import assemble_qrf_training_pairs, fit_qrf
+    from weather_edge.store import parquet as store
+
+    as_of_d = date.fromisoformat(as_of) if as_of else date.today()
+    _console.print(
+        f"Fitting QRF for [bold]{station}[/bold] lead=[bold]{lead}h[/bold] "
+        f"as_of={as_of_d} window={window}d"
+    )
+
+    pairs = assemble_qrf_training_pairs(station, lead, as_of_d, window_days=window)
+    if len(pairs) < 10:
+        _console.print(
+            f"[red]Insufficient training pairs: {len(pairs)} (need ≥10) — "
+            "ingest more forecasts and observations first[/red]"
+        )
+        raise typer.Exit(1)
+
+    forest, X, y, meta = fit_qrf(pairs, station, lead)
+    valid_from = datetime.now(timezone.utc)
+    path = store.write_qrf_params(forest, X, y, meta, station, lead, valid_from)
+
+    _console.print(f"[green]QRF fitted on {len(pairs)} samples[/green] -> {path}")
+    _console.print(f"  n_estimators={meta['n_estimators']}  min_samples_leaf={meta['min_samples_leaf']}")
 
 
 @app.command("fit-emos-bma")
@@ -184,10 +288,10 @@ def lock_cmd(
             continue
 
         mode = result.provenance.get("mode", "pooled")
-        _console.print(f"  μ={result.mu:.2f}°C  σ={result.sigma:.2f}°C  mode=[cyan]{mode}[/cyan]")
+        _console.print(f"  mu={result.mu:.2f}C  sigma={result.sigma:.2f}C  mode=[cyan]{mode}[/cyan]")
 
         if result.picks:
-            table = Table(title=f"Locked Picks — {station_id}", show_header=True)
+            table = Table(title=f"Locked Picks -- {station_id}", show_header=True)
             table.add_column("Bracket")
             table.add_column("Side")
             table.add_column("Model %", justify="right")
@@ -224,7 +328,7 @@ def backtest_cmd(
     start_d = date.fromisoformat(start)
     end_d = date.fromisoformat(end)
 
-    _console.print(f"Backtesting [bold]{station}[/bold] {start_d} → {end_d}")
+    _console.print(f"Backtesting [bold]{station}[/bold] {start_d} -> {end_d}")
     df = backtest(station, start_d, end_d)
 
     if df.is_empty():
@@ -260,7 +364,7 @@ def report_cmd(
     import os
     odir = output_dir or "."
 
-    _console.print(f"Generating report for [bold]{station}[/bold] {start_d} → {end_d}")
+    _console.print(f"Generating report for [bold]{station}[/bold] {start_d} -> {end_d}")
 
     summary = compute_report(station, start_d, end_d)
     _console.print(summary)
