@@ -332,11 +332,17 @@ def _stage3_4(
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _most_recent_12z(now_utc: datetime) -> datetime:
-    """Return the most recent 12z init cycle that is available (~7h publication lag)."""
+    """Return the most recent ECMWF run that should be published (~7h lag for 12z, ~7h lag for 00z).
+
+    Priority: today 12z → today 00z → yesterday 12z.
+    """
     now_utc = now_utc.replace(tzinfo=timezone.utc)
     today_12z = now_utc.replace(hour=12, minute=0, second=0, microsecond=0)
+    today_00z = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     if now_utc >= today_12z + timedelta(hours=7):
         return today_12z
+    if now_utc >= today_00z + timedelta(hours=7):
+        return today_00z
     yesterday = now_utc - timedelta(days=1)
     return yesterday.replace(hour=12, minute=0, second=0, microsecond=0)
 

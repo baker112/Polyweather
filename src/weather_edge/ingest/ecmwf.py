@@ -26,9 +26,9 @@ from weather_edge.exceptions import IngestError
 _logger = logging.getLogger(__name__)
 _MODEL = "ecmwf"
 
-# Lead steps to request (hours from init); covers D+1 only (12z run → ~36h out)
-_STEPS_HRES = list(range(0, 49, 3))
-_STEPS_ENS = list(range(0, 49, 6))
+# Lead steps to request; covers D+1 from either 00z (~36h) or 12z (~24h) run
+_STEPS_HRES = list(range(0, 61, 3))
+_STEPS_ENS = list(range(0, 61, 6))
 
 
 def ingest_forecasts(init_dt: datetime, station: StationConfig) -> pl.DataFrame:
