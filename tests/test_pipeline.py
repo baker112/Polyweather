@@ -265,3 +265,41 @@ def test_lock_picks_idempotency() -> None:
             # Second call must raise
             with pytest.raises(AlreadyLockedError):
                 lock_picks(TARGET_DATE, STATION_ID, NOW_UTC)
+
+
+def test_get_thresholds_per_station_override(tmp_path: Path) -> None:
+    """get_thresholds() should merge per_station overrides over global defaults."""
+    import yaml
+    import weather_edge.config as cfg_mod
+    from weather_edge.config import get_thresholds, load_thresholds
+
+    raw = {
+        "min_edge": 0.04,
+        "max_spread": 0.04,
+        "min_liquidity": 500,
+        "max_raw_prob": 0.85,
+        "market_freshness_minutes": 10,
+        "max_kelly_fraction": 0.25,
+        "per_station": {
+            "LFPB": {"min_liquidity": 200, "min_edge": 0.05},
+        },
+    }
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "thresholds.yaml").write_text(yaml.dump(raw))
+
+    original_dir = cfg_mod._CONFIG_DIR
+    cfg_mod._CONFIG_DIR = config_dir
+    load_thresholds.cache_clear()
+    try:
+        lfpb = get_thresholds("LFPB")
+        assert lfpb.min_liquidity == pytest.approx(200)
+        assert lfpb.min_edge == pytest.approx(0.05)
+        assert lfpb.max_spread == pytest.approx(0.04)  # global default unchanged
+
+        egll = get_thresholds("EGLL")
+        assert egll.min_liquidity == pytest.approx(500)
+        assert egll.min_edge == pytest.approx(0.04)
+    finally:
+        cfg_mod._CONFIG_DIR = original_dir
+        load_thresholds.cache_clear()

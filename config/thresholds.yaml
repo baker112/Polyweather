@@ -4,3 +4,10 @@ min_liquidity: 500
 max_raw_prob: 0.85
 market_freshness_minutes: 10
 max_kelly_fraction: 0.25
+
+# Station-specific overrides — any field above can be overridden per station.
+# Values here take precedence over the global defaults for that station only.
+per_station:
+  LFPB:
+    min_liquidity: 200   # Paris Le Bourget market is typically thinner
+    min_edge: 0.05       # require slightly larger edge to compensate for lower liquidity

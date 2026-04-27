@@ -20,7 +20,7 @@ from typing import Any
 
 import polars as pl
 
-from weather_edge.config import StationConfig, get_station, load_thresholds
+from weather_edge.config import StationConfig, get_station, get_thresholds, load_thresholds
 from weather_edge.exceptions import AlreadyLockedError, EmosError, IngestError, MarketError
 from weather_edge.models import (
     BracketSpec,
@@ -215,7 +215,7 @@ def compute_edges(
     snapshot: MarketSnapshot,
     now_utc: datetime,
 ) -> list[Candidate]:
-    thresholds = load_thresholds()
+    thresholds = get_thresholds(snapshot.station)
     freshness_cutoff = now_utc - timedelta(minutes=thresholds.market_freshness_minutes)
 
     outcome_map = {o.label: o for o in snapshot.outcomes}
@@ -438,7 +438,7 @@ def _summarise_failures(
     bracket_probs: list[Any],
     snapshot: MarketSnapshot,
 ) -> str:
-    thresholds = load_thresholds()
+    thresholds = get_thresholds(snapshot.station)
     outcome_map = {o.label: o for o in snapshot.outcomes}
     failures: list[str] = []
 

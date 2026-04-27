@@ -29,6 +29,7 @@ class ThresholdsConfig(BaseModel):
     max_raw_prob: float
     market_freshness_minutes: int
     max_kelly_fraction: float = 0.25
+    per_station: dict[str, Any] = {}
 
 
 @lru_cache(maxsize=1)
@@ -45,6 +46,17 @@ def load_thresholds() -> ThresholdsConfig:
     with open(path) as f:
         raw: dict[str, Any] = yaml.safe_load(f)
     return ThresholdsConfig(**raw)
+
+
+def get_thresholds(station_id: str) -> ThresholdsConfig:
+    """Return thresholds for a station, applying any per_station overrides."""
+    base = load_thresholds()
+    overrides = base.per_station.get(station_id, {})
+    if not overrides:
+        return base
+    data = {k: v for k, v in base.model_dump().items() if k != "per_station"}
+    data.update(overrides)
+    return ThresholdsConfig(**data)
 
 
 def get_station(icao: str) -> StationConfig:
