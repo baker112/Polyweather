@@ -1,0 +1,16 @@
+[Unit]
+Description=Polyweather scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ohbaker1
+WorkingDirectory=/home/ohbaker1/Polyweather
+EnvironmentFile=/home/ohbaker1/Polyweather/.env
+ExecStart=/home/ohbaker1/Polyweather/.venv/bin/we scheduler --stations EGLC
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
