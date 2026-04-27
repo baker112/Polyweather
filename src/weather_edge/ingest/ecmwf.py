@@ -129,11 +129,13 @@ def _extract_rows(
         _logger.warning("t2m not found in dataset, vars=%s", list(ds.data_vars))
         return []
 
-    # Bilinear interpolation to exact station lat/lon
-    # xarray uses nearest by default for 0.25° grids; linear is fine for ~28 km cells
+    # Normalise longitude to match grid convention (0–360 or –180–180)
+    lon_vals = ds["t2m"].longitude.values
+    station_lon = station.lon % 360 if lon_vals.max() > 180 else station.lon
+
     t2m = ds["t2m"].interp(
         latitude=station.lat,
-        longitude=station.lon % 360,  # ECMWF uses 0-360
+        longitude=station_lon,
         method="linear",
     ) - 273.15  # K → °C
 
