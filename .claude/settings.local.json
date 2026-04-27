@@ -8,7 +8,9 @@
       "Bash(echo \"CLI importable: $?\")",
       "WebFetch(domain:polymarket.com)",
       "Bash(python *)",
-      "mcp__polymarket__search_markets"
+      "mcp__polymarket__search_markets",
+      "Bash(we backfill *)",
+      "Bash(we ingest *)"
     ]
   }
 }
