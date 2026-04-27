@@ -32,11 +32,18 @@ def send(text: str) -> None:
     token, chat_id = creds
     try:
         import httpx
-        httpx.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
+        for attempt in range(4):
+            resp = httpx.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=10,
+            )
+            if resp.status_code != 429:
+                return
+            delay = 2 ** attempt
+            _logger.warning("Telegram rate-limited (429); retrying in %ds (attempt %d/3)", delay, attempt + 1)
+            time.sleep(delay)
+        _logger.warning("Telegram send failed after 3 retries (rate limited)")
     except Exception as exc:
         _logger.warning("Telegram send failed: %s", exc)
 
