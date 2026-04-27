@@ -100,8 +100,20 @@ def _resolve_and_observe_job(station_id: str) -> None:
         _logger.info("Resolved %s %s: %s", station_id, yesterday, resolved_label)
 
         from weather_edge.execution.polymarket_exec import load_executions
+        import json
+        from pathlib import Path
+
         execs = load_executions(station_id, yesterday)
         if execs:
+            clv_path = Path(__file__).parents[4] / "data" / "clv_snapshots" / f"station={station_id}" / f"{yesterday}.json"
+            clv_outcomes: dict[str, float] = {}
+            if clv_path.exists():
+                try:
+                    clv_data = json.loads(clv_path.read_text())
+                    clv_outcomes = {o["label"]: o["mid"] for o in clv_data.get("outcomes", [])}
+                except Exception:
+                    pass
+
             lines = [f"Result: {station_id} {yesterday}  resolved={resolved_label}"]
             for e in execs:
                 if e.get("dry_run"):
@@ -112,12 +124,49 @@ def _resolve_and_observe_job(station_id: str) -> None:
                 stake = float(e.get("usdc_stake", 0))
                 win = (bracket == resolved_label and side == "YES") or (bracket != resolved_label and side == "NO")
                 pnl = (1.0 / entry - 1) * stake if win else -stake
-                lines.append(f"  {side} {bracket}: {'WIN' if win else 'LOSS'}  entry={entry:.2f}  P&L=${pnl:+.2f}")
+                line = f"  {side} {bracket}: {'WIN' if win else 'LOSS'}  entry={entry:.2f}  P&L=${pnl:+.2f}"
+                if bracket in clv_outcomes:
+                    closing = clv_outcomes[bracket]
+                    clv = (closing - entry) if side == "YES" else (entry - closing)
+                    line += f"  CLV={clv:+.3f} (close={closing:.2f})"
+                lines.append(line)
             if len(lines) > 1:
                 _tg.send("\n".join(lines))
     except Exception as exc:
         _logger.error("Resolution failed %s %s: %s", station_id, yesterday, exc)
         _tg.send(f"Resolution FAILED: {station_id} {yesterday}\n{exc}")
+
+
+def _closing_snapshot_job(station_id: str) -> None:
+    """Snapshot the market price at ~01:00z for closing-line value tracking."""
+    import asyncio
+    import json
+    from datetime import timedelta
+    from pathlib import Path
+
+    from weather_edge.config import get_station
+    from weather_edge.market.polymarket import fetch_market
+
+    now_utc = datetime.now(timezone.utc)
+    yesterday = (now_utc - timedelta(days=1)).date()
+    cfg = get_station(station_id)
+    slug = cfg.market_slug_pattern.format(
+        date=yesterday.strftime("%Y-%m-%d"),
+        month_lower=yesterday.strftime("%B").lower(),
+        day=yesterday.day,
+        year=yesterday.year,
+    )
+
+    try:
+        snapshot = asyncio.run(fetch_market(slug, station_id, yesterday))
+        clv_dir = Path(__file__).parents[4] / "data" / "clv_snapshots" / f"station={station_id}"
+        clv_dir.mkdir(parents=True, exist_ok=True)
+        clv_path = clv_dir / f"{yesterday}.json"
+        with open(clv_path, "w") as f:
+            json.dump(snapshot.model_dump(), f, default=str)
+        _logger.info("CLV snapshot saved for %s %s", station_id, yesterday)
+    except Exception as exc:
+        _logger.warning("CLV snapshot failed %s %s: %s", station_id, yesterday, exc)
 
 
 def _refit_job(station_id: str) -> None:
@@ -162,6 +211,10 @@ def start(stations: list[str]) -> None:
         sched.add_job(
             _lock_job, CronTrigger(hour=18, minute=0),
             args=[station_id], id=f"lock_{station_id}", name=f"Lock {station_id}",
+        )
+        sched.add_job(
+            _closing_snapshot_job, CronTrigger(hour=1, minute=0),
+            args=[station_id], id=f"clv_{station_id}", name=f"CLV snapshot {station_id}",
         )
         sched.add_job(
             _resolve_and_observe_job, CronTrigger(hour=2, minute=0),
