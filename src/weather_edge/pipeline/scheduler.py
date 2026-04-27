@@ -56,10 +56,20 @@ def _lock_job(station_id: str) -> None:
             "Locked %s %s: mu=%.2f sigma=%.2f picks=%d",
             station_id, target_date, result.mu, result.sigma, len(result.picks),
         )
+        if result.picks:
+            lines = [f"Pick locked: {station_id} {target_date}  (mu={result.mu:.1f}C, sigma={result.sigma:.2f})"]
+            for p in result.picks:
+                lines.append(
+                    f"  {p.side} {p.bracket_label}  model={p.model_prob:.2f}  mkt={p.market_prob:.2f}  edge={p.edge:+.3f}"
+                )
+            _tg.send("\n".join(lines))
+        else:
+            _tg.send(f"No edge: {station_id} {target_date}\n{result.no_edge_reason or 'all edges below threshold'}")
     except AlreadyLockedError:
         _logger.info("Already locked %s %s", station_id, target_date)
     except Exception as exc:
         _logger.error("Lock failed %s %s: %s", station_id, target_date, exc)
+        _tg.send(f"Lock FAILED: {station_id} {target_date}\n{exc}")
 
 
 def _resolve_and_observe_job(station_id: str) -> None:
@@ -86,9 +96,28 @@ def _resolve_and_observe_job(station_id: str) -> None:
 
     try:
         rec = asyncio.run(resolve_date(station_id, yesterday))
-        _logger.info("Resolved %s %s: %s", station_id, yesterday, rec.get("resolved_label"))
+        resolved_label = rec.get("resolved_label", "unknown")
+        _logger.info("Resolved %s %s: %s", station_id, yesterday, resolved_label)
+
+        from weather_edge.execution.polymarket_exec import load_executions
+        execs = load_executions(station_id, yesterday)
+        if execs:
+            lines = [f"Result: {station_id} {yesterday}  resolved={resolved_label}"]
+            for e in execs:
+                if e.get("dry_run"):
+                    continue
+                bracket = e.get("bracket_label", "?")
+                side = e.get("side", "?")
+                entry = float(e.get("price", 0))
+                stake = float(e.get("usdc_stake", 0))
+                win = (bracket == resolved_label and side == "YES") or (bracket != resolved_label and side == "NO")
+                pnl = (1.0 / entry - 1) * stake if win else -stake
+                lines.append(f"  {side} {bracket}: {'WIN' if win else 'LOSS'}  entry={entry:.2f}  P&L=${pnl:+.2f}")
+            if len(lines) > 1:
+                _tg.send("\n".join(lines))
     except Exception as exc:
         _logger.error("Resolution failed %s %s: %s", station_id, yesterday, exc)
+        _tg.send(f"Resolution FAILED: {station_id} {yesterday}\n{exc}")
 
 
 def _refit_job(station_id: str) -> None:
