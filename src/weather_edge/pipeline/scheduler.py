@@ -207,22 +207,27 @@ def start(stations: list[str]) -> None:
         sched.add_job(
             _ingest_job, CronTrigger(hour=17, minute=30),
             args=[station_id], id=f"ingest_{station_id}", name=f"Ingest {station_id}",
+            max_instances=1,
         )
         sched.add_job(
             _lock_job, CronTrigger(hour=18, minute=0),
             args=[station_id], id=f"lock_{station_id}", name=f"Lock {station_id}",
+            max_instances=1,
         )
         sched.add_job(
             _closing_snapshot_job, CronTrigger(hour=1, minute=0),
             args=[station_id], id=f"clv_{station_id}", name=f"CLV snapshot {station_id}",
+            max_instances=1,
         )
         sched.add_job(
             _resolve_and_observe_job, CronTrigger(hour=2, minute=0),
             args=[station_id], id=f"resolve_{station_id}", name=f"Resolve {station_id}",
+            max_instances=1,
         )
         sched.add_job(
             _refit_job, CronTrigger(day_of_week="sun", hour=3, minute=0),
             args=[station_id], id=f"refit_{station_id}", name=f"Refit {station_id}",
+            max_instances=1,
         )
 
     _logger.info("Scheduler started for stations: %s", stations)
