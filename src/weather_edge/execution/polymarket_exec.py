@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from weather_edge.models import Candidate, MarketOutcome
+from weather_edge import telegram as _tg
 
 _logger = logging.getLogger(__name__)
 _CLOB_HOST = "https://clob.polymarket.com"
@@ -143,10 +144,19 @@ def place_order(
             "Order placed: %s %s %.2f shares @ %.2f → order_id=%s",
             pick.side, pick.bracket_label, shares, price, order_id
         )
+        _tg.send(
+            f"Bet placed: {pick.side} {pick.bracket_label}\n"
+            f"{shares:.2f} shares @ {price:.2f}  (${usdc_stake:.2f} stake)\n"
+            f"order_id: {order_id}"
+        )
     else:
         _logger.info(
             "DRY RUN: would buy %s %.2f shares @ %.2f (stake $%.2f)",
             pick.side, shares, price, usdc_stake
+        )
+        _tg.send(
+            f"[DRY RUN] Would bet: {pick.side} {pick.bracket_label}\n"
+            f"{shares:.2f} shares @ {price:.2f}  (${usdc_stake:.2f} stake)"
         )
 
     return record

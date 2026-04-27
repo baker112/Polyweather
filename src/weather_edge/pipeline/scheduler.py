@@ -11,6 +11,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+from weather_edge import telegram as _tg
+
 _logger = logging.getLogger(__name__)
 
 
@@ -26,13 +28,17 @@ def _ingest_job(station_id: str) -> None:
     init_dt = _most_recent_12z(now_utc)
     cfg = get_station(station_id)
 
+    results: list[str] = []
     for model_name, fetch_fn in [("ecmwf", ecmwf.ingest_forecasts), ("gefs", gefs.ingest_forecasts)]:
         try:
             df = fetch_fn(init_dt, cfg)
             store.write_forecasts(df, model_name, init_dt, station_id)
             _logger.info("Ingested %s %s: %d rows", model_name, init_dt, len(df))
+            results.append(f"{model_name}: {len(df)} rows")
         except Exception as exc:
             _logger.error("Ingest %s failed: %s", model_name, exc)
+            results.append(f"{model_name}: FAILED ({exc})")
+    _tg.send(f"Ingest {station_id} {init_dt.date()}\n" + "\n".join(results))
 
 
 def _lock_job(station_id: str) -> None:
