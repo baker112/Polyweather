@@ -8,7 +8,7 @@ Type=simple
 User=ohbaker1
 WorkingDirectory=/home/ohbaker1/Polyweather
 EnvironmentFile=/home/ohbaker1/Polyweather/.env
-ExecStart=/home/ohbaker1/Polyweather/.venv/bin/we scheduler --stations EGLC
+ExecStart=/home/ohbaker1/Polyweather/.venv/bin/we scheduler --stations EGLC,LFPB
 Restart=on-failure
 RestartSec=30
 
