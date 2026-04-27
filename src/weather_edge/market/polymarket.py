@@ -186,39 +186,50 @@ async def _get_book(client: httpx.AsyncClient, token_id: str) -> dict[str, float
 # ─── Bracket parsing ──────────────────────────────────────────────────────────
 
 def _parse_bracket(label: str) -> tuple[float | None, float | None]:
-    """Extract (low, high) bracket bounds from a Polymarket temperature outcome label.
+    """Extract (low, high) bracket bounds in Celsius from a Polymarket temperature outcome label.
 
-    Applies ±0.5°C boundary adjustment to account for Wunderground's integer rounding
-    (reported N°C → actual ∈ [N−0.5, N+0.5)).
+    Supports both Celsius (European markets) and Fahrenheit (US markets, auto-detected from label).
+    Applies ±0.5 unit boundary adjustment to account for integer rounding in resolution sources.
 
-    Examples:
+    Celsius examples:
       "15°C or below"  → (None, 15.5)
       "16°C"           → (15.5, 16.5)
       "25°C or higher" → (24.5, None)
-      "16°C to 18°C"   → (16.0, 18.0)  (range — no shift applied)
+
+    Fahrenheit examples (converted to Celsius in output):
+      "85°F or higher" → ((84.5-32)/1.8, None) = (29.17, None)
+      "90°F"           → ((89.5-32)/1.8, (90.5-32)/1.8) = (31.94, 32.50)
     """
     s = label.lower().strip()
+    is_fahrenheit = "°f" in s or ("\xb0f" in s) or (
+        re.search(r"\d+\s*f\b", s) is not None and "°c" not in s and "\xb0c" not in s
+    )
     nums = [float(n) for n in re.findall(r"\d+(?:\.\d+)?", s)]
 
     is_lower_tail = any(kw in s for kw in ("below", "under", "or below", "or lower", "or less"))
     is_upper_tail = any(kw in s for kw in ("above", "over", "or higher", "or above", "or more"))
 
     if is_lower_tail and nums:
-        return None, nums[0] + 0.5  # "15°C or below" → (None, 15.5)
+        return None, _to_celsius(nums[0] + 0.5, is_fahrenheit)
 
     if is_upper_tail and nums:
-        return nums[0] - 0.5, None  # "25°C or higher" → (24.5, None)
+        return _to_celsius(nums[0] - 0.5, is_fahrenheit), None
 
     if len(nums) == 1:
-        # Exact single integer bracket: "16°C" → (15.5, 16.5)
-        return nums[0] - 0.5, nums[0] + 0.5
+        return _to_celsius(nums[0] - 0.5, is_fahrenheit), _to_celsius(nums[0] + 0.5, is_fahrenheit)
 
     if len(nums) >= 2:
-        # Explicit range — no rounding adjustment needed
-        return nums[0], nums[1]
+        # Explicit range — no rounding adjustment, just unit conversion
+        return _to_celsius(nums[0], is_fahrenheit), _to_celsius(nums[1], is_fahrenheit)
 
     _logger.warning("Could not parse bracket bounds from label: %r", label)
     return None, None
+
+
+def _to_celsius(value: float, is_fahrenheit: bool) -> float:
+    if is_fahrenheit:
+        return (value - 32.0) / 1.8
+    return value
 
 
 # ─── Utility ──────────────────────────────────────────────────────────────────

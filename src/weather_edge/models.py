@@ -82,6 +82,7 @@ class Candidate(BaseModel):
     side: str  # "YES" or "NO"
     spread: float
     liquidity: float
+    kelly_fraction: float = 0.0  # full Kelly stake fraction (cap externally)
     gates: dict[str, bool]
     raw_values: dict[str, float]
 

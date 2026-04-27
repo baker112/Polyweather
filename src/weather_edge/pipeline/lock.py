@@ -213,6 +213,12 @@ def compute_edges(
             "market_fresh": snapshot.fetched_at >= freshness_cutoff,
         }
 
+        # Full Kelly fraction: f* = |edge| / price_of_losing_side
+        if edge > 0:  # YES bet
+            kelly = edge / (1.0 - outcome.mid) if outcome.mid < 1.0 else 0.0
+        else:  # NO bet
+            kelly = abs(edge) / outcome.mid if outcome.mid > 0.0 else 0.0
+
         candidates.append(Candidate(
             bracket_label=bp.label,
             low=bp.low,
@@ -223,6 +229,7 @@ def compute_edges(
             side="YES" if edge > 0 else "NO",
             spread=outcome.spread,
             liquidity=outcome.liquidity,
+            kelly_fraction=round(kelly, 4),
             gates=gates,
             raw_values={
                 "edge": edge,

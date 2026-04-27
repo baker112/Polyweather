@@ -23,6 +23,14 @@ _console = Console()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 
+def _notify(title: str, body: str) -> None:
+    try:
+        import plyer  # type: ignore[import-untyped]
+        plyer.notification.notify(title=title, message=body, timeout=10)
+    except Exception:
+        pass
+
+
 # ─── Ingest commands ──────────────────────────────────────────────────────────
 
 @ingest_app.command("forecasts")
@@ -310,6 +318,7 @@ def lock_cmd(
             table.add_column("Model %", justify="right")
             table.add_column("Market %", justify="right")
             table.add_column("Edge", justify="right")
+            table.add_column("Kelly %", justify="right")
             for pick in result.picks:
                 table.add_row(
                     pick.bracket_label,
@@ -317,10 +326,15 @@ def lock_cmd(
                     f"{pick.model_prob*100:.1f}",
                     f"{pick.market_prob*100:.1f}",
                     f"{pick.edge*100:+.1f}",
+                    f"{pick.kelly_fraction*100:.1f}",
                 )
             _console.print(table)
+            _notify(
+                "Weather Edge: Edge Found!",
+                f"{station_id} {target_date}: {len(result.picks)} pick(s)",
+            )
         else:
-            _console.print(f"  [yellow]No edge — {result.no_edge_reason}[/yellow]")
+            _console.print(f"  [yellow]No edge -- {result.no_edge_reason}[/yellow]")
 
 
 # ─── Backtest ─────────────────────────────────────────────────────────────────

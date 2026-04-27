@@ -18,7 +18,7 @@ st.title("Weather Edge")
 
 from weather_edge.store import parquet as store
 
-STATIONS = ["EGLC"]
+STATIONS = ["EGLC", "EGLL", "EHAM", "EDDF", "LFPB", "KJFK", "KLAX", "KORD", "KMIA"]
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 
@@ -26,11 +26,19 @@ with st.sidebar:
     st.header("Settings")
     station = st.selectbox("Station", STATIONS)
     today = date.today()
+    auto_refresh = st.checkbox("Auto-refresh (60s)", value=False)
+    if auto_refresh:
+        import time
+        st.caption("Refreshing every 60s...")
+        time.sleep(60)
+        st.rerun()
 
 
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
 
-tab_today, tab_history, tab_data, tab_model = st.tabs(["Today", "History", "Data", "Model"])
+tab_today, tab_history, tab_data, tab_model, tab_calibration = st.tabs(
+    ["Today", "History", "Data", "Model", "Calibration"]
+)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -100,12 +108,28 @@ with tab_today:
                         marker_color=bar_colors, opacity=0.85)
             fig.add_bar(name="Market %", x=labels, y=[p * 100 for p in market_probs],
                         marker_color="lightcoral", opacity=0.85)
+
+            # Gaussian density overlay scaled to match bar heights
+            import numpy as np
+            from scipy.stats import norm as _norm
+            xs = np.linspace(mu - 4 * sigma, mu + 4 * sigma, 300)
+            ys = _norm.pdf(xs, mu, sigma)
+            # Scale so peak matches ~max model prob * 100
+            max_prob = max(model_probs) if model_probs else 0.1
+            ys_scaled = ys / ys.max() * max_prob * 100
+            fig.add_scatter(
+                x=xs.tolist(), y=ys_scaled.tolist(),
+                mode="lines", name="Gaussian PDF",
+                line=dict(color="lime", width=2, dash="dot"),
+                yaxis="y",
+            )
+
             fig.update_layout(
                 barmode="group",
                 title=f"Model vs Market — {station} {target_date}",
                 xaxis_title="Bracket",
                 yaxis_title="Probability (%)",
-                height=400,
+                height=420,
                 legend=dict(orientation="h"),
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -293,3 +317,105 @@ with tab_model:
             col3.metric("Min leaf", qrf_meta.get("min_samples_leaf", "?"))
     else:
         st.info("No QRF params found.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CALIBRATION TAB
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_calibration:
+    st.subheader("Model Calibration")
+
+    resolutions = store.read_all_resolutions(station)
+    all_picks = store.read_all_picks(station)
+
+    # Build (model_prob, observed_freq) pairs for reliability diagram
+    # Each pick has a model_prob; resolved = 1 if resolved_label == bracket_label, else 0
+    res_map = {r["date"]: r for r in resolutions if r.get("resolved")}
+
+    calibration_rows = []
+    pit_values = []
+
+    # Load observations for PIT computation
+    obs_df = store.read_observations(station, date(2025, 1, 1), today)
+    obs_by_date: dict[str, float] = {}
+    if not obs_df.is_empty():
+        for row in obs_df.iter_rows(named=True):
+            obs_by_date[str(row["date"])] = row["daily_max_c"]
+
+    for pk in all_picks:
+        d = pk["date"]
+        if d not in res_map:
+            continue
+        res = res_map[d]
+        resolved_label = res.get("resolved_label")
+
+        for pick in pk.get("picks", []):
+            outcome = 1 if pick["bracket_label"] == resolved_label else 0
+            calibration_rows.append({
+                "model_prob": pick["model_prob"],
+                "outcome": outcome,
+            })
+
+        # PIT: P(X <= obs | model N(mu, sigma))
+        obs_temp = obs_by_date.get(d)
+        if obs_temp is not None and pk.get("mu") and pk.get("sigma"):
+            from scipy.stats import norm as _norm
+            pit = float(_norm.cdf(obs_temp, pk["mu"], pk["sigma"]))
+            pit_values.append(pit)
+
+    import plotly.graph_objects as go
+    import numpy as np
+
+    if len(calibration_rows) >= 5:
+        probs = [r["model_prob"] for r in calibration_rows]
+        outcomes = [r["outcome"] for r in calibration_rows]
+        bins = np.linspace(0, 1, 11)
+        bin_centers = (bins[:-1] + bins[1:]) / 2
+        obs_freq = []
+        counts = []
+        for lo, hi in zip(bins[:-1], bins[1:]):
+            mask = [lo <= p < hi for p in probs]
+            n = sum(mask)
+            counts.append(n)
+            obs_freq.append(sum(o for o, m in zip(outcomes, mask) if m) / n if n > 0 else None)
+
+        fig_cal = go.Figure()
+        fig_cal.add_scatter(
+            x=bin_centers.tolist(), y=obs_freq,
+            mode="markers+lines", name="Observed freq",
+            marker=dict(size=8, color="steelblue"),
+            line=dict(color="steelblue"),
+        )
+        fig_cal.add_scatter(
+            x=[0, 1], y=[0, 1], mode="lines", name="Perfect",
+            line=dict(color="gray", dash="dash"),
+        )
+        fig_cal.update_layout(
+            title="Reliability Diagram (model prob vs observed frequency)",
+            xaxis_title="Forecast probability", yaxis_title="Observed frequency",
+            height=350, xaxis=dict(range=[0, 1]), yaxis=dict(range=[0, 1]),
+        )
+        st.plotly_chart(fig_cal, use_container_width=True)
+        st.caption(f"Based on {len(calibration_rows)} bracket-outcome pairs. "
+                   f"Bin counts: {counts}")
+    else:
+        st.info(f"Need at least 5 resolved picks for reliability diagram (have {len(calibration_rows)}).")
+
+    if len(pit_values) >= 5:
+        fig_pit = go.Figure(go.Histogram(
+            x=pit_values, nbinsx=10,
+            marker_color="steelblue", opacity=0.8, name="PIT",
+        ))
+        expected = len(pit_values) / 10
+        fig_pit.add_hline(y=expected, line_dash="dash", line_color="gray",
+                          annotation_text="Uniform")
+        fig_pit.update_layout(
+            title="PIT Histogram (uniform = well-calibrated)",
+            xaxis_title="PIT value", yaxis_title="Count",
+            height=300,
+        )
+        st.plotly_chart(fig_pit, use_container_width=True)
+        st.caption(f"PIT values from {len(pit_values)} resolved lock dates.")
+    else:
+        st.info(f"Need at least 5 resolved lock dates for PIT histogram (have {len(pit_values)}).")

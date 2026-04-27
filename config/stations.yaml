@@ -39,10 +39,10 @@ EDDF:
   resolution_field: "daily_max_metar_local"
   lock_time_utc: "18:00"
 
-LFPG:
-  name: Paris Charles de Gaulle
-  lat: 49.0097
-  lon: 2.5479
+LFPB:
+  name: Paris Le Bourget
+  lat: 48.9736
+  lon: 2.4418
   timezone: Europe/Paris
   unit: celsius
   market_slug_pattern: "highest-temperature-in-paris-on-{month_lower}-{day}-{year}"
@@ -54,7 +54,37 @@ KJFK:
   lat: 40.6413
   lon: -73.7781
   timezone: America/New_York
-  unit: celsius
+  unit: fahrenheit
   market_slug_pattern: "highest-temperature-in-new-york-city-on-{month_lower}-{day}-{year}"
+  resolution_field: "daily_max_metar_local"
+  lock_time_utc: "18:00"
+
+KLAX:
+  name: Los Angeles International
+  lat: 33.9425
+  lon: -118.4081
+  timezone: America/Los_Angeles
+  unit: fahrenheit
+  market_slug_pattern: "highest-temperature-in-los-angeles-on-{month_lower}-{day}-{year}"
+  resolution_field: "daily_max_metar_local"
+  lock_time_utc: "18:00"
+
+KORD:
+  name: Chicago O'Hare International
+  lat: 41.9742
+  lon: -87.9073
+  timezone: America/Chicago
+  unit: fahrenheit
+  market_slug_pattern: "highest-temperature-in-chicago-on-{month_lower}-{day}-{year}"
+  resolution_field: "daily_max_metar_local"
+  lock_time_utc: "18:00"
+
+KMIA:
+  name: Miami International
+  lat: 25.7959
+  lon: -80.2870
+  timezone: America/New_York
+  unit: fahrenheit
+  market_slug_pattern: "highest-temperature-in-miami-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local"
   lock_time_utc: "18:00"
