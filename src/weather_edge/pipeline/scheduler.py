@@ -145,4 +145,20 @@ def start(stations: list[str]) -> None:
 
     _logger.info("Scheduler started for stations: %s", stations)
     _logger.info("Jobs: ingest@17:30z, lock@18:00z, resolve+obs@02:00z, refit@Sun03:00z")
+
+    def _status() -> str:
+        now = datetime.now(timezone.utc)
+        lines = [f"Scheduler running — {now.strftime('%Y-%m-%d %H:%M')} UTC", ""]
+        for job in sched.get_jobs():
+            next_run = job.next_run_time
+            if next_run:
+                delta = next_run - now
+                h, m = divmod(int(delta.total_seconds()) // 60, 60)
+                lines.append(f"{job.name}: next in {h}h {m}m ({next_run.strftime('%H:%M')}z)")
+            else:
+                lines.append(f"{job.name}: not scheduled")
+        return "\n".join(lines)
+
+    _tg.start_command_listener(_status)
+    _tg.send(f"Scheduler started — stations: {', '.join(stations)}\nSend /status to check next job times.")
     sched.start()
