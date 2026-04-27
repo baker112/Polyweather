@@ -49,15 +49,21 @@ def lock_picks(
     target_date: date,
     station_id: str,
     now_utc: datetime,
+    force: bool = False,
 ) -> LockedPicks:
     """Orchestrate stages 1-6 and write immutable picks file.
 
     Raises AlreadyLockedError if picks already exist for this (date, station).
+    Pass force=True to overwrite existing picks with fresh market data.
     """
     from weather_edge.logging import log_event
 
     if store.picks_exist(station_id, target_date):
-        raise AlreadyLockedError(f"Picks already locked for {station_id} on {target_date}")
+        if not force:
+            raise AlreadyLockedError(f"Picks already locked for {station_id} on {target_date}")
+        _logger.info("Force re-lock: deleting existing picks for %s %s", station_id, target_date)
+        picks_path = store._DATA_DIR / "picks" / f"date={target_date}" / f"station={station_id}" / "picks.json"
+        picks_path.unlink(missing_ok=True)
 
     station = get_station(station_id)
     t0 = time.monotonic()

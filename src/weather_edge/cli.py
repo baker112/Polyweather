@@ -282,6 +282,9 @@ def lock_cmd(
     all_stations: Annotated[
         bool, typer.Option("--all-stations", help="Run for all configured stations")
     ] = False,
+    force: Annotated[
+        bool, typer.Option("--force", "-f", help="Overwrite existing picks with fresh market data")
+    ] = False,
 ) -> None:
     """Run the full pipeline and lock picks for the target date."""
     from weather_edge.config import load_stations
@@ -300,7 +303,7 @@ def lock_cmd(
     for station_id in stations_to_run:
         _console.print(f"Locking picks for [bold]{station_id}[/bold] date=[bold]{target_date}[/bold]")
         try:
-            result = lock_picks(target_date, station_id, now_utc)
+            result = lock_picks(target_date, station_id, now_utc, force=force)
         except AlreadyLockedError as exc:
             _console.print(f"  [yellow]{exc}[/yellow]")
             continue
