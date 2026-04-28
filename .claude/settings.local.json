@@ -10,7 +10,11 @@
       "Bash(python *)",
       "mcp__polymarket__search_markets",
       "Bash(we backfill *)",
-      "Bash(we ingest *)"
+      "Bash(we ingest *)",
+      "Bash(pip index *)",
+      "Bash(git -C \"C:/Users/olive/documents/github/polyweather\" add src/weather_edge/pipeline/scheduler.py polyweather.service)",
+      "Bash(git -C C:/Users/olive/documents/github/polyweather commit -m ' *)",
+      "Bash(git -C \"C:/Users/olive/documents/github/polyweather\" push)"
     ]
   }
 }

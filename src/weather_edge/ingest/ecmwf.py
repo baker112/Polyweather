@@ -124,7 +124,6 @@ def _extract_rows(
         _logger.warning("cfgrib open failed for %s: %s", grib_path, exc)
         return []
 
-    _logger.info("cfgrib opened %s: vars=%s dims=%s", grib_path.name, list(ds.data_vars), dict(ds.dims))
     if "t2m" not in ds:
         _logger.warning("t2m not found in dataset, vars=%s", list(ds.data_vars))
         return []
@@ -138,10 +137,6 @@ def _extract_rows(
         longitude=station_lon,
         method="linear",
     ) - 273.15  # K → °C
-
-    _logger.info("t2m after interp: dims=%s shape=%s first3=%s", t2m.dims, t2m.shape, t2m.values[:3])
-    _logger.info("lon coord sample: %s", ds["t2m"].longitude.values[-5:])
-    _logger.info("lat coord sample: %s", ds["t2m"].latitude.values[:5])
 
     rows: list[dict[str, Any]] = []
 

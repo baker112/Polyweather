@@ -1,9 +1,11 @@
 """Daily pipeline scheduler using APScheduler.
 
-Jobs (all UTC):
-  17:30z — ingest ECMWF + GEFS forecasts (12z run usually published by ~17z)
-  18:00z — lock picks for D+1
-  02:00z — ingest yesterday's observations + resolve yesterday's market
+Jobs (all UTC, staggered 2-3 min per station):
+  ~17:30z — ingest ECMWF + GEFS forecasts (12z run usually published by ~17z)
+  lock_time_utc — lock picks for D+1 (per-station, set in config/stations.yaml)
+  lock_time_utc+5m — execute orders
+  ~01:00z — CLV closing snapshot
+  ~02:00z — ingest yesterday's observations + resolve yesterday's market
   Sunday 03:00z — re-fit EMOS and QRF models
 """
 from __future__ import annotations
@@ -286,34 +288,56 @@ def start(stations: list[str]) -> None:
 
     sched = BlockingScheduler(timezone="UTC")
 
-    for station_id in stations:
+    from weather_edge.config import get_station as _get_station
+
+    for i, station_id in enumerate(stations):
+        cfg = _get_station(station_id)
+        lock_h, lock_m = map(int, cfg.lock_time_utc.split(":"))
+
+        # Ingest runs 30 min before lock so the forecast is cached when lock fires.
+        # CLV/resolve are staggered 2 min apart by index (low-traffic cleanup jobs).
+        ingest_total_m = lock_h * 60 + lock_m - 30
+        ingest_h, ingest_m = divmod(ingest_total_m, 60)
+
+        exec_total_m = lock_h * 60 + lock_m + 5
+        exec_h, exec_m = divmod(exec_total_m, 60)
+
+        clv_total_m = 1 * 60 + 0 + i * 2
+        clv_h, clv_m = divmod(clv_total_m, 60)
+
+        resolve_total_m = 2 * 60 + 0 + i * 2
+        resolve_h, resolve_m = divmod(resolve_total_m, 60)
+
         sched.add_job(
-            _ingest_job, CronTrigger(hour=17, minute=30),
+            _ingest_job, CronTrigger(hour=ingest_h, minute=ingest_m),
             args=[station_id], id=f"ingest_{station_id}", name=f"Ingest {station_id}",
         )
         sched.add_job(
-            _lock_job, CronTrigger(hour=18, minute=0),
+            _lock_job, CronTrigger(hour=lock_h, minute=lock_m),
             args=[station_id], id=f"lock_{station_id}", name=f"Lock {station_id}",
         )
         sched.add_job(
-            _execute_job, CronTrigger(hour=18, minute=5),
+            _execute_job, CronTrigger(hour=exec_h, minute=exec_m),
             args=[station_id], id=f"execute_{station_id}", name=f"Execute {station_id}",
         )
         sched.add_job(
-            _closing_snapshot_job, CronTrigger(hour=1, minute=0),
+            _closing_snapshot_job, CronTrigger(hour=clv_h, minute=clv_m),
             args=[station_id], id=f"clv_{station_id}", name=f"CLV snapshot {station_id}",
         )
         sched.add_job(
-            _resolve_and_observe_job, CronTrigger(hour=2, minute=0),
+            _resolve_and_observe_job, CronTrigger(hour=resolve_h, minute=resolve_m),
             args=[station_id], id=f"resolve_{station_id}", name=f"Resolve {station_id}",
         )
         sched.add_job(
             _refit_job, CronTrigger(day_of_week="sun", hour=3, minute=0),
             args=[station_id], id=f"refit_{station_id}", name=f"Refit {station_id}",
         )
+        _logger.info(
+            "Scheduled %s: ingest@%02d:%02dz lock@%02d:%02dz execute@%02d:%02dz",
+            station_id, ingest_h, ingest_m, lock_h, lock_m, exec_h, exec_m,
+        )
 
     _logger.info("Scheduler started for stations: %s", stations)
-    _logger.info("Jobs: ingest@17:30z, lock@18:00z, resolve+obs@02:00z, refit@Sun03:00z")
 
     import os as _os
 
