@@ -1,14 +1,15 @@
 """GEFS ingestion from AWS S3 Open Data (anonymous access).
 
 Bucket:  noaa-gefs-pds
-Path:    gefs.{YYYYMMDD}/{HH}/atmos/pgrb2sp25/
-Files:   gec00.t{HH}z.pgrb2s.0p25.f{FFF}   (control)
-         gep{NN}.t{HH}z.pgrb2s.0p25.f{FFF}  (perturbed, NN=01-30)
+Path:    gefs.{YYYYMMDD}/{HH}/atmos/pgrb2ap5/
+Files:   gec00.t{HH}z.pgrb2a.0p50.f{FFF}   (control)
+         gep{NN}.t{HH}z.pgrb2a.0p50.f{FFF}  (perturbed, NN=01-30)
 
-GEFS GEFSv12 notes:
-  - pgrb2sp25 = subset product at 0.25° resolution, 3-hourly steps to f240
-  - Each file is ~17 MB but contains ~50 fields; we use byte-range reads on
-    the .idx sidecar to download only the 2m TMP field (~400 KB/file)
+GEFS GEFSv12 notes (post-2024 NOAA reorg):
+  - pgrb2ap5 = primary product at 0.5° resolution, 3-hourly to f240, then 6-hourly to f384
+  - pgrb2sp25 (0.25°) now contains ONLY ensemble stats (geavg/gespr), no per-member
+  - Each file ~5 MB; we use byte-range reads on the .idx sidecar to download only
+    the 2m TMP field (~100 KB/file)
   - Members: c00 (control) + p01-p30 (perturbed) = 31 total
 """
 from __future__ import annotations
@@ -67,9 +68,14 @@ def ingest_forecasts(
     hour_str = f"{init_dt.hour:02d}"
     base = f"{_BUCKET}/gefs.{date_str}/{hour_str}/atmos"
 
-    # pgrb2sp25 (subset) exists for recent runs; pgrb2ap25 for older/archived runs.
-    # Try subset first, fall back to the full product.
-    _PRODUCTS = [("pgrb2sp25", "pgrb2s"), ("pgrb2ap25", "pgrb2a")]
+    # Per-member files live in pgrb2ap5 (0.5°) since NOAA's 2024 reorg.
+    # pgrb2sp25 (0.25°) kept as a fallback in case NOAA restores it; today it only
+    # carries ensemble stats (geavg/gespr) so the lookup will 404 cleanly.
+    # Tuple: (subdir, filename suffix, resolution token used in filename)
+    _PRODUCTS = [
+        ("pgrb2ap5", "pgrb2a", "0p50"),
+        ("pgrb2sp25", "pgrb2s", "0p25"),
+    ]
 
     steps_to_fetch = steps if steps is not None else _STEPS
 
@@ -87,8 +93,8 @@ def ingest_forecasts(
                 tmp_path = Path(tmpdir) / f"m{member_id:02d}_f{step_str}.grib2"
 
                 temp_c = None
-                for prod_dir, prod_sfx in _PRODUCTS:
-                    fname = f"{mem_pfx}.t{hour_str}z.{prod_sfx}.0p25.f{step_str}"
+                for prod_dir, prod_sfx, prod_res in _PRODUCTS:
+                    fname = f"{mem_pfx}.t{hour_str}z.{prod_sfx}.{prod_res}.f{step_str}"
                     key = f"{base}/{prod_dir}/{fname}"
                     temp_c = _fetch_tmp_field(fs, key, tmp_path, station.lat, station.lon)
                     if temp_c is not None:
