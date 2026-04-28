@@ -33,7 +33,12 @@ def _ingest_job(station_id: str) -> None:
     results: list[str] = []
     for model_name, fetch_fn in [("ecmwf", ecmwf.ingest_forecasts), ("gefs", gefs.ingest_forecasts)]:
         try:
-            df = fetch_fn(init_dt, cfg)
+            # GEFS: download only step=24 (matches backfill mode + lock.py _DEFAULT_LEAD_HOURS).
+            # ~30s per station instead of ~15 min for all steps.
+            if model_name == "gefs":
+                df = fetch_fn(init_dt, cfg, steps=[24])
+            else:
+                df = fetch_fn(init_dt, cfg)
             store.write_forecasts(df, model_name, init_dt, station_id)
             _logger.info("Ingested %s %s: %d rows", model_name, init_dt, len(df))
             results.append(f"{model_name}: {len(df)} rows")
@@ -151,7 +156,12 @@ def _resolve_and_observe_job(station_id: str) -> None:
 
 
 def _execute_job(station_id: str) -> None:
-    """Place orders for tomorrow's locked picks. Dry-run unless LIVE_TRADING=true."""
+    """Place orders for tomorrow's locked picks.
+
+    Gated by TRADING_ENABLED (master switch, set via /mode). When disabled, the
+    job no-ops so picks are still locked but no orders are placed or simulated.
+    Dry-run vs live is controlled by LIVE_TRADING.
+    """
     import asyncio
     import os
     from datetime import timedelta
@@ -162,6 +172,10 @@ def _execute_job(station_id: str) -> None:
     from weather_edge.market.polymarket import fetch_market
     from weather_edge.models import LockedPicks, MarketSnapshot
     from weather_edge.store import parquet as store
+
+    if os.getenv("TRADING_ENABLED", "false").lower() != "true":
+        _logger.info("Trading disabled (TRADING_ENABLED!=true) — skipping execute for %s", station_id)
+        return
 
     dry_run = os.getenv("LIVE_TRADING", "false").lower() != "true"
     now_utc = datetime.now(timezone.utc)
@@ -278,6 +292,159 @@ def _refit_job(station_id: str) -> None:
         _logger.info("Re-fitted QRF %s n=%d", station_id, len(pairs_qrf))
 
 
+# ─── /mode helpers ────────────────────────────────────────────────────────────
+
+def _env_path() -> "Any":
+    from pathlib import Path
+    return Path(__file__).parents[3] / ".env"
+
+
+def _write_env(updates: dict[str, str]) -> None:
+    """Persist env vars to .env (project root) and update os.environ for the running process."""
+    import os
+    env_path = _env_path()
+    lines = env_path.read_text().splitlines() if env_path.exists() else []
+    keys = set(updates.keys())
+    lines = [l for l in lines if not any(l.startswith(f"{k}=") for k in keys)]
+    for k, v in updates.items():
+        lines.append(f"{k}={v}")
+        os.environ[k] = v
+    env_path.write_text("\n".join(lines) + "\n")
+
+
+def _current_mode() -> str:
+    """Return 'off', 'dryrun', or 'live' based on TRADING_ENABLED + LIVE_TRADING."""
+    import os
+    if os.getenv("TRADING_ENABLED", "false").lower() != "true":
+        return "off"
+    if os.getenv("LIVE_TRADING", "false").lower() == "true":
+        return "live"
+    return "dryrun"
+
+
+# ─── Daily summary ────────────────────────────────────────────────────────────
+
+def _daily_summary_job(stations: list[str]) -> None:
+    """Send a consolidated Telegram digest: yesterday P&L + bankroll + tomorrow's picks."""
+    from datetime import timedelta
+
+    from weather_edge.execution import bankroll as br
+    from weather_edge.execution.polymarket_exec import load_executions
+    from weather_edge.models import LockedPicks
+    from weather_edge.store import parquet as store
+
+    now = datetime.now(timezone.utc)
+    yesterday = (now - timedelta(days=1)).date()
+    tomorrow = (now + timedelta(days=1)).date()
+
+    lines = [f"<b>Daily summary — {now.strftime('%Y-%m-%d %H:%M')}z</b>"]
+    lines.append(f"Mode: {_current_mode()}")
+
+    # Yesterday P&L per station
+    lines.append("\n<b>Yesterday P&amp;L:</b>")
+    total_pnl = 0.0
+    any_live = False
+    for sid in stations:
+        rec = store.read_resolution(sid, yesterday)
+        execs = load_executions(sid, yesterday)
+        live_execs = [e for e in execs if not e.get("dry_run")]
+        if not live_execs:
+            lines.append(f"  {sid}: no live bets")
+            continue
+        any_live = True
+        if rec and rec.get("resolved"):
+            pnl = sum(float(e.get("pnl", 0.0)) for e in live_execs)
+            total_pnl += pnl
+            lines.append(f"  {sid}: resolved={rec['resolved_label']}  P&amp;L=${pnl:+.2f}")
+        else:
+            lines.append(f"  {sid}: pending resolution")
+    if any_live:
+        lines.append(f"  <b>Total: ${total_pnl:+.2f}</b>")
+
+    # Bankroll
+    try:
+        b = br.load()
+        lines.append(
+            f"\n<b>Bankroll:</b> ${b['current_usdc']:.2f}  "
+            f"(reserved=${b.get('reserved_usdc', 0):.2f}, total P&amp;L=${b.get('total_pnl', 0):+.2f}, "
+            f"{b.get('n_trades', 0)} trades)"
+        )
+    except FileNotFoundError:
+        lines.append("\nBankroll not initialised.")
+
+    # Tomorrow's picks
+    lines.append(f"\n<b>Picks for {tomorrow}:</b>")
+    for sid in stations:
+        data = store.read_picks(sid, tomorrow)
+        if data is None:
+            lines.append(f"  {sid}: not locked yet")
+            continue
+        try:
+            locked = LockedPicks(**data)
+        except Exception:
+            lines.append(f"  {sid}: malformed picks file")
+            continue
+        if locked.picks:
+            for p in locked.picks:
+                lines.append(
+                    f"  {sid} {p.side} {p.bracket_label}  "
+                    f"edge={p.edge:+.3f}  kelly={p.kelly_fraction*100:.1f}%"
+                )
+        else:
+            lines.append(f"  {sid}: no edge ({locked.no_edge_reason or 'all below threshold'})")
+
+    _tg.send("\n".join(lines))
+
+
+# ─── Catch-up ──────────────────────────────────────────────────────────────────
+
+def _catchup(stations: list[str]) -> None:
+    """At scheduler startup, run any lock/execute jobs that should already have fired today.
+
+    For each station: if now > lock_time + 15min and tomorrow's picks don't exist,
+    run lock immediately. If now > exec_time + 5min and picks exist but no executions
+    are recorded, run execute. Idempotent — safe across multiple restarts.
+    """
+    from datetime import timedelta
+
+    from weather_edge.config import get_station
+    from weather_edge.execution.polymarket_exec import load_executions
+    from weather_edge.store import parquet as store
+
+    now = datetime.now(timezone.utc)
+    tomorrow = (now + timedelta(days=1)).date()
+
+    for station_id in stations:
+        try:
+            cfg = get_station(station_id)
+        except Exception as exc:
+            _logger.warning("Catch-up: cannot load %s: %s", station_id, exc)
+            continue
+
+        lock_h, lock_m = map(int, cfg.lock_time_utc.split(":"))
+        lock_dt = now.replace(hour=lock_h, minute=lock_m, second=0, microsecond=0)
+        exec_dt = lock_dt + timedelta(minutes=5)
+
+        if now > lock_dt + timedelta(minutes=15):
+            if store.read_picks(station_id, tomorrow) is None:
+                _logger.info("Catch-up: running missed lock for %s %s", station_id, tomorrow)
+                _tg.send(f"Catch-up: running missed lock for {station_id} {tomorrow}")
+                try:
+                    _lock_job(station_id)
+                except Exception as exc:
+                    _logger.error("Catch-up lock failed %s: %s", station_id, exc)
+
+        if now > exec_dt + timedelta(minutes=5):
+            picks_data = store.read_picks(station_id, tomorrow)
+            if picks_data and picks_data.get("picks"):
+                if not load_executions(station_id, tomorrow):
+                    _logger.info("Catch-up: running missed execute for %s %s", station_id, tomorrow)
+                    try:
+                        _execute_job(station_id)
+                    except Exception as exc:
+                        _logger.error("Catch-up execute failed %s: %s", station_id, exc)
+
+
 def start(stations: list[str]) -> None:
     """Start the blocking daily scheduler."""
     try:
@@ -337,14 +504,23 @@ def start(stations: list[str]) -> None:
             station_id, ingest_h, ingest_m, lock_h, lock_m, exec_h, exec_m,
         )
 
+    # Daily consolidated digest: yesterday P&L + bankroll + tomorrow's picks
+    sched.add_job(
+        _daily_summary_job, CronTrigger(hour=8, minute=30),
+        args=[stations], id="daily_summary", name="Daily summary",
+    )
+
     _logger.info("Scheduler started for stations: %s", stations)
 
-    import os as _os
+    import threading as _threading
 
-    def _status() -> str:
+    def _status(args: str = "") -> str:
         now = datetime.now(timezone.utc)
-        live = _os.getenv("LIVE_TRADING", "false").lower() == "true"
-        lines = [f"Scheduler running — {now.strftime('%Y-%m-%d %H:%M')} UTC", f"Mode: {'LIVE' if live else 'dry-run'}", ""]
+        lines = [
+            f"Scheduler running — {now.strftime('%Y-%m-%d %H:%M')} UTC",
+            f"Mode: {_current_mode()}",
+            "",
+        ]
         for job in sched.get_jobs():
             next_run = job.next_run_time
             if next_run:
@@ -355,14 +531,13 @@ def start(stations: list[str]) -> None:
                 lines.append(f"{job.name}: not scheduled")
         return "\n".join(lines)
 
-    def _picks() -> str:
+    def _picks(args: str = "") -> str:
         from datetime import timedelta
         from weather_edge.models import LockedPicks
         from weather_edge.store import parquet as store
         now = datetime.now(timezone.utc)
         target_date = (now + timedelta(days=1)).date()
         lines = [f"Picks for {target_date}:"]
-        found = False
         for sid in stations:
             data = store.read_picks(sid, target_date)
             if data is None:
@@ -372,12 +547,11 @@ def start(stations: list[str]) -> None:
             if locked.picks:
                 for p in locked.picks:
                     lines.append(f"  {sid} {p.side} {p.bracket_label}  edge={p.edge:+.3f}  kelly={p.kelly_fraction*100:.1f}%")
-                found = True
             else:
                 lines.append(f"  {sid}: no edge ({locked.no_edge_reason or 'all below threshold'})")
         return "\n".join(lines)
 
-    def _bankroll() -> str:
+    def _bankroll(args: str = "") -> str:
         from weather_edge.execution import bankroll as br
         try:
             b = br.load()
@@ -393,7 +567,7 @@ def start(stations: list[str]) -> None:
         except FileNotFoundError:
             return "Bankroll not initialised. Run: we init-bankroll --usdc <amount>"
 
-    def _pnl() -> str:
+    def _pnl(args: str = "") -> str:
         from datetime import timedelta
         from weather_edge.execution.polymarket_exec import load_executions
         now = datetime.now(timezone.utc)
@@ -420,16 +594,79 @@ def start(stations: list[str]) -> None:
         lines.append("\n(Use bankroll for settled totals)")
         return "\n".join(lines)
 
+    # ── Resolve target stations from command args ────────────────────────────
+    def _resolve_targets(args: str) -> list[str]:
+        if not args:
+            return list(stations)
+        wanted = [s.upper() for s in args.replace(",", " ").split()]
+        return [s for s in wanted if s in stations] or list(stations)
+
+    # ── Telegram write commands (dispatched to background threads) ───────────
+    def _spawn(name: str, target: "Any", *fn_args: "Any") -> None:
+        _threading.Thread(target=target, args=fn_args, daemon=True, name=name).start()
+
+    def _cmd_lock(args: str = "") -> str:
+        targets = _resolve_targets(args)
+        for sid in targets:
+            _spawn(f"manual-lock-{sid}", _lock_job, sid)
+        return f"Lock dispatched for {len(targets)} station(s): {', '.join(targets)}"
+
+    def _cmd_execute(args: str = "") -> str:
+        if _current_mode() == "off":
+            return "Trading is OFF. Enable with /mode dryrun or /mode live first."
+        targets = _resolve_targets(args)
+        for sid in targets:
+            _spawn(f"manual-exec-{sid}", _execute_job, sid)
+        return f"Execute dispatched ({_current_mode()}) for {len(targets)} station(s): {', '.join(targets)}"
+
+    def _cmd_resolve(args: str = "") -> str:
+        targets = _resolve_targets(args)
+        for sid in targets:
+            _spawn(f"manual-resolve-{sid}", _resolve_and_observe_job, sid)
+        return f"Resolve dispatched for {len(targets)} station(s): {', '.join(targets)}"
+
+    def _cmd_summary(args: str = "") -> str:
+        _spawn("manual-summary", _daily_summary_job, list(stations))
+        return "Daily summary dispatched."
+
+    def _cmd_mode(args: str = "") -> str:
+        target = args.strip().lower()
+        if not target:
+            return (
+                f"Mode: <b>{_current_mode()}</b>\n"
+                "Usage: /mode off | /mode dryrun | /mode live\n"
+                "  off     — locks fire, no orders placed\n"
+                "  dryrun  — orders simulated, no real money\n"
+                "  live    — real orders submitted to Polymarket"
+            )
+        if target == "off":
+            _write_env({"TRADING_ENABLED": "false"})
+        elif target == "dryrun":
+            _write_env({"TRADING_ENABLED": "true", "LIVE_TRADING": "false"})
+        elif target == "live":
+            _write_env({"TRADING_ENABLED": "true", "LIVE_TRADING": "true"})
+        else:
+            return f"Unknown mode '{target}'. Use: off | dryrun | live"
+        return f"Mode set to <b>{_current_mode()}</b>. Effective immediately; persisted to .env."
+
     _tg.start_command_listener({
         "/status": _status,
         "/picks": _picks,
         "/bankroll": _bankroll,
         "/pnl": _pnl,
+        "/lock": _cmd_lock,
+        "/execute": _cmd_execute,
+        "/resolve": _cmd_resolve,
+        "/summary": _cmd_summary,
+        "/mode": _cmd_mode,
     })
-    live_mode = _os.getenv("LIVE_TRADING", "false").lower() == "true"
     _tg.send(
         f"Scheduler started — stations: {', '.join(stations)}\n"
-        f"Mode: {'LIVE' if live_mode else 'dry-run'}\n"
-        f"Commands: /status /picks /bankroll /pnl"
+        f"Mode: {_current_mode()}\n"
+        f"Commands: /status /picks /bankroll /pnl /summary /lock /execute /resolve /mode"
     )
+
+    # Run any missed jobs from earlier today (e.g. after VPS reboot)
+    _catchup(list(stations))
+
     sched.start()

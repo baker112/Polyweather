@@ -41,11 +41,12 @@ def send(text: str) -> None:
         _logger.warning("Telegram send failed: %s", exc)
 
 
-def start_command_listener(handlers: dict[str, Callable[[], str]]) -> None:
+def start_command_listener(handlers: dict[str, Callable[[str], str]]) -> None:
     """Start a daemon thread that dispatches bot commands to handler functions.
 
-    handlers: mapping of command string (e.g. "/status") to a zero-arg callable
-    that returns the reply text.
+    handlers: mapping of command string (e.g. "/status") to a callable that
+    takes an args string (everything after the command, may be empty) and
+    returns the reply text.
     """
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -64,11 +65,16 @@ def start_command_listener(handlers: dict[str, Callable[[], str]]) -> None:
                 for update in resp.json().get("result", []):
                     offset = update["update_id"] + 1
                     msg = update.get("message", {})
-                    cmd = msg.get("text", "").strip().lower().split("@")[0]
+                    text = msg.get("text", "").strip()
+                    if not text:
+                        continue
+                    parts = text.split(None, 1)
+                    cmd = parts[0].lower().split("@")[0]
+                    args = parts[1].strip() if len(parts) > 1 else ""
                     if cmd in handlers:
                         chat = msg["chat"]["id"]
                         try:
-                            reply = handlers[cmd]()
+                            reply = handlers[cmd](args)
                         except Exception as exc:
                             reply = f"Error running {cmd}: {exc}"
                         httpx.post(

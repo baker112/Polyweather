@@ -271,6 +271,111 @@ def fit_emos_bma_cmd(
                        f"a={params.a:.3f} b={params.b:.3f} c={params.c:.3f} d={params.d:.3f}")
 
 
+# ─── Onboard station ─────────────────────────────────────────────────────────
+
+@app.command("onboard-station")
+def onboard_station_cmd(
+    station: Annotated[str, typer.Option("--station", "-s", help="ICAO code from stations.yaml")] = "",
+    backfill_days: Annotated[int, typer.Option("--backfill-days")] = 90,
+) -> None:
+    """One-shot setup for a new station: GEFS backfill (step=24), METAR observations, fit EMOS + QRF.
+
+    Run once before adding the station's ICAO to the scheduler --stations list
+    (or to the systemd ExecStart). Idempotent — re-runs skip already-cached data.
+    """
+    import datetime as _dt
+
+    import polars as _pl
+
+    from weather_edge.config import get_station
+    from weather_edge.ingest import gefs as gefs_ingest
+    from weather_edge.ingest.metar import fetch_observations
+    from weather_edge.postprocess.emos import (
+        _init_datetime_for,
+        assemble_training_pairs,
+        fit_emos,
+    )
+    from weather_edge.postprocess.qrf import assemble_qrf_training_pairs, fit_qrf
+    from weather_edge.store import parquet as store
+
+    if not station:
+        _console.print("[red]--station is required[/red]")
+        raise typer.Exit(1)
+
+    try:
+        cfg = get_station(station)
+    except Exception as exc:
+        _console.print(f"[red]Unknown station '{station}': {exc}[/red]")
+        raise typer.Exit(1)
+
+    end_d = date.today() - _dt.timedelta(days=1)
+    start_d = end_d - _dt.timedelta(days=backfill_days)
+    _console.print(f"Onboarding [bold]{station}[/bold] ({cfg.name})")
+    _console.print(f"  Backfill range: {start_d} -> {end_d} ({backfill_days} days)")
+
+    # ── Step 1: GEFS backfill (step=24) ───────────────────────────────────────
+    _console.print("\n[bold][1/4] GEFS backfill (step=24)...[/bold]")
+    n_fetched = n_skipped = n_failed = 0
+    current = start_d
+    while current <= end_d:
+        init_dt = _init_datetime_for(current, 24)
+        existing = store.read_forecasts("gefs", init_dt, station)
+        if existing is not None and existing.filter(_pl.col("valid_date") == current).height > 0:
+            n_skipped += 1
+            current += _dt.timedelta(days=1)
+            continue
+        try:
+            df = gefs_ingest.ingest_forecasts(init_dt, cfg, steps=[24])
+            store.write_forecasts(df, "gefs", init_dt, station)
+            n_fetched += 1
+        except Exception as exc:
+            _console.print(f"  [red]{current}: {exc}[/red]")
+            n_failed += 1
+        current += _dt.timedelta(days=1)
+    _console.print(f"  [green]{n_fetched} fetched[/green], {n_skipped} skipped, [red]{n_failed} failed[/red]")
+
+    # ── Step 2: METAR observations ────────────────────────────────────────────
+    _console.print("\n[bold][2/4] METAR observations...[/bold]")
+    try:
+        df_obs = asyncio.run(fetch_observations(cfg, start_d, end_d))
+    except Exception as exc:
+        _console.print(f"  [red]Observation fetch failed: {exc}[/red]")
+        df_obs = None
+
+    if df_obs is not None and not df_obs.is_empty():
+        store.write_observations(df_obs, station)
+        _console.print(f"  [green]{len(df_obs)} rows saved[/green]")
+    elif df_obs is not None:
+        _console.print("  [yellow]No observations returned[/yellow]")
+
+    # ── Step 3: Fit pooled EMOS for leads 24, 48, 72 ─────────────────────────
+    _console.print("\n[bold][3/4] Fitting EMOS...[/bold]")
+    for lead in (24, 48, 72):
+        pairs = assemble_training_pairs(station, lead, end_d)
+        if len(pairs) >= 10:
+            params = fit_emos(pairs, station, lead)
+            store.write_emos_params(params.model_dump(), station, lead, params.valid_from, model=None)
+            _console.print(
+                f"  lead={lead}h: [green]n={params.n_samples} CRPS={params.train_crps:.4f}[/green]"
+            )
+        else:
+            _console.print(f"  lead={lead}h: [yellow]only {len(pairs)} pairs — skipped[/yellow]")
+
+    # ── Step 4: Fit QRF for lead=24 ───────────────────────────────────────────
+    _console.print("\n[bold][4/4] Fitting QRF (lead=24h)...[/bold]")
+    pairs_qrf = assemble_qrf_training_pairs(station, 24, end_d, window_days=backfill_days)
+    if len(pairs_qrf) >= 10:
+        forest, X, y, meta = fit_qrf(pairs_qrf, station, 24)
+        store.write_qrf_params(forest, X, y, meta, station, 24, datetime.now(timezone.utc))
+        _console.print(f"  [green]n={len(pairs_qrf)} samples[/green]")
+    else:
+        _console.print(f"  [yellow]Only {len(pairs_qrf)} pairs — QRF skipped[/yellow]")
+
+    _console.print(
+        f"\n[green]{station} onboarded.[/green] Add it to the scheduler --stations list."
+    )
+
+
 # ─── Lock picks ───────────────────────────────────────────────────────────────
 
 @app.command("lock")
