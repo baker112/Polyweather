@@ -340,26 +340,33 @@ def _daily_summary_job(stations: list[str]) -> None:
     lines = [f"<b>Daily summary — {now.strftime('%Y-%m-%d %H:%M')}z</b>"]
     lines.append(f"Mode: {_current_mode()}")
 
-    # Yesterday P&L per station
+    # Yesterday P&L per station (show dry-run results when no live bets exist)
+    mode = _current_mode()
     lines.append("\n<b>Yesterday P&amp;L:</b>")
     total_pnl = 0.0
-    any_live = False
+    any_bets = False
     for sid in stations:
         rec = store.read_resolution(sid, yesterday)
         execs = load_executions(sid, yesterday)
         live_execs = [e for e in execs if not e.get("dry_run")]
-        if not live_execs:
-            lines.append(f"  {sid}: no live bets")
+        dry_execs = [e for e in execs if e.get("dry_run")]
+        # Prefer live bets; fall back to dry-run so you see simulated P&L
+        active_execs = live_execs if live_execs else dry_execs
+        tag = "" if live_execs else " [DRY]"
+        if not active_execs:
+            lines.append(f"  {sid}: no bets")
             continue
-        any_live = True
+        any_bets = True
         if rec and rec.get("resolved"):
-            pnl = sum(float(e.get("pnl", 0.0)) for e in live_execs)
-            total_pnl += pnl
-            lines.append(f"  {sid}: resolved={rec['resolved_label']}  P&amp;L=${pnl:+.2f}")
+            pnl = sum(float(e.get("pnl", 0.0)) for e in active_execs)
+            if live_execs:
+                total_pnl += pnl
+            lines.append(f"  {sid}{tag}: resolved={rec['resolved_label']}  P&amp;L=${pnl:+.2f}")
         else:
-            lines.append(f"  {sid}: pending resolution")
-    if any_live:
-        lines.append(f"  <b>Total: ${total_pnl:+.2f}</b>")
+            lines.append(f"  {sid}{tag}: pending resolution")
+    if any_bets:
+        live_label = "live" if mode == "live" else "dry"
+        lines.append(f"  <b>Live total: ${total_pnl:+.2f}</b> ({live_label} P&amp;L excludes [DRY] rows)")
 
     # Bankroll
     try:
