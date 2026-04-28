@@ -129,13 +129,34 @@ def place_order(
             raise RuntimeError("py-clob-client not installed") from exc
 
         client = _client()
-        signed = client.create_order(OrderArgs(
-            token_id=token_id,
-            price=price,
-            size=shares,
-            side=BUY,
-        ))
-        resp = client.post_order(signed, OrderType.GTC)
+
+        # One-time USDC + CTF approval (no-op if already approved)
+        try:
+            client.set_allowances()
+        except Exception as exc:
+            _logger.warning("set_allowances failed (may already be set): %s", exc)
+
+        # Neg-risk markets require a flag in the signed order
+        try:
+            neg_risk: bool = client.get_neg_risk(token_id)
+        except Exception:
+            neg_risk = False
+
+        try:
+            signed = client.create_order(OrderArgs(
+                token_id=token_id,
+                price=price,
+                size=shares,
+                side=BUY,
+                neg_risk=neg_risk,
+            ))
+            resp = client.post_order(signed, OrderType.GTC)
+        except Exception as exc:
+            # Surface the raw API error body for diagnosis
+            body = getattr(exc, "body", None) or getattr(exc, "message", None) or str(exc)
+            _logger.error("CLOB order rejected (token=%s price=%.2f size=%.2f neg_risk=%s): %s",
+                          token_id, price, shares, neg_risk, body)
+            raise
         order_id = resp.get("orderID") or resp.get("id", "unknown")
         record["order_id"] = order_id
         record["status"] = "submitted"
