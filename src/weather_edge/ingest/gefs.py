@@ -59,10 +59,12 @@ def ingest_forecasts(
     except ImportError as exc:
         raise IngestError("s3fs not installed") from exc
 
-    fs = s3fs.S3FileSystem(
-        anon=True,
-        client_kwargs={"connect_timeout": 15, "read_timeout": 60},
-    )
+    try:
+        from botocore.config import Config as _BotocoreConfig
+        _s3_config = _BotocoreConfig(connect_timeout=15, read_timeout=60)
+        fs = s3fs.S3FileSystem(anon=True, client_kwargs={"config": _s3_config})
+    except Exception:
+        fs = s3fs.S3FileSystem(anon=True)
     tz = zoneinfo.ZoneInfo(station.timezone)
     date_str = init_dt.strftime("%Y%m%d")
     hour_str = f"{init_dt.hour:02d}"
