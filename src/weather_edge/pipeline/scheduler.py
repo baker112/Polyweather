@@ -533,22 +533,32 @@ def start(stations: list[str]) -> None:
 
     def _picks(args: str = "") -> str:
         from datetime import timedelta
+        from weather_edge.config import get_station as _gs
         from weather_edge.models import LockedPicks
         from weather_edge.store import parquet as store
         now = datetime.now(timezone.utc)
         target_date = (now + timedelta(days=1)).date()
-        lines = [f"Picks for {target_date}:"]
+        lines = [f"Picks for {target_date} (now {now.strftime('%H:%M')}z):"]
         for sid in stations:
+            cfg = _gs(sid)
+            lock_h, lock_m = map(int, cfg.lock_time_utc.split(":"))
+            lock_dt = now.replace(hour=lock_h, minute=lock_m, second=0, microsecond=0)
             data = store.read_picks(sid, target_date)
             if data is None:
-                lines.append(f"  {sid}: not locked yet")
+                mins_until = int((lock_dt - now).total_seconds() / 60)
+                if mins_until > 0:
+                    lines.append(f"  {sid}: not locked yet (lock at {cfg.lock_time_utc}z, {mins_until}m away)")
+                else:
+                    lines.append(f"  {sid}: lock overdue — try /lock {sid}")
                 continue
             locked = LockedPicks(**data)
+            locked_at = locked.locked_at.strftime("%H:%M") if locked.locked_at else "?"
             if locked.picks:
+                lines.append(f"  {sid} (locked {locked_at}z, mu={locked.mu:.1f}C):")
                 for p in locked.picks:
-                    lines.append(f"  {sid} {p.side} {p.bracket_label}  edge={p.edge:+.3f}  kelly={p.kelly_fraction*100:.1f}%")
+                    lines.append(f"    {p.side} {p.bracket_label}  edge={p.edge:+.3f}  kelly={p.kelly_fraction*100:.1f}%")
             else:
-                lines.append(f"  {sid}: no edge ({locked.no_edge_reason or 'all below threshold'})")
+                lines.append(f"  {sid} (locked {locked_at}z): no edge — {locked.no_edge_reason or 'all below threshold'}")
         return "\n".join(lines)
 
     def _bankroll(args: str = "") -> str:

@@ -86,11 +86,14 @@ def start_command_listener(handlers: dict[str, Callable[[str], str]]) -> None:
                             reply = handlers[cmd](args)
                         except Exception as exc:
                             reply = f"Error running {cmd}: {exc}"
-                        httpx.post(
-                            f"https://api.telegram.org/bot{token}/sendMessage",
-                            json={"chat_id": chat, "text": reply, "parse_mode": "HTML"},
-                            timeout=10,
-                        )
+                        try:
+                            httpx.post(
+                                f"https://api.telegram.org/bot{token}/sendMessage",
+                                json={"chat_id": chat, "text": reply},
+                                timeout=10,
+                            )
+                        except Exception as exc:
+                            _logger.warning("Telegram reply failed for %s: %s", cmd, exc)
             except Exception as exc:
                 _logger.warning("Telegram listener error: %s", exc)
                 time.sleep(5)
