@@ -240,7 +240,7 @@ def compute_edges(
             kelly = edge / (1.0 - outcome.mid) if outcome.mid < 1.0 else 0.0
         else:  # NO bet
             kelly = abs(edge) / outcome.mid if outcome.mid > 0.0 else 0.0
-        kelly = min(kelly, thresholds.max_kelly_fraction)
+        kelly = min(kelly, thresholds.max_kelly_fraction) * thresholds.kelly_multiplier
 
         candidates.append(Candidate(
             bracket_label=bp.label,

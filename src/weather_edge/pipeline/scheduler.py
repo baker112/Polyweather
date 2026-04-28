@@ -99,6 +99,7 @@ def _resolve_and_observe_job(station_id: str) -> None:
         resolved_label = rec.get("resolved_label", "unknown")
         _logger.info("Resolved %s %s: %s", station_id, yesterday, resolved_label)
 
+        from weather_edge.execution import bankroll as br
         from weather_edge.execution.polymarket_exec import load_executions
         import json
         from pathlib import Path
@@ -113,6 +114,11 @@ def _resolve_and_observe_job(station_id: str) -> None:
                     clv_outcomes = {o["label"]: o["mid"] for o in clv_data.get("outcomes", [])}
                 except Exception:
                     pass
+
+            try:
+                bankroll_data = br.load()
+            except FileNotFoundError:
+                bankroll_data = None
 
             lines = [f"Result: {station_id} {yesterday}  resolved={resolved_label}"]
             for e in execs:
@@ -130,6 +136,11 @@ def _resolve_and_observe_job(station_id: str) -> None:
                     clv = (closing - entry) if side == "YES" else (entry - closing)
                     line += f"  CLV={clv:+.3f} (close={closing:.2f})"
                 lines.append(line)
+                if bankroll_data is not None:
+                    try:
+                        br.settle(bankroll_data, stake, pnl)
+                    except Exception as exc:
+                        _logger.warning("Bankroll settle failed: %s", exc)
             if len(lines) > 1:
                 _tg.send("\n".join(lines))
     except Exception as exc:

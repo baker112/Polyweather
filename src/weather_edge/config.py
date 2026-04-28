@@ -29,6 +29,7 @@ class ThresholdsConfig(BaseModel):
     max_raw_prob: float
     market_freshness_minutes: int
     max_kelly_fraction: float = 0.25
+    kelly_multiplier: float = 1.0
 
 
 @lru_cache(maxsize=1)
