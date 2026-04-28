@@ -86,8 +86,8 @@ async def fetch_observations(
     df = pl.DataFrame(rows, schema={"date": pl.Date, "tmpc": pl.Float64}, orient="row")
     now = datetime.now(timezone.utc)
 
-    # Polymarket resolves against whole-degree Celsius (Wunderground rounds to nearest integer).
-    # Store both the raw continuous max and the rounded value; use rounded for bracket matching.
+    # Polymarket truncates (floor) to the nearest integer, not rounds.
+    # Store the floored value so EMOS training labels match Polymarket's resolution.
     resolution_field = getattr(station, "resolution_field", "daily_max_metar_local")
     use_whole_deg = "wholedeg" in resolution_field
 
@@ -98,8 +98,9 @@ async def fetch_observations(
         .sort("date")
     )
     if use_whole_deg:
+        # Polymarket truncates (floor), not rounds. 15.7°C → 15, not 16.
         result = result.with_columns(
-            pl.col("daily_max_c").round(0).alias("daily_max_c")
+            pl.col("daily_max_c").floor().alias("daily_max_c")
         )
 
     return (

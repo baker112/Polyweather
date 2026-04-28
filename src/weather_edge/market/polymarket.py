@@ -190,16 +190,21 @@ def _parse_bracket(label: str) -> tuple[float | None, float | None]:
     """Extract (low, high) bracket bounds in Celsius from a Polymarket temperature outcome label.
 
     Supports both Celsius (European markets) and Fahrenheit (US markets, auto-detected from label).
-    Applies ±0.5 unit boundary adjustment to account for integer rounding in resolution sources.
+
+    Polymarket resolves by truncation (floor), not rounding. A resolved value of N means
+    floor(actual) == N, i.e. actual ∈ [N, N+1). Bracket boundaries are set accordingly:
 
     Celsius examples:
-      "15°C or below"  → (None, 15.5)
-      "16°C"           → (15.5, 16.5)
-      "25°C or higher" → (24.5, None)
+      "15°C or below"  → (None, 16.0)   # floor(T) ≤ 15 iff T < 16
+      "16°C"           → (16.0, 17.0)   # floor(T) == 16 iff T ∈ [16, 17)
+      "25°C or higher" → (25.0, None)   # floor(T) ≥ 25 iff T ≥ 25
 
     Fahrenheit examples (converted to Celsius in output):
-      "85°F or higher" → ((84.5-32)/1.8, None) = (29.17, None)
-      "90°F"           → ((89.5-32)/1.8, (90.5-32)/1.8) = (31.94, 32.50)
+      "85°F or higher" → ((85-32)/1.8, None) = (29.44, None)
+      "90°F"           → ((90-32)/1.8, (91-32)/1.8) = (32.22, 32.78)
+
+    Explicit ranges (e.g. "15-17°C") are taken as-is — the label itself encodes
+    the half-open interval [low, high).
     """
     s = label.lower().strip()
     is_fahrenheit = "°f" in s or ("\xb0f" in s) or (
@@ -211,16 +216,19 @@ def _parse_bracket(label: str) -> tuple[float | None, float | None]:
     is_upper_tail = any(kw in s for kw in ("above", "over", "or higher", "or above", "or more"))
 
     if is_lower_tail and nums:
-        return None, _to_celsius(nums[0] + 0.5, is_fahrenheit)
+        # floor(T) ≤ N  →  T < N+1
+        return None, _to_celsius(nums[0] + 1.0, is_fahrenheit)
 
     if is_upper_tail and nums:
-        return _to_celsius(nums[0] - 0.5, is_fahrenheit), None
+        # floor(T) ≥ N  →  T ≥ N
+        return _to_celsius(nums[0], is_fahrenheit), None
 
     if len(nums) == 1:
-        return _to_celsius(nums[0] - 0.5, is_fahrenheit), _to_celsius(nums[0] + 0.5, is_fahrenheit)
+        # floor(T) == N  →  T ∈ [N, N+1)
+        return _to_celsius(nums[0], is_fahrenheit), _to_celsius(nums[0] + 1.0, is_fahrenheit)
 
     if len(nums) >= 2:
-        # Explicit range — no rounding adjustment, just unit conversion
+        # Explicit range — label encodes [low, high) directly, no adjustment needed
         return _to_celsius(nums[0], is_fahrenheit), _to_celsius(nums[1], is_fahrenheit)
 
     _logger.warning("Could not parse bracket bounds from label: %r", label)
