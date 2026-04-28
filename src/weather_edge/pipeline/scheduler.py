@@ -113,7 +113,7 @@ def _resolve_and_observe_job(station_id: str) -> None:
 
         execs = load_executions(station_id, yesterday)
         if execs:
-            clv_path = Path(__file__).parents[4] / "data" / "clv_snapshots" / f"station={station_id}" / f"{yesterday}.json"
+            clv_path = Path(__file__).parents[3] / "data" / "clv_snapshots" / f"station={station_id}" / f"{yesterday}.json"
             clv_outcomes: dict[str, float] = {}
             if clv_path.exists():
                 try:
@@ -258,7 +258,7 @@ def _closing_snapshot_job(station_id: str) -> None:
 
     try:
         snapshot = asyncio.run(fetch_market(slug, station_id, yesterday))
-        clv_dir = Path(__file__).parents[4] / "data" / "clv_snapshots" / f"station={station_id}"
+        clv_dir = Path(__file__).parents[3] / "data" / "clv_snapshots" / f"station={station_id}"
         clv_dir.mkdir(parents=True, exist_ok=True)
         clv_path = clv_dir / f"{yesterday}.json"
         with open(clv_path, "w") as f:

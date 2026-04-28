@@ -766,7 +766,7 @@ def mode_cmd(
     import os
     from pathlib import Path
 
-    env_path = Path(__file__).parents[3] / ".env"
+    env_path = Path(__file__).parents[2] / ".env"
 
     def _read_env() -> dict[str, str]:
         if not env_path.exists():

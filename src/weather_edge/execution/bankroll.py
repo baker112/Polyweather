@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-_PATH = Path(__file__).parents[4] / "data" / "bankroll.json"
+_PATH = Path(__file__).parents[3] / "data" / "bankroll.json"
 
 
 def load() -> dict[str, Any]:

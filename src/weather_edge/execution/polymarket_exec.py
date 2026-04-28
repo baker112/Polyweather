@@ -22,7 +22,7 @@ from weather_edge import telegram as _tg
 
 _logger = logging.getLogger(__name__)
 _CLOB_HOST = "https://clob.polymarket.com"
-_EXECUTIONS_DIR = Path(__file__).parents[4] / "data" / "executions"
+_EXECUTIONS_DIR = Path(__file__).parents[3] / "data" / "executions"
 MIN_ORDER_USDC = 1.0  # Polymarket minimum
 
 
