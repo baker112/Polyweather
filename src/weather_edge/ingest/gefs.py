@@ -68,13 +68,15 @@ def ingest_forecasts(
     hour_str = f"{init_dt.hour:02d}"
     base = f"{_BUCKET}/gefs.{date_str}/{hour_str}/atmos"
 
-    # Per-member files live in pgrb2ap5 (0.5°) since NOAA's 2024 reorg.
-    # pgrb2sp25 (0.25°) kept as a fallback in case NOAA restores it; today it only
-    # carries ensemble stats (geavg/gespr) so the lookup will 404 cleanly.
-    # Tuple: (subdir, filename suffix, resolution token used in filename)
+    # GEFSv12 product hierarchy (per-member files only):
+    #   pgrb2ap5 — subset A, 0.5°: select variables (pressure levels, precip, MSLP)
+    #   pgrb2bp5 — subset B, 0.5°: extended variables including 2m TMP and 10m winds
+    # pgrb2sp25 (0.25°) carries only ensemble stats (geavg/gespr) — skip per-member.
+    # Try both A and B; 2m TMP may be in B only depending on the init cycle.
+    # Tuple: (subdir, filename suffix, resolution token)
     _PRODUCTS = [
         ("pgrb2ap5", "pgrb2a", "0p50"),
-        ("pgrb2sp25", "pgrb2s", "0p25"),
+        ("pgrb2bp5", "pgrb2b", "0p50"),
     ]
 
     steps_to_fetch = steps if steps is not None else _STEPS
@@ -120,7 +122,10 @@ def ingest_forecasts(
             })
 
     if not rows:
-        raise IngestError("GEFS: no data retrieved")
+        raise IngestError(
+            f"GEFS: no data retrieved for {init_dt:%Y-%m-%dT%Hz} "
+            f"(tried products: {[p[0] for p in _PRODUCTS]})"
+        )
 
     return pl.DataFrame(rows)
 
@@ -194,30 +199,43 @@ def _find_tmp_bytes(fs: Any, key: str) -> tuple[int | None, int | None]:
 # ─── GRIB2 interpolation ──────────────────────────────────────────────────────
 
 def _extract_temp(grib_path: Path, lat: float, lon: float) -> float | None:
-    """Bilinear-interpolate 2m temperature from a GRIB2 file to station lat/lon."""
+    """Bilinear-interpolate 2m temperature from a GRIB2 file to station lat/lon.
+
+    Tries a type+level filter first (works for both ECMWF and NCEP/GEFS files).
+    Falls back to unfiltered open if that fails (e.g. multi-message byte-range read).
+    Does NOT filter on shortName — "2t" is ECMWF notation and silently rejects GEFS.
+    """
     if not grib_path.exists() or grib_path.stat().st_size == 0:
         return None
 
-    try:
-        ds = xr.open_dataset(
-            grib_path,
-            engine="cfgrib",
-            backend_kwargs={
-                "filter_by_keys": {
-                    "typeOfLevel": "heightAboveGround",
-                    "level": 2,
-                    "shortName": "2t",
-                }
-            },
-        )
-    except Exception:
+    ds = None
+    # Filter by level type+value only — catches both "2t" (ECMWF) and "TMP" (NCEP)
+    for filt in [
+        {"typeOfLevel": "heightAboveGround", "level": 2},
+        {},  # last resort: take first variable in file
+    ]:
         try:
-            ds = xr.open_dataset(grib_path, engine="cfgrib")
-        except Exception:
-            return None
+            ds = xr.open_dataset(
+                grib_path,
+                engine="cfgrib",
+                backend_kwargs={"filter_by_keys": filt} if filt else {},
+            )
+            if ds.data_vars:
+                break
+            ds.close()
+            ds = None
+        except Exception as exc:
+            _logger.debug("cfgrib open failed (filter=%s): %s", filt, exc)
+            ds = None
 
+    if ds is None:
+        _logger.debug("cfgrib could not open %s", grib_path.name)
+        return None
+
+    # Variable name: "t2m" (CF standard) or first available
     var_name = "t2m" if "t2m" in ds else next(iter(ds.data_vars), None)
     if var_name is None:
+        ds.close()
         return None
 
     # GEFS uses 0–360 longitude
@@ -226,7 +244,8 @@ def _extract_temp(grib_path: Path, lat: float, lon: float) -> float | None:
         val = ds[var_name].interp(latitude=lat, longitude=lon_360, method="linear")
         temp_c = float(val.values) - 273.15
         return temp_c if np.isfinite(temp_c) else None
-    except Exception:
+    except Exception as exc:
+        _logger.debug("GEFS interpolation failed at (%.3f, %.3f): %s", lat, lon_360, exc)
         return None
     finally:
         ds.close()
