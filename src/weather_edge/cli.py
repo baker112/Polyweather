@@ -752,6 +752,76 @@ def execute_cmd(
         _console.print("[dim]Re-run with --live to submit real orders.[/dim]")
 
 
+# ─── Mode ─────────────────────────────────────────────────────────────────────
+
+@app.command("mode")
+def mode_cmd(
+    target: Annotated[Optional[str], typer.Argument(help="off | dryrun | live")] = None,
+) -> None:
+    """Show or set the trading mode (off / dryrun / live).
+
+    Writes TRADING_ENABLED and LIVE_TRADING to .env in the project root.
+    Takes effect immediately for a running scheduler on the next job cycle.
+    """
+    import os
+    from pathlib import Path
+
+    env_path = Path(__file__).parents[3] / ".env"
+
+    def _read_env() -> dict[str, str]:
+        if not env_path.exists():
+            return {}
+        result: dict[str, str] = {}
+        for line in env_path.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                result[k.strip()] = v.strip()
+        return result
+
+    def _write_env(updates: dict[str, str]) -> None:
+        lines = env_path.read_text().splitlines() if env_path.exists() else []
+        keys = set(updates.keys())
+        lines = [l for l in lines if not any(l.startswith(f"{k}=") for k in keys)]
+        for k, v in updates.items():
+            lines.append(f"{k}={v}")
+            os.environ[k] = v
+        env_path.write_text("\n".join(lines) + "\n")
+
+    def _current_mode(env: dict[str, str]) -> str:
+        if env.get("TRADING_ENABLED", "false").lower() != "true":
+            return "off"
+        if env.get("LIVE_TRADING", "false").lower() == "true":
+            return "live"
+        return "dryrun"
+
+    env = _read_env()
+
+    if target is None:
+        mode = _current_mode(env)
+        colour = {"off": "yellow", "dryrun": "cyan", "live": "red"}[mode]
+        _console.print(f"Mode: [{colour}]{mode}[/{colour}]")
+        _console.print("  off     — locks fire, no orders placed or recorded")
+        _console.print("  dryrun  — orders simulated and recorded, no real money")
+        _console.print("  live    — real orders submitted to Polymarket CLOB")
+        return
+
+    target = target.strip().lower()
+    if target == "off":
+        _write_env({"TRADING_ENABLED": "false"})
+    elif target == "dryrun":
+        _write_env({"TRADING_ENABLED": "true", "LIVE_TRADING": "false"})
+    elif target == "live":
+        _write_env({"TRADING_ENABLED": "true", "LIVE_TRADING": "true"})
+    else:
+        _console.print(f"[red]Unknown mode '{target}'. Use: off | dryrun | live[/red]")
+        raise typer.Exit(1)
+
+    mode = _current_mode(_read_env())
+    colour = {"off": "yellow", "dryrun": "cyan", "live": "red"}[mode]
+    _console.print(f"Mode set to [{colour}]{mode}[/{colour}]. Persisted to .env.")
+    _console.print("[dim]A running scheduler picks this up on the next execute cycle.[/dim]")
+
+
 # ─── Scheduler ────────────────────────────────────────────────────────────────
 
 @app.command("scheduler")
