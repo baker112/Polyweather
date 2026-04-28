@@ -53,15 +53,24 @@ def start_command_listener(handlers: dict[str, Callable[[str], str]]) -> None:
         return
 
     def _listen() -> None:
+        import httpx
         offset = 0
         while True:
             try:
-                import httpx
                 resp = httpx.get(
                     f"https://api.telegram.org/bot{token}/getUpdates",
                     params={"offset": offset, "timeout": 30},
                     timeout=40,
                 )
+                if resp.status_code == 409:
+                    # Another instance is already polling — back off and let it win.
+                    _logger.warning("Telegram 409 Conflict: another bot instance is polling. Retrying in 60s.")
+                    time.sleep(60)
+                    continue
+                if resp.status_code != 200:
+                    _logger.warning("Telegram getUpdates HTTP %d — retrying in 15s", resp.status_code)
+                    time.sleep(15)
+                    continue
                 for update in resp.json().get("result", []):
                     offset = update["update_id"] + 1
                     msg = update.get("message", {})
