@@ -36,6 +36,20 @@ echo ""
 
 tg "Onboard started: ${STATIONS[*]} (~$((TOTAL * 45 / 60))h)"
 
+# ── Step 0: Fix EGLC observations with correct floor truncation ───────────────
+echo "──────────────────────────────────────────────────────────"
+echo "[0] Re-ingesting EGLC observations (truncation fix) — $(date -u '+%H:%M')z"
+echo "──────────────────────────────────────────────────────────"
+if $WE ingest observations --station EGLC --start 2025-11-01 --end 2026-04-28; then
+    echo "[OK] EGLC observations re-ingested"
+    $WE fit-emos --station EGLC && echo "[OK] EGLC EMOS refitted"
+    tg "[0] EGLC obs + EMOS fixed (truncation)"
+else
+    echo "[WARN] EGLC observation re-ingest failed — continuing"
+    tg "[0] EGLC obs re-ingest FAILED — check log"
+fi
+echo ""
+
 FAILED=()
 DONE=0
 
