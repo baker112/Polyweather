@@ -646,6 +646,12 @@ def start(stations: list[str]) -> None:
             _spawn(f"manual-exec-{sid}", _execute_job, sid)
         return f"Execute dispatched ({_current_mode()}) for {len(targets)} station(s): {', '.join(targets)}"
 
+    def _cmd_ingest(args: str = "") -> str:
+        targets = _resolve_targets(args)
+        for sid in targets:
+            _spawn(f"manual-ingest-{sid}", _ingest_job, sid)
+        return f"Ingest dispatched for {len(targets)} station(s): {', '.join(targets)}"
+
     def _cmd_resolve(args: str = "") -> str:
         targets = _resolve_targets(args)
         for sid in targets:
@@ -682,6 +688,7 @@ def start(stations: list[str]) -> None:
         "/bankroll": _bankroll,
         "/pnl": _pnl,
         "/lock": _cmd_lock,
+        "/ingest": _cmd_ingest,
         "/execute": _cmd_execute,
         "/resolve": _cmd_resolve,
         "/summary": _cmd_summary,
@@ -691,7 +698,7 @@ def start(stations: list[str]) -> None:
         f"🚀 <b>Scheduler started</b> · {len(stations)} stations\n"
         f"Mode: {_current_mode()}\n"
         f"Stations: {', '.join(stations)}\n"
-        f"Commands: /status /picks /bankroll /pnl /summary /lock /execute /resolve /mode"
+        f"Commands: /status /picks /bankroll /pnl /summary /lock /ingest /execute /resolve /mode"
     )
 
     # Run any missed jobs from earlier today (e.g. after VPS reboot)
