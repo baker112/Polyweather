@@ -35,7 +35,10 @@ def _notify(title: str, body: str) -> None:
 
 @ingest_app.command("forecasts")
 def ingest_forecasts(
-    station: Annotated[str, typer.Option("--station", "-s", help="ICAO station code")] = "EGLL",
+    station: Annotated[str, typer.Option("--station", "-s", help="ICAO station code")] = "EGLC",
+    all_stations: Annotated[
+        bool, typer.Option("--all-stations", help="Ingest all configured stations (ignores --station)")
+    ] = False,
     init: Annotated[
         Optional[str], typer.Option("--init", help="Init datetime ISO (e.g. 2026-04-25T12:00Z)")
     ] = None,
@@ -46,8 +49,9 @@ def ingest_forecasts(
     """Fetch ECMWF HRES+ENS and GEFS forecasts for a given init cycle.
 
     Use --step 24 for a fast single-step GEFS download (~30s vs ~15min for all steps).
+    Use --all-stations to ingest every station in stations.yaml.
     """
-    from weather_edge.config import get_station
+    from weather_edge.config import get_station, load_stations
     from weather_edge.ingest import ecmwf, gefs
     from weather_edge.store import parquet as store
 
@@ -58,24 +62,29 @@ def ingest_forecasts(
         from weather_edge.pipeline.lock import _most_recent_12z
         init_dt = _most_recent_12z(now_utc)
 
-    cfg = get_station(station)
+    station_ids = list(load_stations().keys()) if all_stations else [station]
     gefs_steps = [step] if step is not None else None
-    _console.print(f"Ingesting forecasts for [bold]{station}[/bold] init=[bold]{init_dt}[/bold]")
 
-    for model_name, fetch_fn in [("ecmwf", ecmwf.ingest_forecasts), ("gefs", gefs.ingest_forecasts)]:
-        try:
-            if model_name == "gefs" and gefs_steps is not None:
-                df = fetch_fn(init_dt, cfg, steps=gefs_steps)
-            else:
-                df = fetch_fn(init_dt, cfg)
-            df = df.with_columns([
-                __import__("polars").lit(cfg.icao).alias("station"),
-                __import__("polars").lit(init_dt.replace(tzinfo=timezone.utc)).alias("init_datetime"),
-            ])
-            path = store.write_forecasts(df, model_name, init_dt, station)
-            _console.print(f"  [green]{model_name}[/green]: {len(df)} rows -> {path}")
-        except Exception as exc:
-            _console.print(f"  [red]{model_name} failed[/red]: {exc}")
+    _console.print(f"Ingesting forecasts init=[bold]{init_dt}[/bold] for {len(station_ids)} station(s)")
+
+    for station_id in station_ids:
+        cfg = get_station(station_id)
+        _console.print(f"\n[bold]{station_id}[/bold] ({cfg.name})")
+        for model_name, fetch_fn in [("ecmwf", ecmwf.ingest_forecasts), ("gefs", gefs.ingest_forecasts)]:
+            try:
+                if model_name == "gefs" and gefs_steps is not None:
+                    df = fetch_fn(init_dt, cfg, steps=gefs_steps)
+                else:
+                    df = fetch_fn(init_dt, cfg)
+                import polars as _pl
+                df = df.with_columns([
+                    _pl.lit(cfg.icao).alias("station"),
+                    _pl.lit(init_dt.replace(tzinfo=timezone.utc)).alias("init_datetime"),
+                ])
+                path = store.write_forecasts(df, model_name, init_dt, station_id)
+                _console.print(f"  [green]{model_name}[/green]: {len(df)} rows -> {path}")
+            except Exception as exc:
+                _console.print(f"  [red]{model_name} failed[/red]: {exc}")
 
 
 @ingest_app.command("observations")
@@ -826,17 +835,25 @@ def mode_cmd(
 
 @app.command("scheduler")
 def scheduler_cmd(
-    stations: Annotated[Optional[str], typer.Option("--stations", help="Comma-separated station list")] = "EGLC",
+    stations: Annotated[Optional[str], typer.Option("--stations", help="Comma-separated station list (default: all configured)")] = None,
 ) -> None:
-    """Start the daily pipeline scheduler (blocking). Runs ingest/lock/resolve automatically."""
+    """Start the daily pipeline scheduler (blocking). Runs ingest/lock/resolve automatically.
+
+    Defaults to all stations in config/stations.yaml. Pass --stations EGLC,LFPB to limit.
+    """
+    from weather_edge.config import load_stations
     from weather_edge.pipeline.scheduler import start as start_scheduler
 
-    station_list = [s.strip() for s in (stations or "EGLC").split(",")]
-    _console.print(f"Starting scheduler for stations: [bold]{', '.join(station_list)}[/bold]")
-    _console.print("  17:30z - ingest forecasts")
-    _console.print("  18:00z - lock picks for D+1")
-    _console.print("  02:00z - ingest observations + resolve yesterday")
-    _console.print("  Sun 03:00z - re-fit EMOS + QRF")
+    if stations:
+        station_list = [s.strip() for s in stations.split(",")]
+    else:
+        station_list = list(load_stations().keys())
+
+    _console.print(f"Starting scheduler for [bold]{len(station_list)}[/bold] station(s): {', '.join(station_list)}")
+    _console.print("  ingest — 30 min before lock (per station lock_time_utc)")
+    _console.print("  lock — per station lock_time_utc")
+    _console.print("  resolve — 02:00z + offset")
+    _console.print("  Sun 03:00z — re-fit EMOS + QRF")
     _console.print("[yellow]Press Ctrl+C to stop[/yellow]")
     start_scheduler(station_list)
 
