@@ -37,7 +37,9 @@ def _ingest_job(station_id: str) -> None:
             # GEFS: download only step=24 (matches backfill mode + lock.py _DEFAULT_LEAD_HOURS).
             # ~30s per station instead of ~15 min for all steps.
             if model_name == "gefs":
-                df = fetch_fn(init_dt, cfg, steps=[24])
+                # steps 24+30+36 covers D+1 noon for both 12z and 00z inits across UTC±12.
+                # Still much faster than all steps (~30s vs ~15 min).
+                df = fetch_fn(init_dt, cfg, steps=[24, 30, 36])
             else:
                 df = fetch_fn(init_dt, cfg)
             store.write_forecasts(df, model_name, init_dt, station_id)

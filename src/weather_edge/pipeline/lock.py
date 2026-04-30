@@ -107,7 +107,27 @@ def lock_picks(
     )
     ensemble_values = target_fcs["daily_max_c"].to_list()
     if not ensemble_values:
-        raise IngestError(f"No forecast values for {target_date} at lead={lead_hours}h")
+        # Fallback: relax lead_hours constraint — take any rows for the target date
+        # and snap to the nearest available bucket. Handles cases where the cached
+        # forecast was written with a slightly different lead (e.g. timezone offset
+        # shifts noon-local vs noon-UTC by a few hours).
+        date_fcs = all_forecasts.filter(pl.col("valid_date") == target_date)
+        if date_fcs.is_empty():
+            available = all_forecasts["valid_date"].unique().to_list() if not all_forecasts.is_empty() else []
+            _logger.warning(
+                "No forecast rows for %s at all — available dates: %s", target_date, sorted(available)
+            )
+            raise IngestError(f"No forecast values for {target_date} at lead={lead_hours}h")
+        # Pick the lead bucket closest to expected
+        available_leads = date_fcs["lead_hours"].unique().to_list()
+        best_lead = min(available_leads, key=lambda h: abs(h - lead_hours))
+        _logger.warning(
+            "No forecasts for %s at lead=%dh; falling back to lead=%dh (available: %s)",
+            target_date, lead_hours, best_lead, sorted(available_leads),
+        )
+        target_fcs = date_fcs.filter(pl.col("lead_hours") == best_lead)
+        ensemble_values = target_fcs["daily_max_c"].to_list()
+        lead_hours = best_lead
 
     provenance["ensemble_size"] = len(ensemble_values)
     log_event("ingest_forecasts", station_id, "ok",
