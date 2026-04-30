@@ -45,6 +45,8 @@ def ingest_forecasts(init_dt: datetime, station: StationConfig) -> pl.DataFrame:
     tz = zoneinfo.ZoneInfo(station.timezone)
     rows: list[dict[str, Any]] = []
 
+    stream_errors: list[str] = []
+
     with tempfile.TemporaryDirectory() as tmpdir:
         # ── HRES ──────────────────────────────────────────────────────────────
         hres_path = Path(tmpdir) / "hres.grib2"
@@ -63,6 +65,7 @@ def ingest_forecasts(init_dt: datetime, station: StationConfig) -> pl.DataFrame:
             _logger.info("ECMWF HRES: %d member-day rows", len(hres_rows))
         except Exception as exc:
             _logger.warning("ECMWF HRES failed: %s", exc)
+            stream_errors.append(f"HRES: {exc}")
 
         # ── ENS perturbed ─────────────────────────────────────────────────────
         ens_path = Path(tmpdir) / "ens_pf.grib2"
@@ -82,6 +85,7 @@ def ingest_forecasts(init_dt: datetime, station: StationConfig) -> pl.DataFrame:
             _logger.info("ECMWF ENS: %d member-day rows", len(ens_rows))
         except Exception as exc:
             _logger.warning("ECMWF ENS failed: %s", exc)
+            stream_errors.append(f"ENS pf: {exc}")
 
         # ── ENS control ───────────────────────────────────────────────────────
         cf_path = Path(tmpdir) / "ens_cf.grib2"
@@ -99,9 +103,11 @@ def ingest_forecasts(init_dt: datetime, station: StationConfig) -> pl.DataFrame:
             rows.extend(cf_rows)
         except Exception as exc:
             _logger.warning("ECMWF ENS control failed: %s", exc)
+            stream_errors.append(f"ENS cf: {exc}")
 
     if not rows:
-        raise IngestError("ECMWF: no data retrieved for any stream")
+        detail = "; ".join(stream_errors) if stream_errors else "unknown"
+        raise IngestError(f"ECMWF: no data retrieved for any stream ({detail})")
 
     return _to_dataframe(rows, _MODEL)
 
