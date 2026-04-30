@@ -481,7 +481,7 @@ def start(stations: list[str]) -> None:
         ingest_total_m = lock_h * 60 + lock_m - 30
         ingest_h, ingest_m = divmod(ingest_total_m, 60)
 
-        exec_total_m = lock_h * 60 + lock_m + 5
+        exec_total_m = lock_h * 60 + lock_m + 1
         exec_h, exec_m = divmod(exec_total_m, 60)
 
         clv_total_m = 1 * 60 + 0 + i * 2
