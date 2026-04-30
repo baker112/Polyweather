@@ -30,7 +30,8 @@ def _ingest_job(station_id: str) -> None:
     init_dt = _most_recent_12z(now_utc)
     cfg = get_station(station_id)
 
-    results: list[str] = []
+    lines: list[str] = [f"📡 <b>Ingest {station_id}</b> · {init_dt.strftime('%Y-%m-%d %HZ')}"]
+    any_fail = False
     for model_name, fetch_fn in [("ecmwf", ecmwf.ingest_forecasts), ("gefs", gefs.ingest_forecasts)]:
         try:
             # GEFS: download only step=24 (matches backfill mode + lock.py _DEFAULT_LEAD_HOURS).
@@ -41,11 +42,14 @@ def _ingest_job(station_id: str) -> None:
                 df = fetch_fn(init_dt, cfg)
             store.write_forecasts(df, model_name, init_dt, station_id)
             _logger.info("Ingested %s %s: %d rows", model_name, init_dt, len(df))
-            results.append(f"{model_name}: {len(df)} rows")
+            lines.append(f"  ✅ {model_name}: {len(df)} rows")
         except Exception as exc:
             _logger.error("Ingest %s failed: %s", model_name, exc)
-            results.append(f"{model_name}: FAILED ({exc})")
-    _tg.send(f"Ingest {station_id} {init_dt.date()}\n" + "\n".join(results))
+            lines.append(f"  ❌ {model_name}: {exc}")
+            any_fail = True
+    if any_fail:
+        lines[0] = lines[0].replace("📡", "⚠️")
+    _tg.send("\n".join(lines))
 
 
 def _lock_job(station_id: str) -> None:
@@ -64,19 +68,21 @@ def _lock_job(station_id: str) -> None:
             station_id, target_date, result.mu, result.sigma, len(result.picks),
         )
         if result.picks:
-            lines = [f"Pick locked: {station_id} {target_date}  (mu={result.mu:.1f}C, sigma={result.sigma:.2f})"]
+            lines = [f"🎯 <b>Pick locked: {station_id}</b> · {target_date}",
+                     f"   μ={result.mu:.1f}°C  σ={result.sigma:.2f}"]
             for p in result.picks:
                 lines.append(
-                    f"  {p.side} {p.bracket_label}  model={p.model_prob:.2f}  mkt={p.market_prob:.2f}  edge={p.edge:+.3f}"
+                    f"  {'🟢' if p.side == 'YES' else '🔴'} {p.side} {p.bracket_label}"
+                    f"  model={p.model_prob:.0%}  mkt={p.market_prob:.0%}  edge={p.edge:+.1%}  kelly={p.kelly_fraction:.1%}"
                 )
             _tg.send("\n".join(lines))
         else:
-            _tg.send(f"No edge: {station_id} {target_date}\n{result.no_edge_reason or 'all edges below threshold'}")
+            _tg.send(f"ℹ️ <b>No edge: {station_id}</b> · {target_date}\n{result.no_edge_reason or 'all edges below threshold'}")
     except AlreadyLockedError:
         _logger.info("Already locked %s %s", station_id, target_date)
     except Exception as exc:
         _logger.error("Lock failed %s %s: %s", station_id, target_date, exc)
-        _tg.send(f"Lock FAILED: {station_id} {target_date}\n{exc}")
+        _tg.send(f"❌ <b>Lock FAILED: {station_id}</b> · {target_date}\n{exc}")
 
 
 def _resolve_and_observe_job(station_id: str) -> None:
@@ -127,7 +133,7 @@ def _resolve_and_observe_job(station_id: str) -> None:
             except FileNotFoundError:
                 bankroll_data = None
 
-            lines = [f"Result: {station_id} {yesterday}  resolved={resolved_label}"]
+            lines = [f"📋 <b>Result: {station_id}</b> · {yesterday}  →  {resolved_label}"]
             for e in execs:
                 if e.get("dry_run"):
                     continue
@@ -137,11 +143,12 @@ def _resolve_and_observe_job(station_id: str) -> None:
                 stake = float(e.get("usdc_stake", 0))
                 win = (bracket == resolved_label and side == "YES") or (bracket != resolved_label and side == "NO")
                 pnl = (1.0 / entry - 1) * stake if win else -stake
-                line = f"  {side} {bracket}: {'WIN' if win else 'LOSS'}  entry={entry:.2f}  P&L=${pnl:+.2f}"
+                icon = "🏆" if win else "💸"
+                line = f"  {icon} {side} {bracket}  entry={entry:.2f}  P&amp;L=${pnl:+.2f}"
                 if bracket in clv_outcomes:
                     closing = clv_outcomes[bracket]
                     clv = (closing - entry) if side == "YES" else (entry - closing)
-                    line += f"  CLV={clv:+.3f} (close={closing:.2f})"
+                    line += f"  CLV={clv:+.3f}"
                 lines.append(line)
                 if bankroll_data is not None:
                     try:
@@ -152,7 +159,7 @@ def _resolve_and_observe_job(station_id: str) -> None:
                 _tg.send("\n".join(lines))
     except Exception as exc:
         _logger.error("Resolution failed %s %s: %s", station_id, yesterday, exc)
-        _tg.send(f"Resolution FAILED: {station_id} {yesterday}\n{exc}")
+        _tg.send(f"❌ <b>Resolution FAILED: {station_id}</b> · {yesterday}\n{exc}")
 
 
 def _execute_job(station_id: str) -> None:
@@ -191,7 +198,7 @@ def _execute_job(station_id: str) -> None:
     try:
         bankroll = br.load()
     except FileNotFoundError:
-        _tg.send(f"Execute FAILED {station_id}: bankroll not initialised. Run: we init-bankroll --usdc <amount>")
+        _tg.send(f"❌ <b>Execute FAILED {station_id}:</b> bankroll not initialised\nRun: we init-bankroll --usdc &lt;amount&gt;")
         return
 
     avail = br.available(bankroll)
@@ -207,7 +214,7 @@ def _execute_job(station_id: str) -> None:
         snapshot = asyncio.run(fetch_market(slug, station_id, target_date))
         store.write_market_snapshot(snapshot.model_dump(), station_id, target_date)
     except Exception as exc:
-        _tg.send(f"Execute FAILED {station_id}: market fetch error\n{exc}")
+        _tg.send(f"❌ <b>Execute FAILED {station_id}:</b> market fetch error\n{exc}")
         return
 
     outcome_map = {o.label: o for o in snapshot.outcomes}
@@ -228,7 +235,7 @@ def _execute_job(station_id: str) -> None:
             total_staked += usdc_stake
         except Exception as exc:
             _logger.error("Order failed %s %s: %s", station_id, pick.bracket_label, exc)
-            _tg.send(f"Order FAILED {station_id} {pick.bracket_label}: {exc}")
+            _tg.send(f"❌ <b>Order FAILED {station_id} {pick.bracket_label}:</b> {exc}")
 
     if records and not dry_run:
         br.reserve(bankroll, total_staked)
@@ -337,12 +344,12 @@ def _daily_summary_job(stations: list[str]) -> None:
     yesterday = (now - timedelta(days=1)).date()
     tomorrow = (now + timedelta(days=1)).date()
 
-    lines = [f"<b>Daily summary — {now.strftime('%Y-%m-%d %H:%M')}z</b>"]
-    lines.append(f"Mode: {_current_mode()}")
+    mode = _current_mode()
+    mode_icon = {"off": "⏸", "dryrun": "🔵", "live": "🟢"}.get(mode, "❓")
+    lines = [f"📊 <b>Daily Summary</b> · {now.strftime('%Y-%m-%d %H:%M')}z  {mode_icon} {mode}"]
 
     # Yesterday P&L per station (show dry-run results when no live bets exist)
-    mode = _current_mode()
-    lines.append("\n<b>Yesterday P&amp;L:</b>")
+    lines.append("\n<b>Yesterday P&amp;L</b>")
     total_pnl = 0.0
     any_bets = False
     for sid in stations:
@@ -350,55 +357,56 @@ def _daily_summary_job(stations: list[str]) -> None:
         execs = load_executions(sid, yesterday)
         live_execs = [e for e in execs if not e.get("dry_run")]
         dry_execs = [e for e in execs if e.get("dry_run")]
-        # Prefer live bets; fall back to dry-run so you see simulated P&L
         active_execs = live_execs if live_execs else dry_execs
-        tag = "" if live_execs else " [DRY]"
+        tag = "" if live_execs else " [dry]"
         if not active_execs:
-            lines.append(f"  {sid}: no bets")
             continue
         any_bets = True
         if rec and rec.get("resolved"):
             pnl = sum(float(e.get("pnl", 0.0)) for e in active_execs)
             if live_execs:
                 total_pnl += pnl
-            lines.append(f"  {sid}{tag}: resolved={rec['resolved_label']}  P&amp;L=${pnl:+.2f}")
+            icon = "🏆" if pnl >= 0 else "💸"
+            lines.append(f"  {icon} {sid}{tag}  →  {rec['resolved_label']}  P&amp;L=${pnl:+.2f}")
         else:
-            lines.append(f"  {sid}{tag}: pending resolution")
-    if any_bets:
-        live_label = "live" if mode == "live" else "dry"
-        lines.append(f"  <b>Live total: ${total_pnl:+.2f}</b> ({live_label} P&amp;L excludes [DRY] rows)")
+            lines.append(f"  ⏳ {sid}{tag}: pending")
+    if not any_bets:
+        lines.append("  No bets yesterday")
+    elif mode == "live":
+        lines.append(f"  <b>Total: ${total_pnl:+.2f}</b>")
 
     # Bankroll
+    lines.append("\n<b>Bankroll</b>")
     try:
         b = br.load()
+        avail = b['current_usdc'] - b.get('reserved_usdc', 0)
         lines.append(
-            f"\n<b>Bankroll:</b> ${b['current_usdc']:.2f}  "
-            f"(reserved=${b.get('reserved_usdc', 0):.2f}, total P&amp;L=${b.get('total_pnl', 0):+.2f}, "
-            f"{b.get('n_trades', 0)} trades)"
+            f"  💰 ${b['current_usdc']:.2f}  "
+            f"(avail=${avail:.2f}  P&amp;L=${b.get('total_pnl', 0):+.2f}  {b.get('n_trades', 0)} trades)"
         )
     except FileNotFoundError:
-        lines.append("\nBankroll not initialised.")
+        lines.append("  Not initialised")
 
     # Tomorrow's picks
-    lines.append(f"\n<b>Picks for {tomorrow}:</b>")
+    lines.append(f"\n<b>Picks for {tomorrow}</b>")
+    any_picks = False
     for sid in stations:
         data = store.read_picks(sid, tomorrow)
         if data is None:
-            lines.append(f"  {sid}: not locked yet")
             continue
         try:
             locked = LockedPicks(**data)
         except Exception:
-            lines.append(f"  {sid}: malformed picks file")
             continue
         if locked.picks:
+            any_picks = True
             for p in locked.picks:
                 lines.append(
-                    f"  {sid} {p.side} {p.bracket_label}  "
-                    f"edge={p.edge:+.3f}  kelly={p.kelly_fraction*100:.1f}%"
+                    f"  🎯 {sid}  {'🟢' if p.side == 'YES' else '🔴'} {p.side} {p.bracket_label}"
+                    f"  edge={p.edge:+.1%}  kelly={p.kelly_fraction:.1%}"
                 )
-        else:
-            lines.append(f"  {sid}: no edge ({locked.no_edge_reason or 'all below threshold'})")
+    if not any_picks:
+        lines.append("  No picks yet (locks fire later today)")
 
     _tg.send("\n".join(lines))
 
@@ -435,7 +443,7 @@ def _catchup(stations: list[str]) -> None:
         if now > lock_dt + timedelta(minutes=15):
             if store.read_picks(station_id, tomorrow) is None:
                 _logger.info("Catch-up: running missed lock for %s %s", station_id, tomorrow)
-                _tg.send(f"Catch-up: running missed lock for {station_id} {tomorrow}")
+                _tg.send(f"⏰ <b>Catch-up:</b> running missed lock for {station_id} · {tomorrow}")
                 try:
                     _lock_job(station_id)
                 except Exception as exc:
@@ -678,8 +686,9 @@ def start(stations: list[str]) -> None:
         "/mode": _cmd_mode,
     })
     _tg.send(
-        f"Scheduler started — stations: {', '.join(stations)}\n"
+        f"🚀 <b>Scheduler started</b> · {len(stations)} stations\n"
         f"Mode: {_current_mode()}\n"
+        f"Stations: {', '.join(stations)}\n"
         f"Commands: /status /picks /bankroll /pnl /summary /lock /execute /resolve /mode"
     )
 
