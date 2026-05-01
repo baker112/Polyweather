@@ -35,15 +35,22 @@ _OVERROUND_MIN = 0.9
 _OVERROUND_MAX = 1.2
 
 
-async def fetch_market(slug: str, station: str, target_date: date) -> MarketSnapshot:
+async def fetch_market(
+    slug: str,
+    station: str,
+    target_date: date,
+    include_inactive: bool = False,
+) -> MarketSnapshot:
     """Fetch a Polymarket temperature event by slug and return a MarketSnapshot.
 
     The slug is the *event* slug (e.g. 'highest-temperature-in-london-on-april-27-2026').
     All bracket sub-markets are fetched and their CLOB books queried.
+    When include_inactive=True, closed/inactive markets are included via outcomePrices,
+    which is required for resolved events.
     """
     async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
         event = await _get_event(client, slug)
-        outcomes = await _get_outcomes(client, event)
+        outcomes = await _get_outcomes(client, event, include_inactive=include_inactive)
 
     implied_sum = sum(o.mid for o in outcomes)
     if not (_OVERROUND_MIN <= implied_sum <= _OVERROUND_MAX):
@@ -81,6 +88,7 @@ async def _get_event(client: httpx.AsyncClient, slug: str) -> dict[str, Any]:
 async def _get_outcomes(
     client: httpx.AsyncClient,
     event: dict[str, Any],
+    include_inactive: bool = False,
 ) -> list[MarketOutcome]:
     """Build MarketOutcome objects for each bracket market in the event.
 
@@ -91,14 +99,27 @@ async def _get_outcomes(
     outcomes: list[MarketOutcome] = []
 
     for mkt in markets:
-        if not mkt.get("active", True) or mkt.get("closed", False):
+        active = mkt.get("active", True)
+        closed = mkt.get("closed", False)
+        if not include_inactive and (not active or closed):
             continue
-        if not mkt.get("enableOrderBook", True):
-            # AMM-only market — use outcomePrices as fallback
+
+        enable_orderbook = mkt.get("enableOrderBook", True)
+        inactive = not active or closed
+        if not enable_orderbook:
             outcome = _outcome_from_prices(mkt)
             if outcome is not None:
                 outcomes.append(outcome)
+            else:
+                _warn_missing_outcome_prices(mkt, inactive=inactive)
             continue
+
+        if inactive:
+            outcome = _outcome_from_prices(mkt)
+            if outcome is not None:
+                outcomes.append(outcome)
+                continue
+            _warn_missing_outcome_prices(mkt, inactive=True)
 
         token_ids: list[str] = _parse_json_list(mkt.get("clobTokenIds", "[]"))
         if not token_ids:
@@ -107,7 +128,6 @@ async def _get_outcomes(
         yes_token_id = token_ids[0]
         no_token_id = token_ids[1] if len(token_ids) > 1 else ""
         label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
-
         try:
             book = await _get_book(client, yes_token_id)
         except Exception as exc:
@@ -135,6 +155,17 @@ async def _get_outcomes(
         raise MarketError("No active outcomes found in event")
 
     return sorted(outcomes, key=lambda o: (o.low is None, o.low or 0.0))
+
+
+def _warn_missing_outcome_prices(mkt: dict[str, Any], *, inactive: bool) -> None:
+    label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
+    market_id = mkt.get("id")
+    market_id_str = str(market_id) if market_id is not None else "no-id"
+    target = f"market {label} (ID: {market_id_str})" if label else f"market ID {market_id_str}"
+    if inactive:
+        _logger.warning("No outcomePrices for inactive %s; falling back to orderbook", target)
+    else:
+        _logger.warning("No outcomePrices for %s", target)
 
 
 def _outcome_from_prices(mkt: dict[str, Any]) -> MarketOutcome | None:

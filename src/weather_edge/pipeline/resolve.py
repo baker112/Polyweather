@@ -34,7 +34,7 @@ async def resolve_date(
     )
 
     from weather_edge.market.polymarket import fetch_market
-    snapshot = await fetch_market(slug, station_id, target_date)
+    snapshot = await fetch_market(slug, station_id, target_date, include_inactive=True)
 
     # Resolved markets: winning outcome has mid ~1.0, others ~0.0
     resolved_label: str | None = None
