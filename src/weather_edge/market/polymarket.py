@@ -111,7 +111,7 @@ async def _get_outcomes(
             if outcome is not None:
                 outcomes.append(outcome)
             else:
-                _warn_missing_outcome_prices(mkt, inactive=False)
+                _warn_missing_outcome_prices(mkt, inactive=inactive)
             continue
 
         if inactive:
