@@ -116,8 +116,12 @@ async def _get_outcomes(
         label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
         if not enable_orderbook:
             if not _append_prices_outcome(mkt):
-                market_id = mkt.get("id", "unknown")
-                _logger.warning("No outcomePrices for market %s", label or market_id)
+                market_id = mkt.get("id")
+                market_id_str = str(market_id) if market_id is not None else "no-id"
+                if label:
+                    _logger.warning("No outcomePrices for market %s (ID: %s)", label, market_id_str)
+                else:
+                    _logger.warning("No outcomePrices for market ID %s", market_id_str)
             continue
 
         if use_prices_first and _append_prices_outcome(mkt):
