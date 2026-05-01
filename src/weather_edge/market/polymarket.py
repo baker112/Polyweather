@@ -124,6 +124,19 @@ async def _get_outcomes(
             if outcome is not None:
                 outcomes.append(outcome)
                 continue
+            market_id = mkt.get("id")
+            market_id_str = str(market_id) if market_id is not None else "no-id"
+            if label:
+                _logger.warning(
+                    "No outcomePrices for inactive market %s (ID: %s); falling back to orderbook",
+                    label,
+                    market_id_str,
+                )
+            else:
+                _logger.warning(
+                    "No outcomePrices for inactive market ID %s; falling back to orderbook",
+                    market_id_str,
+                )
 
         token_ids: list[str] = _parse_json_list(mkt.get("clobTokenIds", "[]"))
         if not token_ids:
