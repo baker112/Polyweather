@@ -98,6 +98,13 @@ async def _get_outcomes(
     markets: list[dict[str, Any]] = event.get("markets", [])
     outcomes: list[MarketOutcome] = []
 
+    def _append_prices_outcome(mkt: dict[str, Any]) -> bool:
+        outcome = _outcome_from_prices(mkt)
+        if outcome is None:
+            return False
+        outcomes.append(outcome)
+        return True
+
     for mkt in markets:
         active = mkt.get("active", True)
         closed = mkt.get("closed", False)
@@ -106,18 +113,11 @@ async def _get_outcomes(
 
         enable_orderbook = mkt.get("enableOrderBook", True)
         use_prices_first = include_inactive and (not active or closed)
-        def _append_prices_outcome() -> bool:
-            outcome = _outcome_from_prices(mkt)
-            if outcome is None:
-                return False
-            outcomes.append(outcome)
-            return True
-
         if not enable_orderbook:
-            _append_prices_outcome()
+            _append_prices_outcome(mkt)
             continue
 
-        if use_prices_first and _append_prices_outcome():
+        if use_prices_first and _append_prices_outcome(mkt):
             continue
 
         token_ids: list[str] = _parse_json_list(mkt.get("clobTokenIds", "[]"))
