@@ -98,16 +98,6 @@ async def _get_outcomes(
     markets: list[dict[str, Any]] = event.get("markets", [])
     outcomes: list[MarketOutcome] = []
 
-    def _warn_missing_outcome_prices(mkt: dict[str, Any], *, inactive: bool) -> None:
-        label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
-        market_id = mkt.get("id")
-        market_id_str = str(market_id) if market_id is not None else "no-id"
-        target = f"market {label} (ID: {market_id_str})" if label else f"market ID {market_id_str}"
-        if inactive:
-            _logger.warning("No outcomePrices for inactive %s; falling back to orderbook", target)
-        else:
-            _logger.warning("No outcomePrices for %s", target)
-
     for mkt in markets:
         active = mkt.get("active", True)
         closed = mkt.get("closed", False)
@@ -116,14 +106,20 @@ async def _get_outcomes(
 
         enable_orderbook = mkt.get("enableOrderBook", True)
         inactive = not active or closed
-        if not enable_orderbook or inactive:
+        if not enable_orderbook:
+            outcome = _outcome_from_prices(mkt)
+            if outcome is not None:
+                outcomes.append(outcome)
+            else:
+                _warn_missing_outcome_prices(mkt, inactive=False)
+            continue
+
+        if inactive:
             outcome = _outcome_from_prices(mkt)
             if outcome is not None:
                 outcomes.append(outcome)
                 continue
-            _warn_missing_outcome_prices(mkt, inactive=inactive)
-            if not enable_orderbook:
-                continue
+            _warn_missing_outcome_prices(mkt, inactive=True)
 
         token_ids: list[str] = _parse_json_list(mkt.get("clobTokenIds", "[]"))
         if not token_ids:
@@ -158,6 +154,17 @@ async def _get_outcomes(
         raise MarketError("No active outcomes found in event")
 
     return sorted(outcomes, key=lambda o: (o.low is None, o.low or 0.0))
+
+
+def _warn_missing_outcome_prices(mkt: dict[str, Any], *, inactive: bool) -> None:
+    label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
+    market_id = mkt.get("id")
+    market_id_str = str(market_id) if market_id is not None else "no-id"
+    target = f"market {label} (ID: {market_id_str})" if label else f"market ID {market_id_str}"
+    if inactive:
+        _logger.warning("No outcomePrices for inactive %s; falling back to orderbook", target)
+    else:
+        _logger.warning("No outcomePrices for %s", target)
 
 
 def _outcome_from_prices(mkt: dict[str, Any]) -> MarketOutcome | None:
