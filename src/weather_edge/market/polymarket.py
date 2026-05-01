@@ -98,6 +98,28 @@ async def _get_outcomes(
     markets: list[dict[str, Any]] = event.get("markets", [])
     outcomes: list[MarketOutcome] = []
 
+    def _warn_missing_outcome_prices(mkt: dict[str, Any], *, inactive: bool) -> None:
+        label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
+        market_id = mkt.get("id")
+        market_id_str = str(market_id) if market_id is not None else "no-id"
+        if label:
+            if inactive:
+                _logger.warning(
+                    "No outcomePrices for inactive market %s (ID: %s); falling back to orderbook",
+                    label,
+                    market_id_str,
+                )
+            else:
+                _logger.warning("No outcomePrices for market %s (ID: %s)", label, market_id_str)
+        else:
+            if inactive:
+                _logger.warning(
+                    "No outcomePrices for inactive market ID %s; falling back to orderbook",
+                    market_id_str,
+                )
+            else:
+                _logger.warning("No outcomePrices for market ID %s", market_id_str)
+
     for mkt in markets:
         active = mkt.get("active", True)
         closed = mkt.get("closed", False)
@@ -105,36 +127,15 @@ async def _get_outcomes(
             continue
 
         enable_orderbook = mkt.get("enableOrderBook", True)
-        label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
-        market_id = mkt.get("id")
-        market_id_str = str(market_id) if market_id is not None else "no-id"
-        if not enable_orderbook:
-            outcome = _outcome_from_prices(mkt)
-            if outcome is None:
-                if label:
-                    _logger.warning("No outcomePrices for market %s (ID: %s)", label, market_id_str)
-                else:
-                    _logger.warning("No outcomePrices for market ID %s", market_id_str)
-            else:
-                outcomes.append(outcome)
-            continue
-
-        if not active or closed:
+        inactive = not active or closed
+        if not enable_orderbook or inactive:
             outcome = _outcome_from_prices(mkt)
             if outcome is not None:
                 outcomes.append(outcome)
                 continue
-            if label:
-                _logger.warning(
-                    "No outcomePrices for inactive market %s (ID: %s); falling back to orderbook",
-                    label,
-                    market_id_str,
-                )
-            else:
-                _logger.warning(
-                    "No outcomePrices for inactive market ID %s; falling back to orderbook",
-                    market_id_str,
-                )
+            _warn_missing_outcome_prices(mkt, inactive=inactive)
+            if not enable_orderbook:
+                continue
 
         token_ids: list[str] = _parse_json_list(mkt.get("clobTokenIds", "[]"))
         if not token_ids:
