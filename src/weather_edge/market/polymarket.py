@@ -106,11 +106,11 @@ async def _get_outcomes(
 
         enable_orderbook = mkt.get("enableOrderBook", True)
         label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
+        market_id = mkt.get("id")
+        market_id_str = str(market_id) if market_id is not None else "no-id"
         if not enable_orderbook:
             outcome = _outcome_from_prices(mkt)
             if outcome is None:
-                market_id = mkt.get("id")
-                market_id_str = str(market_id) if market_id is not None else "no-id"
                 if label:
                     _logger.warning("No outcomePrices for market %s (ID: %s)", label, market_id_str)
                 else:
@@ -124,8 +124,6 @@ async def _get_outcomes(
             if outcome is not None:
                 outcomes.append(outcome)
                 continue
-            market_id = mkt.get("id")
-            market_id_str = str(market_id) if market_id is not None else "no-id"
             if label:
                 _logger.warning(
                     "No outcomePrices for inactive market %s (ID: %s); falling back to orderbook",
