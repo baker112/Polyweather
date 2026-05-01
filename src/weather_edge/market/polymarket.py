@@ -127,6 +127,7 @@ async def _get_outcomes(
 
         yes_token_id = token_ids[0]
         no_token_id = token_ids[1] if len(token_ids) > 1 else ""
+        label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
         try:
             book = await _get_book(client, yes_token_id)
         except Exception as exc:
