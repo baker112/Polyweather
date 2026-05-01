@@ -103,17 +103,17 @@ async def _get_outcomes(
         closed = mkt.get("closed", False)
         if not include_inactive and (not active or closed):
             continue
-        if include_inactive and (not active or closed):
+
+        enable_orderbook = mkt.get("enableOrderBook", True)
+        use_prices_first = include_inactive and (not active or closed)
+        if use_prices_first or not enable_orderbook:
             outcome = _outcome_from_prices(mkt)
             if outcome is not None:
                 outcomes.append(outcome)
+                if use_prices_first:
+                    continue
+            if not enable_orderbook:
                 continue
-        if not mkt.get("enableOrderBook", True):
-            # AMM-only market — use outcomePrices as fallback
-            outcome = _outcome_from_prices(mkt)
-            if outcome is not None:
-                outcomes.append(outcome)
-            continue
 
         token_ids: list[str] = _parse_json_list(mkt.get("clobTokenIds", "[]"))
         if not token_ids:
