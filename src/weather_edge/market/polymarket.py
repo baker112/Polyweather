@@ -112,9 +112,12 @@ async def _get_outcomes(
             continue
 
         enable_orderbook = mkt.get("enableOrderBook", True)
-        use_prices_first = include_inactive and (not active or closed)
+        use_prices_first = not active or closed
+        label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
         if not enable_orderbook:
-            _append_prices_outcome(mkt)
+            if not _append_prices_outcome(mkt):
+                market_id = mkt.get("id", "unknown")
+                _logger.warning("No outcomePrices for market %s", label or market_id)
             continue
 
         if use_prices_first and _append_prices_outcome(mkt):
@@ -126,8 +129,6 @@ async def _get_outcomes(
 
         yes_token_id = token_ids[0]
         no_token_id = token_ids[1] if len(token_ids) > 1 else ""
-        label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
-
         try:
             book = await _get_book(client, yes_token_id)
         except Exception as exc:
