@@ -102,23 +102,11 @@ async def _get_outcomes(
         label = mkt.get("groupItemTitle", "") or mkt.get("question", "")
         market_id = mkt.get("id")
         market_id_str = str(market_id) if market_id is not None else "no-id"
-        if label:
-            if inactive:
-                _logger.warning(
-                    "No outcomePrices for inactive market %s (ID: %s); falling back to orderbook",
-                    label,
-                    market_id_str,
-                )
-            else:
-                _logger.warning("No outcomePrices for market %s (ID: %s)", label, market_id_str)
+        target = f"market {label} (ID: {market_id_str})" if label else f"market ID {market_id_str}"
+        if inactive:
+            _logger.warning("No outcomePrices for inactive %s; falling back to orderbook", target)
         else:
-            if inactive:
-                _logger.warning(
-                    "No outcomePrices for inactive market ID %s; falling back to orderbook",
-                    market_id_str,
-                )
-            else:
-                _logger.warning("No outcomePrices for market ID %s", market_id_str)
+            _logger.warning("No outcomePrices for %s", target)
 
     for mkt in markets:
         active = mkt.get("active", True)
