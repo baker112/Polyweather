@@ -16,15 +16,48 @@ def load() -> dict[str, Any]:
         raise FileNotFoundError(
             "Bankroll not initialised. Run: we init-bankroll --usdc <amount>"
         )
-    with open(_PATH) as f:
-        return json.load(f)
+    try:
+        with open(_PATH) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        # Quarantine the corrupt file so its bytes are preserved and the next
+        # writer isn't blocked, then surface a clear error. Don't silently
+        # re-init: this holds real $$$, so the user must confirm recovery.
+        try:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+            quarantine = _PATH.with_name(f"{_PATH.name}.corrupt-{ts}")
+            _PATH.rename(quarantine)
+            hint = f" (corrupt file moved to {quarantine.name})"
+        except OSError:
+            hint = ""
+        raise RuntimeError(
+            f"Bankroll file at {_PATH} is corrupt ({exc}){hint}. "
+            "Inspect the quarantined file, then re-run: we init-bankroll --usdc <amount>"
+        ) from exc
 
 
 def save(b: dict[str, Any]) -> None:
     b["last_updated"] = datetime.now(timezone.utc).isoformat()
     _PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_PATH, "w") as f:
-        json.dump(b, f, indent=2, default=str)
+    _dump(b, _PATH)
+
+
+def _dump(b: dict[str, Any], path: Path) -> None:
+    import math as _math
+    def _scrub(v: Any) -> Any:
+        if isinstance(v, float) and not _math.isfinite(v):
+            return None
+        if isinstance(v, dict):
+            return {k: _scrub(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [_scrub(x) for x in v]
+        return v
+    def _default(o: Any) -> str:
+        if isinstance(o, datetime):
+            return o.isoformat()
+        return str(o)
+    with open(path, "w") as f:
+        json.dump(_scrub(b), f, indent=2, default=_default, allow_nan=False)
 
 
 def init(initial_usdc: float) -> dict[str, Any]:
@@ -64,14 +97,17 @@ def settle(b: dict[str, Any], stake: float, pnl: float) -> None:
 def _save_dry(b: dict[str, Any]) -> None:
     b["last_updated"] = datetime.now(timezone.utc).isoformat()
     _DRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(_DRY_PATH, "w") as f:
-        json.dump(b, f, indent=2, default=str)
+    _dump(b, _DRY_PATH)
 
 
 def load_dry() -> dict[str, Any]:
     if _DRY_PATH.exists():
-        with open(_DRY_PATH) as f:
-            return json.load(f)
+        try:
+            with open(_DRY_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            # Dry bankroll is paper-trading only — silently re-seed if corrupt.
+            pass
     b: dict[str, Any] = {
         "initial_usdc": DRY_INITIAL_USDC,
         "current_usdc": DRY_INITIAL_USDC,

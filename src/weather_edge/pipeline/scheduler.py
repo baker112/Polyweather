@@ -19,10 +19,12 @@ _logger = logging.getLogger(__name__)
 
 
 def _ingest_job(station_id: str) -> None:
+    import time as _time
     from datetime import timedelta
 
     from weather_edge.config import get_station
     from weather_edge.ingest import ecmwf, gefs
+    from weather_edge.logging import log_event
     from weather_edge.pipeline.lock import _most_recent_12z
     from weather_edge.store import parquet as store
 
@@ -33,6 +35,8 @@ def _ingest_job(station_id: str) -> None:
     lines: list[str] = [f"📡 <b>Ingest {station_id}</b> · {init_dt.strftime('%Y-%m-%d %HZ')}"]
     any_fail = False
     for model_name, fetch_fn in [("ecmwf", ecmwf.ingest_forecasts), ("gefs", gefs.ingest_forecasts)]:
+        # Per-call timer — prevents cumulative-since-job-start drift.
+        t0 = _time.monotonic()
         try:
             # GEFS: download only step=24 (matches backfill mode + lock.py _DEFAULT_LEAD_HOURS).
             # ~30s per station instead of ~15 min for all steps.
@@ -45,10 +49,14 @@ def _ingest_job(station_id: str) -> None:
             store.write_forecasts(df, model_name, init_dt, station_id)
             _logger.info("Ingested %s %s: %d rows", model_name, init_dt, len(df))
             lines.append(f"  ✅ {model_name}: {len(df)} rows")
+            log_event(f"ingest_{model_name}", station_id, "ok",
+                      (_time.monotonic() - t0) * 1000, rows=len(df))
         except Exception as exc:
             _logger.error("Ingest %s failed: %s", model_name, exc)
             lines.append(f"  ❌ {model_name}: {exc}")
             any_fail = True
+            log_event(f"ingest_{model_name}", station_id, "error",
+                      (_time.monotonic() - t0) * 1000, error=str(exc))
     if any_fail:
         lines[0] = lines[0].replace("📡", "⚠️")
     _tg.send("\n".join(lines))
@@ -186,11 +194,12 @@ def _resolve_and_observe_job(station_id: str) -> None:
 
             if not already_settled and settled_records:
                 settled_path.parent.mkdir(parents=True, exist_ok=True)
-                settled_path.write_text(json.dumps({
+                from weather_edge.store.parquet import _dump_json as _dj
+                _dj({
                     "resolved_label": resolved_label,
                     "settled_at": now_utc.isoformat(),
                     "records": settled_records,
-                }, indent=2, default=str))
+                }, settled_path)
 
             # Append running dry-bankroll line so paper-trading P&L is always visible
             if any(e.get("dry_run") for e in execs):
@@ -319,8 +328,8 @@ def _closing_snapshot_job(station_id: str) -> None:
         clv_dir = Path(__file__).parents[3] / "data" / "clv_snapshots" / f"station={station_id}"
         clv_dir.mkdir(parents=True, exist_ok=True)
         clv_path = clv_dir / f"{yesterday}.json"
-        with open(clv_path, "w") as f:
-            json.dump(snapshot.model_dump(), f, default=str)
+        from weather_edge.store.parquet import _dump_json as _dj
+        _dj(snapshot.model_dump(), clv_path)
         _logger.info("CLV snapshot saved for %s %s", station_id, yesterday)
     except Exception as exc:
         _logger.warning("CLV snapshot failed %s %s: %s", station_id, yesterday, exc)
@@ -416,8 +425,14 @@ def _daily_summary_job(stations: list[str]) -> None:
     any_bets = False
     any_dry = False
     for sid in stations:
-        rec = store.read_resolution(sid, yesterday)
-        execs = load_executions(sid, yesterday)
+        try:
+            rec = store.read_resolution(sid, yesterday)
+        except Exception:
+            rec = None
+        try:
+            execs = [e for e in load_executions(sid, yesterday) if isinstance(e, dict)]
+        except Exception:
+            execs = []
         live_execs = [e for e in execs if not e.get("dry_run")]
         dry_execs = [e for e in execs if e.get("dry_run")]
         if not (live_execs or dry_execs):
@@ -674,15 +689,22 @@ def start(stations: list[str]) -> None:
             ]
         except FileNotFoundError:
             lines.append("  Live: not initialised (we init-bankroll --usdc <amount>)")
-        db = br.load_dry()
-        lines += [
-            f"  Dry (paper, ${br.DRY_INITIAL_USDC:.0f} seed):",
-            f"    Current: ${db['current_usdc']:.2f}",
-            f"    Reserved: ${db.get('reserved_usdc', 0):.2f}",
-            f"    Available: ${br.available(db):.2f}",
-            f"    Total P&L: ${db.get('total_pnl', 0):+.2f}",
-            f"    Trades: {db.get('n_trades', 0)}",
-        ]
+        except Exception as exc:
+            # Corrupt JSON, permission errors, etc. — show in-band, don't
+            # crash the dispatcher (otherwise the whole reply is an error).
+            lines.append(f"  Live: ⚠️ unreadable — {exc}")
+        try:
+            db = br.load_dry()
+            lines += [
+                f"  Dry (paper, ${br.DRY_INITIAL_USDC:.0f} seed):",
+                f"    Current: ${db['current_usdc']:.2f}",
+                f"    Reserved: ${db.get('reserved_usdc', 0):.2f}",
+                f"    Available: ${br.available(db):.2f}",
+                f"    Total P&L: ${db.get('total_pnl', 0):+.2f}",
+                f"    Trades: {db.get('n_trades', 0)}",
+            ]
+        except Exception as exc:
+            lines.append(f"  Dry: ⚠️ unreadable — {exc}")
         return "\n".join(lines)
 
     def _pnl(args: str = "") -> str:
@@ -706,11 +728,22 @@ def start(stations: list[str]) -> None:
         for days_ago in range(1, 8):
             d = (now - timedelta(days=days_ago)).date()
             for sid in stations:
-                rec = _store.read_resolution(sid, d)
-                if not (rec and rec.get("resolved")):
+                try:
+                    rec = _store.read_resolution(sid, d)
+                except Exception:
+                    rec = None
+                if not (isinstance(rec, dict) and rec.get("resolved")):
                     continue
                 label = rec.get("resolved_label", "")
-                for e in load_executions(sid, d):
+                try:
+                    execs = load_executions(sid, d)
+                except Exception:
+                    continue
+                for e in execs:
+                    # Defensive: load_executions used to extend with dict keys
+                    # when a file held a single-record dict, yielding str items.
+                    if not isinstance(e, dict):
+                        continue
                     bucket = dry if e.get("dry_run") else live
                     bucket["n"] += 1
                     bucket["staked"] += float(e.get("usdc_stake", 0) or 0)

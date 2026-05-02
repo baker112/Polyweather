@@ -48,7 +48,12 @@ def _emos_loss(
     return mean_crps(mu, sigma, obs)
 
 
-def fit_emos(training_pairs: list[TrainingPair], station: str, lead_hours: int) -> EmosParams:
+def fit_emos(
+    training_pairs: list[TrainingPair],
+    station: str,
+    lead_hours: int,
+    now_utc: datetime | None = None,
+) -> EmosParams:
     if not training_pairs:
         from weather_edge.exceptions import EmosError
         raise EmosError("No training pairs provided")
@@ -74,7 +79,10 @@ def fit_emos(training_pairs: list[TrainingPair], station: str, lead_hours: int) 
     sigma_fit = np.sqrt(np.maximum(c + d * ens_var, 1e-8))
     train_crps = mean_crps(mu_fit, sigma_fit, obs)
 
-    now = datetime.now(timezone.utc)
+    # valid_from must equal the historical lock time (now_utc passed by the
+    # caller); using wall-time would let backtests pull future-dated fits and
+    # poison subsequent date iterations with look-ahead bias.
+    now = now_utc if now_utc is not None else datetime.now(timezone.utc)
     return EmosParams(
         a=float(a),
         b=float(b),
@@ -282,16 +290,18 @@ def fit_emos_per_model(
     as_of: date,
     models: tuple[str, ...] = ("ecmwf", "gefs"),
     window_days: int = 60,
+    now_utc: datetime | None = None,
 ) -> dict[str, EmosParams]:
     """Fit one EmosParams per model. Returns only models with sufficient data.
 
     Phase 2 entry point. Falls back gracefully if a model has insufficient data.
+    Pass now_utc to anchor `valid_from` at the historical lock time (backtest-safe).
     """
     results: dict[str, EmosParams] = {}
     for model in models:
         pairs = assemble_training_pairs_per_model(station, lead_hours, as_of, model, window_days)
         if len(pairs) < 10:
             continue
-        params = fit_emos(pairs, station=station, lead_hours=lead_hours)
+        params = fit_emos(pairs, station=station, lead_hours=lead_hours, now_utc=now_utc)
         results[model] = params
     return results

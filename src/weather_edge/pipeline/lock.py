@@ -66,11 +66,15 @@ def lock_picks(
         picks_path.unlink(missing_ok=True)
 
     station = get_station(station_id)
-    t0 = time.monotonic()
 
     provenance: dict[str, Any] = {}
+    pipeline_start = time.monotonic()
 
     # ── Stage 1: Ingest forecasts ─────────────────────────────────────────────
+    # Per-stage timer anchored immediately before the work; the prior
+    # version reused the pipeline-start timer, conflating later stages'
+    # latency with the ingest figure on long lock_picks runs.
+    t0 = time.monotonic()
     init_dt = _most_recent_12z(now_utc)
     provenance["init_dt"] = init_dt.isoformat()
     forecast_dfs: list[pl.DataFrame] = []
@@ -224,7 +228,7 @@ def lock_picks(
 
     store.write_picks(result.model_dump(), station_id, target_date)
     log_event("lock_picks", station_id, "ok",
-              (time.monotonic() - t0) * 1000, n_picks=len(picks))
+              (time.monotonic() - pipeline_start) * 1000, n_picks=len(picks))
     return result
 
 
@@ -405,7 +409,14 @@ def _get_pooled_emos_params(station_id: str, lead_hours: int, now_utc: datetime)
 
     pairs = assemble_training_pairs(station_id, lead_hours, now_utc.date())
     if pairs:
-        params = fit_emos(pairs, station_id, lead_hours)
+        params = fit_emos(pairs, station_id, lead_hours, now_utc=now_utc)
+        # Defensive backtest invariant: never persist a fit whose valid_from
+        # would let a same-or-earlier lock time read it. params.valid_from is
+        # set to now_utc inside fit_emos; the assertion guards future drift.
+        if params.valid_from > now_utc:
+            raise EmosError(
+                f"EMOS valid_from {params.valid_from} must be <= lock time {now_utc}"
+            )
         store.write_emos_params(params.model_dump(), station_id, lead_hours, params.valid_from, model=None)
     else:
         _logger.warning(

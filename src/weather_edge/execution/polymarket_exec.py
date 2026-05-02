@@ -196,8 +196,24 @@ def save_execution(
         / f"{ts}.json"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
+    import math as _math
+
+    def _scrub(v: Any) -> Any:
+        if isinstance(v, float) and not _math.isfinite(v):
+            return None
+        if isinstance(v, dict):
+            return {k: _scrub(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [_scrub(x) for x in v]
+        return v
+
+    def _default(o: Any) -> str:
+        if isinstance(o, datetime):
+            return o.isoformat()
+        return str(o)
+
     with open(path, "w") as f:
-        json.dump(records, f, indent=2, default=str)
+        json.dump(_scrub(records), f, indent=2, default=_default, allow_nan=False)
     return path
 
 
@@ -207,6 +223,17 @@ def load_executions(station: str, target_date: Any) -> list[dict[str, Any]]:
         return []
     records: list[dict[str, Any]] = []
     for p in sorted(base.glob("*.json")):
-        with open(p) as f:
-            records.extend(json.load(f))
+        # Skip non-execution sidecars (settlement marker, atomic-write tmp,
+        # quarantined corrupt files) and tolerate any individual bad file.
+        if p.name.startswith("_") or p.name.endswith(".tmp") or ".corrupt-" in p.name:
+            continue
+        try:
+            with open(p) as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                records.extend(data)
+            elif isinstance(data, dict):
+                records.append(data)
+        except (json.JSONDecodeError, OSError) as exc:
+            _logger.warning("Skipping unreadable execution file %s: %s", p, exc)
     return records
