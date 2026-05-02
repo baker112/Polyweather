@@ -120,7 +120,7 @@ def _resolve_and_observe_job(station_id: str) -> None:
         from pathlib import Path
 
         execs = load_executions(station_id, yesterday)
-        if execs:
+        if execs and rec.get("resolved"):
             clv_path = Path(__file__).parents[3] / "data" / "clv_snapshots" / f"station={station_id}" / f"{yesterday}.json"
             clv_outcomes: dict[str, float] = {}
             if clv_path.exists():
@@ -130,33 +130,75 @@ def _resolve_and_observe_job(station_id: str) -> None:
                 except Exception:
                     pass
 
+            # Per-date settlement marker — prevents double-settlement if the
+            # resolve job re-runs (manual /resolve, restart catch-up, etc.).
+            settled_path = (
+                Path(__file__).parents[3] / "data" / "executions"
+                / f"station={station_id}" / f"date={yesterday}" / "_settled.json"
+            )
+            already_settled = settled_path.exists()
+
             try:
                 bankroll_data = br.load()
             except FileNotFoundError:
                 bankroll_data = None
+            dry_bankroll = br.load_dry()
 
             lines = [f"📋 <b>Result: {station_id}</b> · {yesterday}  →  {resolved_label}"]
+            settled_records: list[dict] = []
             for e in execs:
-                if e.get("dry_run"):
-                    continue
                 bracket = e.get("bracket_label", "?")
                 side = e.get("side", "?")
                 entry = float(e.get("price", 0))
                 stake = float(e.get("usdc_stake", 0))
+                if entry <= 0:
+                    continue
                 win = (bracket == resolved_label and side == "YES") or (bracket != resolved_label and side == "NO")
                 pnl = (1.0 / entry - 1) * stake if win else -stake
+                is_dry = bool(e.get("dry_run"))
+                tag = " [dry]" if is_dry else ""
                 icon = "🏆" if win else "💸"
-                line = f"  {icon} {side} {bracket}  entry={entry:.2f}  P&amp;L=${pnl:+.2f}"
+                line = f"  {icon} {side} {bracket}{tag}  entry={entry:.2f}  P&amp;L=${pnl:+.2f}"
                 if bracket in clv_outcomes:
                     closing = clv_outcomes[bracket]
                     clv = (closing - entry) if side == "YES" else (entry - closing)
                     line += f"  CLV={clv:+.3f}"
                 lines.append(line)
-                if bankroll_data is not None:
+
+                settled_records.append({
+                    "bracket_label": bracket,
+                    "side": side,
+                    "dry_run": is_dry,
+                    "entry": entry,
+                    "stake": stake,
+                    "win": win,
+                    "pnl": round(pnl, 4),
+                })
+
+                if not already_settled:
                     try:
-                        br.settle(bankroll_data, stake, pnl)
+                        if is_dry:
+                            br.settle_dry(dry_bankroll, stake, pnl)
+                        elif bankroll_data is not None:
+                            br.settle(bankroll_data, stake, pnl)
                     except Exception as exc:
                         _logger.warning("Bankroll settle failed: %s", exc)
+
+            if not already_settled and settled_records:
+                settled_path.parent.mkdir(parents=True, exist_ok=True)
+                settled_path.write_text(json.dumps({
+                    "resolved_label": resolved_label,
+                    "settled_at": now_utc.isoformat(),
+                    "records": settled_records,
+                }, indent=2, default=str))
+
+            # Append running dry-bankroll line so paper-trading P&L is always visible
+            if any(e.get("dry_run") for e in execs):
+                lines.append(
+                    f"  📒 dry bankroll: ${dry_bankroll['current_usdc']:.2f}  "
+                    f"(P&amp;L=${dry_bankroll.get('total_pnl', 0):+.2f}  "
+                    f"{dry_bankroll.get('n_trades', 0)} trades)"
+                )
             if len(lines) > 1:
                 _tg.send("\n".join(lines))
     except Exception as exc:
@@ -197,11 +239,16 @@ def _execute_job(station_id: str) -> None:
 
     locked = LockedPicks(**picks_data)
 
-    try:
-        bankroll = br.load()
-    except FileNotFoundError:
-        _tg.send(f"❌ <b>Execute FAILED {station_id}:</b> bankroll not initialised\nRun: we init-bankroll --usdc &lt;amount&gt;")
-        return
+    # Dry runs size against a separate paper bankroll (auto-init at $100)
+    # so simulated P&L doesn't pollute the live tracker.
+    if dry_run:
+        bankroll = br.load_dry()
+    else:
+        try:
+            bankroll = br.load()
+        except FileNotFoundError:
+            _tg.send(f"❌ <b>Execute FAILED {station_id}:</b> bankroll not initialised\nRun: we init-bankroll --usdc &lt;amount&gt;")
+            return
 
     avail = br.available(bankroll)
     cfg = get_station(station_id)
@@ -239,9 +286,11 @@ def _execute_job(station_id: str) -> None:
             _logger.error("Order failed %s %s: %s", station_id, pick.bracket_label, exc)
             _tg.send(f"❌ <b>Order FAILED {station_id} {pick.bracket_label}:</b> {exc}")
 
-    if records and not dry_run:
-        br.reserve(bankroll, total_staked)
     if records:
+        if dry_run:
+            br.reserve_dry(bankroll, total_staked)
+        else:
+            br.reserve(bankroll, total_staked)
         save_execution(station_id, target_date, records)
 
 
@@ -351,31 +400,56 @@ def _daily_summary_job(stations: list[str]) -> None:
     lines = [f"📊 <b>Daily Summary</b> · {now.strftime('%Y-%m-%d %H:%M')}z  {mode_icon} {mode}"]
 
     # Yesterday P&L per station (show dry-run results when no live bets exist)
+    def _pnl_for(e: dict, resolved_label: str) -> float:
+        bracket = e.get("bracket_label", "?")
+        side = e.get("side", "?")
+        entry = float(e.get("price", 0) or 0)
+        stake = float(e.get("usdc_stake", 0) or 0)
+        if entry <= 0:
+            return 0.0
+        win = (bracket == resolved_label and side == "YES") or (bracket != resolved_label and side == "NO")
+        return (1.0 / entry - 1) * stake if win else -stake
+
     lines.append("\n<b>Yesterday P&amp;L</b>")
-    total_pnl = 0.0
+    total_live_pnl = 0.0
+    total_dry_pnl = 0.0
     any_bets = False
+    any_dry = False
     for sid in stations:
         rec = store.read_resolution(sid, yesterday)
         execs = load_executions(sid, yesterday)
         live_execs = [e for e in execs if not e.get("dry_run")]
         dry_execs = [e for e in execs if e.get("dry_run")]
-        active_execs = live_execs if live_execs else dry_execs
-        tag = "" if live_execs else " [dry]"
-        if not active_execs:
+        if not (live_execs or dry_execs):
             continue
         any_bets = True
-        if rec and rec.get("resolved"):
-            pnl = sum(float(e.get("pnl", 0.0)) for e in active_execs)
-            if live_execs:
-                total_pnl += pnl
-            icon = "🏆" if pnl >= 0 else "💸"
-            lines.append(f"  {icon} {sid}{tag}  →  {rec['resolved_label']}  P&amp;L=${pnl:+.2f}")
-        else:
-            lines.append(f"  ⏳ {sid}{tag}: pending")
+        resolved = bool(rec and rec.get("resolved"))
+        resolved_label = (rec or {}).get("resolved_label", "")
+
+        if live_execs:
+            if resolved:
+                pnl = sum(_pnl_for(e, resolved_label) for e in live_execs)
+                total_live_pnl += pnl
+                icon = "🏆" if pnl >= 0 else "💸"
+                lines.append(f"  {icon} {sid}  →  {resolved_label}  P&amp;L=${pnl:+.2f}")
+            else:
+                lines.append(f"  ⏳ {sid}: pending")
+        if dry_execs:
+            any_dry = True
+            if resolved:
+                pnl = sum(_pnl_for(e, resolved_label) for e in dry_execs)
+                total_dry_pnl += pnl
+                icon = "🏆" if pnl >= 0 else "💸"
+                lines.append(f"  {icon} {sid} [dry]  →  {resolved_label}  P&amp;L=${pnl:+.2f}")
+            else:
+                lines.append(f"  ⏳ {sid} [dry]: pending")
     if not any_bets:
         lines.append("  No bets yesterday")
-    elif mode == "live":
-        lines.append(f"  <b>Total: ${total_pnl:+.2f}</b>")
+    else:
+        if mode == "live":
+            lines.append(f"  <b>Live total: ${total_live_pnl:+.2f}</b>")
+        if any_dry:
+            lines.append(f"  <b>Dry total: ${total_dry_pnl:+.2f}</b>")
 
     # Bankroll
     lines.append("\n<b>Bankroll</b>")
@@ -383,11 +457,17 @@ def _daily_summary_job(stations: list[str]) -> None:
         b = br.load()
         avail = b['current_usdc'] - b.get('reserved_usdc', 0)
         lines.append(
-            f"  💰 ${b['current_usdc']:.2f}  "
+            f"  💰 live: ${b['current_usdc']:.2f}  "
             f"(avail=${avail:.2f}  P&amp;L=${b.get('total_pnl', 0):+.2f}  {b.get('n_trades', 0)} trades)"
         )
     except FileNotFoundError:
-        lines.append("  Not initialised")
+        lines.append("  💰 live: not initialised")
+    db = br.load_dry()
+    db_avail = db['current_usdc'] - db.get('reserved_usdc', 0)
+    lines.append(
+        f"  📒 dry:  ${db['current_usdc']:.2f}  "
+        f"(avail=${db_avail:.2f}  P&amp;L=${db.get('total_pnl', 0):+.2f}  {db.get('n_trades', 0)} trades)"
+    )
 
     # Tomorrow's picks
     lines.append(f"\n<b>Picks for {tomorrow}</b>")
@@ -580,45 +660,72 @@ def start(stations: list[str]) -> None:
 
     def _bankroll(args: str = "") -> str:
         from weather_edge.execution import bankroll as br
+        lines: list[str] = ["Bankroll"]
         try:
             b = br.load()
             avail = br.available(b)
-            return (
-                f"Bankroll\n"
-                f"  Current: ${b['current_usdc']:.2f}\n"
-                f"  Reserved: ${b.get('reserved_usdc', 0):.2f}\n"
-                f"  Available: ${avail:.2f}\n"
-                f"  Total P&L: ${b.get('total_pnl', 0):+.2f}\n"
-                f"  Trades: {b.get('n_trades', 0)}"
-            )
+            lines += [
+                f"  Live:",
+                f"    Current: ${b['current_usdc']:.2f}",
+                f"    Reserved: ${b.get('reserved_usdc', 0):.2f}",
+                f"    Available: ${avail:.2f}",
+                f"    Total P&L: ${b.get('total_pnl', 0):+.2f}",
+                f"    Trades: {b.get('n_trades', 0)}",
+            ]
         except FileNotFoundError:
-            return "Bankroll not initialised. Run: we init-bankroll --usdc <amount>"
+            lines.append("  Live: not initialised (we init-bankroll --usdc <amount>)")
+        db = br.load_dry()
+        lines += [
+            f"  Dry (paper, ${br.DRY_INITIAL_USDC:.0f} seed):",
+            f"    Current: ${db['current_usdc']:.2f}",
+            f"    Reserved: ${db.get('reserved_usdc', 0):.2f}",
+            f"    Available: ${br.available(db):.2f}",
+            f"    Total P&L: ${db.get('total_pnl', 0):+.2f}",
+            f"    Trades: {db.get('n_trades', 0)}",
+        ]
+        return "\n".join(lines)
 
     def _pnl(args: str = "") -> str:
         from datetime import timedelta
         from weather_edge.execution.polymarket_exec import load_executions
+        from weather_edge.store import parquet as _store
         now = datetime.now(timezone.utc)
-        lines = ["P&L last 7 days:"]
-        total_pnl = 0.0
-        total_staked = 0.0
-        n = 0
+
+        def _pnl_for(e: dict, label: str) -> float:
+            entry = float(e.get("price", 0) or 0)
+            stake = float(e.get("usdc_stake", 0) or 0)
+            if entry <= 0:
+                return 0.0
+            br_l = e.get("bracket_label", "?")
+            sd = e.get("side", "?")
+            win = (br_l == label and sd == "YES") or (br_l != label and sd == "NO")
+            return (1.0 / entry - 1) * stake if win else -stake
+
+        live = {"n": 0, "staked": 0.0, "pnl": 0.0}
+        dry = {"n": 0, "staked": 0.0, "pnl": 0.0}
         for days_ago in range(1, 8):
             d = (now - timedelta(days=days_ago)).date()
             for sid in stations:
+                rec = _store.read_resolution(sid, d)
+                if not (rec and rec.get("resolved")):
+                    continue
+                label = rec.get("resolved_label", "")
                 for e in load_executions(sid, d):
-                    if e.get("dry_run"):
-                        continue
-                    stake = float(e.get("usdc_stake", 0))
-                    pnl = float(e.get("pnl", 0))
-                    total_staked += stake
-                    total_pnl += pnl
-                    n += 1
-        lines.append(f"  Trades: {n}")
-        lines.append(f"  Staked: ${total_staked:.2f}")
-        lines.append(f"  P&L: ${total_pnl:+.2f}")
-        if total_staked > 0:
-            lines.append(f"  ROI: {total_pnl/total_staked*100:+.1f}%")
-        lines.append("\n(Use bankroll for settled totals)")
+                    bucket = dry if e.get("dry_run") else live
+                    bucket["n"] += 1
+                    bucket["staked"] += float(e.get("usdc_stake", 0) or 0)
+                    bucket["pnl"] += _pnl_for(e, label)
+
+        def _block(name: str, b: dict) -> list[str]:
+            out = [f"{name}: trades={b['n']} staked=${b['staked']:.2f} P&L=${b['pnl']:+.2f}"]
+            if b["staked"] > 0:
+                out.append(f"  ROI: {b['pnl']/b['staked']*100:+.1f}%")
+            return out
+
+        lines = ["P&L last 7 days (resolved bets):"]
+        lines += _block("  Live", live)
+        lines += _block("  Dry ", dry)
+        lines.append("\n(Use /bankroll for settled totals)")
         return "\n".join(lines)
 
     # ── Resolve target stations from command args ────────────────────────────

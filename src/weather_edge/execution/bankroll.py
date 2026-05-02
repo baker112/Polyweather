@@ -7,6 +7,8 @@ from pathlib import Path
 from typing import Any
 
 _PATH = Path(__file__).parents[3] / "data" / "bankroll.json"
+_DRY_PATH = Path(__file__).parents[3] / "data" / "dry_bankroll.json"
+DRY_INITIAL_USDC = 100.0  # paper-trading bankroll seed
 
 
 def load() -> dict[str, Any]:
@@ -53,3 +55,42 @@ def settle(b: dict[str, Any], stake: float, pnl: float) -> None:
     b["total_pnl"] = float(b.get("total_pnl", 0.0)) + pnl
     b["n_trades"] = int(b.get("n_trades", 0)) + 1
     save(b)
+
+
+# ─── Dry-run (paper) bankroll ──────────────────────────────────────────────────
+# Independent of the live bankroll. Auto-initialises at $DRY_INITIAL_USDC the
+# first time it's loaded so paper-trading P&L can accrue without ceremony.
+
+def _save_dry(b: dict[str, Any]) -> None:
+    b["last_updated"] = datetime.now(timezone.utc).isoformat()
+    _DRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_DRY_PATH, "w") as f:
+        json.dump(b, f, indent=2, default=str)
+
+
+def load_dry() -> dict[str, Any]:
+    if _DRY_PATH.exists():
+        with open(_DRY_PATH) as f:
+            return json.load(f)
+    b: dict[str, Any] = {
+        "initial_usdc": DRY_INITIAL_USDC,
+        "current_usdc": DRY_INITIAL_USDC,
+        "reserved_usdc": 0.0,
+        "total_pnl": 0.0,
+        "n_trades": 0,
+    }
+    _save_dry(b)
+    return b
+
+
+def reserve_dry(b: dict[str, Any], amount: float) -> None:
+    b["reserved_usdc"] = float(b.get("reserved_usdc", 0.0)) + amount
+    _save_dry(b)
+
+
+def settle_dry(b: dict[str, Any], stake: float, pnl: float) -> None:
+    b["reserved_usdc"] = max(0.0, float(b.get("reserved_usdc", 0.0)) - stake)
+    b["current_usdc"] = float(b["current_usdc"]) + pnl
+    b["total_pnl"] = float(b.get("total_pnl", 0.0)) + pnl
+    b["n_trades"] = int(b.get("n_trades", 0)) + 1
+    _save_dry(b)

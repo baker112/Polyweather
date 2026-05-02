@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -35,13 +35,44 @@ def ingest_forecasts(init_dt: datetime, station: StationConfig) -> pl.DataFrame:
     """Fetch ECMWF HRES + ENS and return a forecast DataFrame.
 
     Columns: model, member_id, init_datetime, valid_date, station, daily_max_c, lead_hours
+
+    If the requested init cycle returns 404 / no data on every stream, falls
+    back to progressively older inits (init - 12h, init - 24h, init - 36h)
+    before giving up. Open-data retention is ~4 days, so this gracefully
+    handles temporary publication gaps and clock-skew at the boundary.
     """
     try:
         from ecmwf.opendata import Client  # type: ignore[import-untyped]
     except ImportError as exc:
         raise IngestError("ecmwf-opendata not installed") from exc
 
-    client = Client(source="ecmwf")
+    fallback_inits = [init_dt - timedelta(hours=h) for h in (0, 12, 24, 36)]
+    last_error: Exception | None = None
+
+    for try_init in fallback_inits:
+        try:
+            df = _fetch_one_init(Client(source="ecmwf"), try_init, station)
+            if try_init != init_dt:
+                _logger.warning(
+                    "ECMWF: requested init %s unavailable, used fallback %s",
+                    init_dt.strftime("%Y-%m-%dT%HZ"),
+                    try_init.strftime("%Y-%m-%dT%HZ"),
+                )
+            return df
+        except IngestError as exc:
+            last_error = exc
+            _logger.warning(
+                "ECMWF init %s failed: %s",
+                try_init.strftime("%Y-%m-%dT%HZ"), exc,
+            )
+
+    raise last_error or IngestError("ECMWF: no data available across all fallback inits")
+
+
+def _fetch_one_init(
+    client: Any, init_dt: datetime, station: StationConfig
+) -> pl.DataFrame:
+    """Try to fetch one init cycle; raise IngestError if all streams fail."""
     tz = zoneinfo.ZoneInfo(station.timezone)
     rows: list[dict[str, Any]] = []
 

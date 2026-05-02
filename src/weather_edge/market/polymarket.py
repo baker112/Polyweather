@@ -46,7 +46,10 @@ async def fetch_market(slug: str, station: str, target_date: date) -> MarketSnap
         outcomes = await _get_outcomes(client, event)
 
     implied_sum = sum(o.mid for o in outcomes)
-    if not (_OVERROUND_MIN <= implied_sum <= _OVERROUND_MAX):
+    # For resolved events all bracket markets are closed; the overround check
+    # doesn't apply (one winner ~1.0, losers ~0.0 → sum ≈ 1.0 by construction).
+    event_closed = bool(event.get("closed", False))
+    if not event_closed and not (_OVERROUND_MIN <= implied_sum <= _OVERROUND_MAX):
         raise MarketError(
             f"Event {slug!r} implied sum {implied_sum:.3f} outside "
             f"[{_OVERROUND_MIN}, {_OVERROUND_MAX}]"
@@ -91,7 +94,13 @@ async def _get_outcomes(
     outcomes: list[MarketOutcome] = []
 
     for mkt in markets:
-        if not mkt.get("active", True) or mkt.get("closed", False):
+        # Closed (resolved) markets: outcomePrices reflect the resolution
+        # (winner ≈ 1.0, losers ≈ 0.0). Use those instead of a CLOB book so
+        # resolve_date can detect the winning bracket.
+        if mkt.get("closed", False) or not mkt.get("active", True):
+            outcome = _outcome_from_prices(mkt)
+            if outcome is not None:
+                outcomes.append(outcome)
             continue
         if not mkt.get("enableOrderBook", True):
             # AMM-only market — use outcomePrices as fallback
