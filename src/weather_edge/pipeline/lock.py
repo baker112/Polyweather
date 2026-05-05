@@ -264,6 +264,9 @@ def compute_edges(
             top_size_shares = outcome.top_bid_size
             fill_price = (1.0 - outcome.best_bid) if outcome.best_bid > 0 else (1.0 - outcome.mid)
         top_size_usdc = top_size_shares * fill_price
+        # Pre-feature snapshots have both sizes = 0; treat as "unknown" rather
+        # than zero-depth so backtest replay against legacy snapshots still works.
+        has_book_data = outcome.top_ask_size > 0 or outcome.top_bid_size > 0
         net_edge = abs(edge) - outcome.spread
 
         gates = {
@@ -272,7 +275,7 @@ def compute_edges(
             "min_liquidity": outcome.liquidity >= thresholds.min_liquidity,
             "max_raw_prob": bp.model_prob <= thresholds.max_raw_prob,
             "market_fresh": snapshot.fetched_at >= freshness_cutoff,
-            "min_top_size": top_size_usdc >= thresholds.min_top_size_usdc,
+            "min_top_size": (not has_book_data) or top_size_usdc >= thresholds.min_top_size_usdc,
             "min_net_edge": net_edge >= thresholds.min_net_edge,
         }
 
@@ -284,9 +287,10 @@ def compute_edges(
         kelly = min(kelly, thresholds.max_kelly_fraction) * thresholds.kelly_multiplier
 
         # Depth-implied stake cap: only consume `depth_safety_factor` of top-of-book.
+        # Skip the cap when book data is unavailable (legacy snapshots).
         max_stake_usdc = (
             top_size_usdc * thresholds.depth_safety_factor
-            if top_size_usdc > 0 else None
+            if has_book_data and top_size_usdc > 0 else None
         )
 
         candidates.append(Candidate(
@@ -511,12 +515,14 @@ def _summarise_failures(
         if outcome.liquidity < thresholds.min_liquidity:
             failures.append(f"{bp.label}: liq=${outcome.liquidity:.0f}<${thresholds.min_liquidity:.0f}")
         side = "YES" if edge > 0 else "NO"
-        if side == "YES":
-            top_usdc = outcome.top_ask_size * (outcome.best_ask or outcome.mid)
-        else:
-            top_usdc = outcome.top_bid_size * (1.0 - (outcome.best_bid or outcome.mid))
-        if top_usdc < thresholds.min_top_size_usdc:
-            failures.append(f"{bp.label}: top=${top_usdc:.1f}<${thresholds.min_top_size_usdc:.0f}")
+        has_book_data = outcome.top_ask_size > 0 or outcome.top_bid_size > 0
+        if has_book_data:
+            if side == "YES":
+                top_usdc = outcome.top_ask_size * (outcome.best_ask or outcome.mid)
+            else:
+                top_usdc = outcome.top_bid_size * (1.0 - (outcome.best_bid or outcome.mid))
+            if top_usdc < thresholds.min_top_size_usdc:
+                failures.append(f"{bp.label}: top=${top_usdc:.1f}<${thresholds.min_top_size_usdc:.0f}")
         net = abs(edge) - outcome.spread
         if net < thresholds.min_net_edge:
             failures.append(f"{bp.label}: net_edge={net:+.3f}<{thresholds.min_net_edge}")

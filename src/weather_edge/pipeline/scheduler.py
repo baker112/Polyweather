@@ -81,9 +81,11 @@ def _lock_job(station_id: str) -> None:
             lines = [f"🎯 <b>Pick locked: {station_id}</b> · {target_date}",
                      f"   μ={result.mu:.1f}°C  σ={result.sigma:.2f}"]
             for p in result.picks:
+                cap_str = f"  cap=${p.max_stake_usdc:.0f}" if p.max_stake_usdc is not None else ""
                 lines.append(
                     f"  {'🟢' if p.side == 'YES' else '🔴'} {p.side} {p.bracket_label}"
-                    f"  model={p.model_prob:.0%}  mkt={p.market_prob:.0%}  edge={p.edge:+.1%}  kelly={p.kelly_fraction:.1%}"
+                    f"  model={p.model_prob:.0%}  mkt={p.market_prob:.0%}  edge={p.edge:+.1%}"
+                    f"  kelly={p.kelly_fraction:.1%}{cap_str}"
                 )
             _tg.send("\n".join(lines))
         else:
@@ -890,14 +892,23 @@ def start(stations: list[str]) -> None:
         return out
 
     def _parse_days(args: str, default: int = 7) -> int:
-        try:
-            n = int(args.strip().split()[0]) if args.strip() else default
-            return max(1, min(n, 90))
-        except Exception:
-            return default
+        for tok in args.strip().split():
+            try:
+                n = int(tok)
+                return max(1, min(n, 90))
+            except ValueError:
+                continue
+        return default
+
+    def _parse_sort_by(args: str) -> str:
+        for tok in args.strip().lower().split():
+            if tok in {"clv", "pnl"}:
+                return tok
+        return "pnl"
 
     def _format_ranking(args: str, reverse: bool, title: str) -> str:
         days = _parse_days(args)
+        sort_by = _parse_sort_by(args)
         data = _station_breakdown(days)
 
         rows: list[tuple[str, float, float, int, int, float | None]] = []
@@ -916,8 +927,13 @@ def start(stations: list[str]) -> None:
         if not rows:
             return f"{title} (last {days}d): no resolved bets yet."
 
-        rows.sort(key=lambda r: r[1], reverse=reverse)
-        lines = [f"{title} (last {days}d, live+dry combined):"]
+        if sort_by == "clv":
+            # None CLV pushed to the unfavoured end so they don't dominate either ranking.
+            unfav = float("-inf") if reverse else float("inf")
+            rows.sort(key=lambda r: (r[5] if r[5] is not None else unfav), reverse=reverse)
+        else:
+            rows.sort(key=lambda r: r[1], reverse=reverse)
+        lines = [f"{title} (last {days}d, sort={sort_by}, live+dry combined):"]
         for sid, pnl, staked, n, wins, mean_clv in rows:
             roi = (pnl / staked * 100) if staked > 0 else 0.0
             clv_str = f"  CLV={mean_clv:+.3f}" if mean_clv is not None else "  CLV=n/a"
@@ -925,7 +941,7 @@ def start(stations: list[str]) -> None:
                 f"  {sid}: P&L=${pnl:+.2f}  ROI={roi:+.1f}%{clv_str}  "
                 f"trades={n}  wins={wins}/{n} ({wins/n*100:.0f}%)  staked=${staked:.2f}"
             )
-        lines.append("\nCLV = mean per-bet closing-line value (less noisy than P&L).")
+        lines.append("\nCLV = mean per-bet closing-line value (less noisy than P&L). Try `/topstations clv 14`.")
         return "\n".join(lines)
 
     def _cmd_top(args: str = "") -> str:
