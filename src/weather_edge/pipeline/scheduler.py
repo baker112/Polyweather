@@ -167,13 +167,14 @@ def _resolve_and_observe_job(station_id: str) -> None:
                 tag = " [dry]" if is_dry else ""
                 icon = "🏆" if win else "💸"
                 line = f"  {icon} {side} {bracket}{tag}  entry={entry:.2f}  P&amp;L=${pnl:+.2f}"
+                clv_value: float | None = None
                 if bracket in clv_outcomes:
                     closing = clv_outcomes[bracket]
-                    clv = (closing - entry) if side == "YES" else (entry - closing)
-                    line += f"  CLV={clv:+.3f}"
+                    clv_value = (closing - entry) if side == "YES" else (entry - closing)
+                    line += f"  CLV={clv_value:+.3f}"
                 lines.append(line)
 
-                settled_records.append({
+                rec_out = {
                     "bracket_label": bracket,
                     "side": side,
                     "dry_run": is_dry,
@@ -181,7 +182,10 @@ def _resolve_and_observe_job(station_id: str) -> None:
                     "stake": stake,
                     "win": win,
                     "pnl": round(pnl, 4),
-                })
+                }
+                if clv_value is not None:
+                    rec_out["clv"] = round(clv_value, 4)
+                settled_records.append(rec_out)
 
                 if not already_settled:
                     try:
@@ -240,6 +244,18 @@ def _execute_job(station_id: str) -> None:
     dry_run = not _is_live_for(station_id)
     now_utc = datetime.now(timezone.utc)
     target_date = (now_utc + timedelta(days=1)).date()
+
+    if not dry_run:
+        from weather_edge.pipeline.edge_gate import station_passes_gate
+        try:
+            passed, reason = station_passes_gate(station_id, target_date)
+        except Exception as exc:
+            _logger.warning("Edge gate errored for %s (%s) — allowing live", station_id, exc)
+            passed, reason = True, f"gate-error: {exc}"
+        if not passed:
+            dry_run = True
+            _logger.warning("Edge gate forced dry-run for %s: %s", station_id, reason)
+            _tg.send(f"⏸ <b>{station_id}</b> auto-paused (live→dry): {reason}")
 
     picks_data = store.read_picks(station_id, target_date)
     if not picks_data or not picks_data.get("picks"):
@@ -528,6 +544,18 @@ def _daily_summary_job(stations: list[str]) -> None:
                 )
     if not any_picks:
         lines.append("  No picks yet (locks fire later today)")
+
+    # Edge-gate status (auto-pause flag per station)
+    from weather_edge.pipeline.edge_gate import station_passes_gate
+    lines.append("\n<b>Edge gate</b>")
+    for sid in stations:
+        try:
+            passed, reason = station_passes_gate(sid, tomorrow)
+        except Exception as exc:
+            lines.append(f"  ❓ {sid}: gate error ({exc})")
+            continue
+        icon = "✅" if passed else "⏸"
+        lines.append(f"  {icon} {sid}: {reason}")
 
     _tg.send("\n".join(lines))
 
