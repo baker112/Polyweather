@@ -237,7 +237,7 @@ def _execute_job(station_id: str) -> None:
         _logger.info("Trading disabled (TRADING_ENABLED!=true) — skipping execute for %s", station_id)
         return
 
-    dry_run = os.getenv("LIVE_TRADING", "false").lower() != "true"
+    dry_run = not _is_live_for(station_id)
     now_utc = datetime.now(timezone.utc)
     target_date = (now_utc + timedelta(days=1)).date()
 
@@ -379,11 +379,35 @@ def _write_env(updates: dict[str, str]) -> None:
     env_path.write_text("\n".join(lines) + "\n")
 
 
+def _live_stations() -> set[str]:
+    """Whitelist of station IDs allowed to submit live orders.
+
+    When non-empty, this overrides LIVE_TRADING on a per-station basis: only
+    listed stations submit real orders, the rest fall back to dry-run.
+    """
+    import os
+    raw = os.getenv("LIVE_STATIONS", "")
+    return {s.strip().upper() for s in raw.split(",") if s.strip()}
+
+
+def _is_live_for(station_id: str) -> bool:
+    """Whether `station_id` should submit live orders right now."""
+    import os
+    if os.getenv("TRADING_ENABLED", "false").lower() != "true":
+        return False
+    whitelist = _live_stations()
+    if whitelist:
+        return station_id.upper() in whitelist
+    return os.getenv("LIVE_TRADING", "false").lower() == "true"
+
+
 def _current_mode() -> str:
-    """Return 'off', 'dryrun', or 'live' based on TRADING_ENABLED + LIVE_TRADING."""
+    """Return 'off', 'dryrun', 'live', or 'partial' based on TRADING_ENABLED, LIVE_TRADING, LIVE_STATIONS."""
     import os
     if os.getenv("TRADING_ENABLED", "false").lower() != "true":
         return "off"
+    if _live_stations():
+        return "partial"
     if os.getenv("LIVE_TRADING", "false").lower() == "true":
         return "live"
     return "dryrun"
@@ -405,7 +429,7 @@ def _daily_summary_job(stations: list[str]) -> None:
     tomorrow = (now + timedelta(days=1)).date()
 
     mode = _current_mode()
-    mode_icon = {"off": "⏸", "dryrun": "🔵", "live": "🟢"}.get(mode, "❓")
+    mode_icon = {"off": "⏸", "dryrun": "🔵", "live": "🟢", "partial": "🟡"}.get(mode, "❓")
     lines = [f"📊 <b>Daily Summary</b> · {now.strftime('%Y-%m-%d %H:%M')}z  {mode_icon} {mode}"]
 
     # Yesterday P&L per station (show dry-run results when no live bets exist)
@@ -761,6 +785,152 @@ def start(stations: list[str]) -> None:
         lines.append("\n(Use /bankroll for settled totals)")
         return "\n".join(lines)
 
+    def _station_breakdown(days: int) -> dict[str, dict]:
+        """Aggregate resolved-bet P&L per station over the last `days` days."""
+        from datetime import timedelta
+        from weather_edge.execution.polymarket_exec import load_executions
+        from weather_edge.store import parquet as _store
+        now = datetime.now(timezone.utc)
+
+        def _pnl_for(e: dict, label: str) -> float:
+            entry = float(e.get("price", 0) or 0)
+            stake = float(e.get("usdc_stake", 0) or 0)
+            if entry <= 0:
+                return 0.0
+            br_l = e.get("bracket_label", "?")
+            sd = e.get("side", "?")
+            win = (br_l == label and sd == "YES") or (br_l != label and sd == "NO")
+            return (1.0 / entry - 1) * stake if win else -stake
+
+        out: dict[str, dict] = {}
+        for sid in stations:
+            out[sid] = {
+                "live": {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0},
+                "dry":  {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0},
+            }
+        for days_ago in range(1, days + 1):
+            d = (now - timedelta(days=days_ago)).date()
+            for sid in stations:
+                try:
+                    rec = _store.read_resolution(sid, d)
+                except Exception:
+                    rec = None
+                if not (isinstance(rec, dict) and rec.get("resolved")):
+                    continue
+                label = rec.get("resolved_label", "")
+                try:
+                    execs = load_executions(sid, d)
+                except Exception:
+                    continue
+                for e in execs:
+                    if not isinstance(e, dict):
+                        continue
+                    bucket = out[sid]["dry"] if e.get("dry_run") else out[sid]["live"]
+                    p = _pnl_for(e, label)
+                    bucket["n"] += 1
+                    if p > 0:
+                        bucket["wins"] += 1
+                    bucket["staked"] += float(e.get("usdc_stake", 0) or 0)
+                    bucket["pnl"] += p
+        return out
+
+    def _parse_days(args: str, default: int = 7) -> int:
+        try:
+            n = int(args.strip().split()[0]) if args.strip() else default
+            return max(1, min(n, 90))
+        except Exception:
+            return default
+
+    def _format_ranking(args: str, reverse: bool, title: str) -> str:
+        days = _parse_days(args)
+        data = _station_breakdown(days)
+
+        rows: list[tuple[str, float, float, int, int]] = []  # (sid, total_pnl, staked, n, wins)
+        for sid, d in data.items():
+            n = d["live"]["n"] + d["dry"]["n"]
+            if n == 0:
+                continue
+            pnl = d["live"]["pnl"] + d["dry"]["pnl"]
+            staked = d["live"]["staked"] + d["dry"]["staked"]
+            wins = d["live"]["wins"] + d["dry"]["wins"]
+            rows.append((sid, pnl, staked, n, wins))
+
+        if not rows:
+            return f"{title} (last {days}d): no resolved bets yet."
+
+        rows.sort(key=lambda r: r[1], reverse=reverse)
+        lines = [f"{title} (last {days}d, live+dry combined):"]
+        for sid, pnl, staked, n, wins in rows:
+            roi = (pnl / staked * 100) if staked > 0 else 0.0
+            lines.append(
+                f"  {sid}: P&L=${pnl:+.2f}  ROI={roi:+.1f}%  "
+                f"trades={n}  wins={wins}/{n} ({wins/n*100:.0f}%)  staked=${staked:.2f}"
+            )
+        return "\n".join(lines)
+
+    def _cmd_top(args: str = "") -> str:
+        return _format_ranking(args, reverse=True, title="Most profitable stations")
+
+    def _cmd_losers(args: str = "") -> str:
+        return _format_ranking(args, reverse=False, title="Biggest losing stations")
+
+    def _cmd_live(args: str = "") -> str:
+        """Per-station live-trading whitelist.
+
+        /live                       — show current setting
+        /live STA1 STA2 ...         — only these stations go live; rest stay dry
+        /live all                   — every station goes live
+        /live none | off            — clear whitelist; everything goes dry (mode stays on)
+        """
+        import os
+        raw = args.strip()
+        whitelist = _live_stations()
+
+        if not raw:
+            if _current_mode() == "off":
+                return "Mode is OFF. Use /mode dryrun or /mode live first."
+            if whitelist:
+                bad = [s for s in whitelist if s not in stations]
+                tail = f"  (unknown: {', '.join(bad)})" if bad else ""
+                return (
+                    f"Live whitelist: {', '.join(sorted(whitelist))}{tail}\n"
+                    f"Other stations run dry-run.\n"
+                    f"Usage: /live STA1 STA2 | /live all | /live none"
+                )
+            mode = _current_mode()
+            return (
+                f"Live whitelist: (empty)\n"
+                f"All stations follow global mode: <b>{mode}</b>\n"
+                f"Usage: /live STA1 STA2 | /live all | /live none"
+            )
+
+        tokens = [t.upper() for t in raw.replace(",", " ").split()]
+
+        if tokens == ["ALL"]:
+            _write_env({"TRADING_ENABLED": "true", "LIVE_TRADING": "true", "LIVE_STATIONS": ""})
+            return f"All {len(stations)} station(s) now LIVE."
+
+        if tokens in (["NONE"], ["OFF"]):
+            _write_env({"LIVE_TRADING": "false", "LIVE_STATIONS": ""})
+            return "Live whitelist cleared. All stations now dry-run (mode unchanged otherwise)."
+
+        unknown = [t for t in tokens if t not in stations]
+        if unknown:
+            return f"Unknown station(s): {', '.join(unknown)}\nKnown: {', '.join(stations)}"
+
+        wanted = sorted(set(tokens))
+        _write_env({
+            "TRADING_ENABLED": "true",
+            "LIVE_TRADING": "false",
+            "LIVE_STATIONS": ",".join(wanted),
+        })
+        dry = [s for s in stations if s not in wanted]
+        return (
+            f"Live: {', '.join(wanted)}\n"
+            f"Dry:  {', '.join(dry) if dry else '(none)'}\n"
+            f"Mode: <b>{_current_mode()}</b>"
+        )
+
     # ── Resolve target stations from command args ────────────────────────────
     def _resolve_targets(args: str) -> list[str]:
         if not args:
@@ -827,18 +997,24 @@ def start(stations: list[str]) -> None:
         "/picks": _picks,
         "/bankroll": _bankroll,
         "/pnl": _pnl,
+        "/topstations": _cmd_top,
+        "/losers": _cmd_losers,
         "/lock": _cmd_lock,
         "/ingest": _cmd_ingest,
         "/execute": _cmd_execute,
         "/resolve": _cmd_resolve,
         "/summary": _cmd_summary,
         "/mode": _cmd_mode,
+        "/live": _cmd_live,
     })
+    whitelist = _live_stations()
+    live_line = f"Live stations: {', '.join(sorted(whitelist))}\n" if whitelist else ""
     _tg.send(
         f"🚀 <b>Scheduler started</b> · {len(stations)} stations\n"
         f"Mode: {_current_mode()}\n"
+        f"{live_line}"
         f"Stations: {', '.join(stations)}\n"
-        f"Commands: /status /picks /bankroll /pnl /summary /lock /ingest /execute /resolve /mode"
+        f"Commands: /status /picks /bankroll /pnl /topstations /losers /summary /lock /ingest /execute /resolve /mode /live"
     )
 
     # Run any missed jobs from earlier today (e.g. after VPS reboot)
