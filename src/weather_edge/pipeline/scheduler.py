@@ -816,6 +816,8 @@ def start(stations: list[str]) -> None:
     def _station_breakdown(days: int) -> dict[str, dict]:
         """Aggregate resolved-bet P&L per station over the last `days` days."""
         from datetime import timedelta
+        from pathlib import Path
+        import json as _json
         from weather_edge.execution.polymarket_exec import load_executions
         from weather_edge.store import parquet as _store
         now = datetime.now(timezone.utc)
@@ -830,11 +832,21 @@ def start(stations: list[str]) -> None:
             win = (br_l == label and sd == "YES") or (br_l != label and sd == "NO")
             return (1.0 / entry - 1) * stake if win else -stake
 
+        def _clv_map(sid: str, d) -> dict[str, float]:
+            p = Path(__file__).parents[3] / "data" / "clv_snapshots" / f"station={sid}" / f"{d}.json"
+            if not p.exists():
+                return {}
+            try:
+                data = _json.loads(p.read_text())
+            except Exception:
+                return {}
+            return {o["label"]: float(o["mid"]) for o in data.get("outcomes", [])}
+
         out: dict[str, dict] = {}
         for sid in stations:
             out[sid] = {
-                "live": {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0},
-                "dry":  {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0},
+                "live": {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0, "clv_sum": 0.0, "clv_n": 0},
+                "dry":  {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0, "clv_sum": 0.0, "clv_n": 0},
             }
         for days_ago in range(1, days + 1):
             d = (now - timedelta(days=days_ago)).date()
@@ -850,6 +862,7 @@ def start(stations: list[str]) -> None:
                     execs = load_executions(sid, d)
                 except Exception:
                     continue
+                clv_close = _clv_map(sid, d)
                 for e in execs:
                     if not isinstance(e, dict):
                         continue
@@ -860,6 +873,14 @@ def start(stations: list[str]) -> None:
                         bucket["wins"] += 1
                     bucket["staked"] += float(e.get("usdc_stake", 0) or 0)
                     bucket["pnl"] += p
+                    br_l = e.get("bracket_label", "?")
+                    sd = e.get("side", "?")
+                    entry = float(e.get("price", 0) or 0)
+                    if entry > 0 and br_l in clv_close:
+                        closing = clv_close[br_l]
+                        clv = (closing - entry) if sd == "YES" else (entry - closing)
+                        bucket["clv_sum"] += clv
+                        bucket["clv_n"] += 1
         return out
 
     def _parse_days(args: str, default: int = 7) -> int:
@@ -873,7 +894,7 @@ def start(stations: list[str]) -> None:
         days = _parse_days(args)
         data = _station_breakdown(days)
 
-        rows: list[tuple[str, float, float, int, int]] = []  # (sid, total_pnl, staked, n, wins)
+        rows: list[tuple[str, float, float, int, int, float | None]] = []
         for sid, d in data.items():
             n = d["live"]["n"] + d["dry"]["n"]
             if n == 0:
@@ -881,19 +902,24 @@ def start(stations: list[str]) -> None:
             pnl = d["live"]["pnl"] + d["dry"]["pnl"]
             staked = d["live"]["staked"] + d["dry"]["staked"]
             wins = d["live"]["wins"] + d["dry"]["wins"]
-            rows.append((sid, pnl, staked, n, wins))
+            clv_n = d["live"]["clv_n"] + d["dry"]["clv_n"]
+            clv_sum = d["live"]["clv_sum"] + d["dry"]["clv_sum"]
+            mean_clv = (clv_sum / clv_n) if clv_n > 0 else None
+            rows.append((sid, pnl, staked, n, wins, mean_clv))
 
         if not rows:
             return f"{title} (last {days}d): no resolved bets yet."
 
         rows.sort(key=lambda r: r[1], reverse=reverse)
         lines = [f"{title} (last {days}d, live+dry combined):"]
-        for sid, pnl, staked, n, wins in rows:
+        for sid, pnl, staked, n, wins, mean_clv in rows:
             roi = (pnl / staked * 100) if staked > 0 else 0.0
+            clv_str = f"  CLV={mean_clv:+.3f}" if mean_clv is not None else "  CLV=n/a"
             lines.append(
-                f"  {sid}: P&L=${pnl:+.2f}  ROI={roi:+.1f}%  "
+                f"  {sid}: P&L=${pnl:+.2f}  ROI={roi:+.1f}%{clv_str}  "
                 f"trades={n}  wins={wins}/{n} ({wins/n*100:.0f}%)  staked=${staked:.2f}"
             )
+        lines.append("\nCLV = mean per-bet closing-line value (less noisy than P&L).")
         return "\n".join(lines)
 
     def _cmd_top(args: str = "") -> str:
