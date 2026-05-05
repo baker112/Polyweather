@@ -1018,6 +1018,88 @@ def start(stations: list[str]) -> None:
     def _spawn(name: str, target: "Any", *fn_args: "Any") -> None:
         _threading.Thread(target=target, args=fn_args, daemon=True, name=name).start()
 
+    def _cmd_backtest(args: str = "") -> str:
+        """Walk-forward backtest on cached forecasts/markets.
+
+        /backtest                   — last 30d, all stations
+        /backtest 14                — last 14d, all stations
+        /backtest 30 EGLC KLGA      — last 30d, just those stations
+        """
+        # Parse: optional integer days + optional station list
+        tokens = args.replace(",", " ").split()
+        days = 30
+        targets: list[str] = []
+        for tok in tokens:
+            if tok.isdigit():
+                days = max(1, min(int(tok), 90))
+            elif tok.upper() in stations:
+                targets.append(tok.upper())
+        if not targets:
+            targets = list(stations)
+
+        from datetime import date as _date, timedelta as _td
+        end = _date.today() - _td(days=1)
+        start = end - _td(days=days - 1)
+
+        def _run() -> None:
+            import polars as pl
+            from weather_edge.pipeline.backtest import backtest as _bt
+            _tg.send(
+                f"📊 <b>Backtest started</b>\n"
+                f"Window: {start} → {end} ({days}d)\n"
+                f"Stations: {', '.join(targets)}\n"
+                f"This can take a while; results will follow."
+            )
+            rows: list[tuple[str, float, float, int, int]] = []
+            errors: list[str] = []
+            for sid in targets:
+                try:
+                    df = _bt(sid, start, end)
+                except Exception as exc:
+                    errors.append(f"{sid}: {exc}")
+                    continue
+                if df.is_empty():
+                    continue
+                bets = df.filter(pl.col("pnl").is_not_null())
+                if bets.is_empty():
+                    rows.append((sid, 0.0, 0.0, 0, 0))
+                    continue
+                pnl_col = bets["pnl"].to_list()
+                entry_col = bets["entry_mid"].to_list()
+                pnl_total = float(sum(pnl_col))
+                staked = float(sum(entry_col))
+                wins = sum(1 for p in pnl_col if p > 0)
+                rows.append((sid, pnl_total, staked, len(pnl_col), wins))
+
+            if not rows and not errors:
+                _tg.send("Backtest: no resolved bets in window.")
+                return
+
+            rows.sort(key=lambda r: r[1], reverse=True)
+            lines = [f"📊 <b>Backtest {start} → {end}</b>"]
+            grand_pnl = grand_stake = 0.0
+            for sid, pnl_total, staked, n, wins in rows:
+                roi = (pnl_total / staked * 100) if staked > 0 else 0.0
+                wr = (wins / n * 100) if n else 0.0
+                lines.append(
+                    f"  {sid}: P&L=${pnl_total:+.2f}  ROI={roi:+.1f}%  "
+                    f"trades={n}  wins={wins}/{n} ({wr:.0f}%)"
+                )
+                grand_pnl += pnl_total
+                grand_stake += staked
+            grand_roi = (grand_pnl / grand_stake * 100) if grand_stake > 0 else 0.0
+            lines.append(f"<b>TOTAL: P&L=${grand_pnl:+.2f}  ROI={grand_roi:+.1f}%</b>")
+            if errors:
+                lines.append("\nErrors:")
+                lines.extend(f"  {e}" for e in errors)
+            _tg.send("\n".join(lines))
+
+        _spawn("manual-backtest", _run)
+        return (
+            f"Backtest dispatched: {start} → {end} ({days}d), "
+            f"{len(targets)} station(s). Results will be posted when done."
+        )
+
     def _cmd_lock(args: str = "") -> str:
         targets = _resolve_targets(args)
         for sid in targets:
@@ -1082,6 +1164,7 @@ def start(stations: list[str]) -> None:
         "/summary": _cmd_summary,
         "/mode": _cmd_mode,
         "/live": _cmd_live,
+        "/backtest": _cmd_backtest,
     })
     whitelist = _live_stations()
     live_line = f"Live stations: {', '.join(sorted(whitelist))}\n" if whitelist else ""
@@ -1090,7 +1173,7 @@ def start(stations: list[str]) -> None:
         f"Mode: {_current_mode()}\n"
         f"{live_line}"
         f"Stations: {', '.join(stations)}\n"
-        f"Commands: /status /picks /bankroll /pnl /topstations /losers /summary /lock /ingest /execute /resolve /mode /live"
+        f"Commands: /status /picks /bankroll /pnl /topstations /losers /summary /lock /ingest /execute /resolve /mode /live /backtest"
     )
 
     # Run any missed jobs from earlier today (e.g. after VPS reboot)
