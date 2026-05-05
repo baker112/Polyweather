@@ -204,7 +204,13 @@ def lock_picks(
     # ── Stage 6: Compute edges ────────────────────────────────────────────────
     brackets = [BracketSpec(label=o.label, low=o.low, high=o.high) for o in snapshot.outcomes]
     bracket_probs = compute_brackets(dist, brackets)
-    candidates = compute_edges(bracket_probs, snapshot, now_utc)
+    # Per-station Kelly multiplier (#6) — auto-promotes once station has 50+
+    # resolved bets with positive CLV; otherwise uses stations.yaml config value.
+    from weather_edge.pipeline.edge_gate import effective_kelly_multiplier
+    station_kelly_mult, kelly_reason = effective_kelly_multiplier(station_id)
+    provenance["station_kelly_multiplier"] = station_kelly_mult
+    provenance["station_kelly_reason"] = kelly_reason
+    candidates = compute_edges(bracket_probs, snapshot, now_utc, station_kelly_mult)
 
     candidates.sort(key=lambda c: abs(c.edge), reverse=True)
     picks = candidates  # all qualifying brackets
@@ -238,6 +244,7 @@ def compute_edges(
     bracket_probs: list[Any],  # list[BracketProb]
     snapshot: MarketSnapshot,
     now_utc: datetime,
+    station_kelly_multiplier: float = 1.0,
 ) -> list[Candidate]:
     thresholds = load_thresholds()
     freshness_cutoff = now_utc - timedelta(minutes=thresholds.market_freshness_minutes)
@@ -284,7 +291,11 @@ def compute_edges(
             kelly = edge / (1.0 - outcome.mid) if outcome.mid < 1.0 else 0.0
         else:  # NO bet
             kelly = abs(edge) / outcome.mid if outcome.mid > 0.0 else 0.0
-        kelly = min(kelly, thresholds.max_kelly_fraction) * thresholds.kelly_multiplier
+        kelly = (
+            min(kelly, thresholds.max_kelly_fraction)
+            * thresholds.kelly_multiplier
+            * station_kelly_multiplier
+        )
 
         # Depth-implied stake cap: only consume `depth_safety_factor` of top-of-book.
         # Skip the cap when book data is unavailable (legacy snapshots).

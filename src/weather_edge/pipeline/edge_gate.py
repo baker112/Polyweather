@@ -26,6 +26,10 @@ WINDOW_DAYS = 30
 LEAD_HOURS = 24
 RAW_SIGMA_FLOOR = 2.0  # K — climo floor when ECMWF ensemble var is tiny
 
+# Auto-promotion threshold for per-station Kelly multiplier (#6).
+PROMOTE_MIN_BETS = 50
+PROMOTED_MULTIPLIER = 1.0
+
 _DATA_ROOT = Path(__file__).parents[3] / "data"
 
 
@@ -156,6 +160,59 @@ def rolling_crps_advantage(
     if not model_scores:
         return None
     return (float(np.mean(model_scores)), float(np.mean(raw_scores)), len(model_scores))
+
+
+def all_time_station_clv(station_id: str) -> tuple[float, int]:
+    """Mean per-bet CLV across ALL settled bets for the station, ever.
+
+    Used by the auto-promotion check (#6): once a station has accumulated
+    PROMOTE_MIN_BETS resolved bets with positive mean CLV, it earns the
+    full Kelly multiplier of 1.0.
+    """
+    base = _DATA_ROOT / "executions" / f"station={station_id}"
+    if not base.exists():
+        return (0.0, 0)
+    clvs: list[float] = []
+    for date_dir in sorted(base.iterdir()):
+        if not date_dir.is_dir() or not date_dir.name.startswith("date="):
+            continue
+        cur_str = date_dir.name.removeprefix("date=")
+        settled = date_dir / "_settled.json"
+        clv_snap = _DATA_ROOT / "clv_snapshots" / f"station={station_id}" / f"{cur_str}.json"
+        if not settled.exists() or not clv_snap.exists():
+            continue
+        try:
+            srec = json.loads(settled.read_text())
+            cdat = json.loads(clv_snap.read_text())
+        except Exception:
+            continue
+        closing = {o["label"]: float(o["mid"]) for o in cdat.get("outcomes", [])}
+        for r in srec.get("records", []):
+            label = r.get("bracket_label")
+            entry = float(r.get("entry", 0) or 0)
+            side = r.get("side", "")
+            if entry <= 0 or label not in closing:
+                continue
+            clvs.append(_clv_for_bet(entry, side, closing[label]))
+    if not clvs:
+        return (0.0, 0)
+    return (float(np.mean(clvs)), len(clvs))
+
+
+def effective_kelly_multiplier(station_id: str) -> tuple[float, str]:
+    """Return (multiplier, reason) for live sizing.
+
+    Promotes the configured stations.yaml value to PROMOTED_MULTIPLIER once a
+    station has PROMOTE_MIN_BETS+ resolved bets with positive mean CLV.
+    Otherwise returns the configured value verbatim.
+    """
+    from weather_edge.config import get_station
+
+    cfg = get_station(station_id).kelly_multiplier
+    mean_clv, n_bets = all_time_station_clv(station_id)
+    if n_bets >= PROMOTE_MIN_BETS and mean_clv > 0 and PROMOTED_MULTIPLIER > cfg:
+        return (PROMOTED_MULTIPLIER, f"promoted: n={n_bets}, clv={mean_clv:+.3f}")
+    return (cfg, f"config: n={n_bets}, clv={mean_clv:+.3f}")
 
 
 def station_passes_gate(station_id: str, as_of: date) -> tuple[bool, str]:
