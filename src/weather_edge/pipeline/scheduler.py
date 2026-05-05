@@ -300,6 +300,12 @@ def _execute_job(station_id: str) -> None:
         if outcome is None:
             continue
         usdc_stake = round(pick.kelly_fraction * avail, 2)
+        if pick.max_stake_usdc is not None and usdc_stake > pick.max_stake_usdc:
+            _logger.info(
+                "Downsizing %s: kelly stake $%.2f → depth cap $%.2f",
+                pick.bracket_label, usdc_stake, pick.max_stake_usdc,
+            )
+            usdc_stake = round(pick.max_stake_usdc, 2)
         if usdc_stake < MIN_ORDER_USDC:
             _logger.info("Skipping %s: stake $%.2f below minimum", pick.bracket_label, usdc_stake)
             continue

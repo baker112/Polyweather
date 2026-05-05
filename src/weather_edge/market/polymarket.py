@@ -136,6 +136,8 @@ async def _get_outcomes(
             mid=book["mid"],
             spread=book["spread"],
             liquidity=book["liquidity"],
+            top_ask_size=book.get("top_ask_size", 0.0),
+            top_bid_size=book.get("top_bid_size", 0.0),
             token_id=yes_token_id,
             no_token_id=no_token_id,
         ))
@@ -184,12 +186,18 @@ async def _get_book(client: httpx.AsyncClient, token_id: str) -> dict[str, float
     spread = best_ask - best_bid
     liquidity = sum(float(b["price"]) * float(b["size"]) for b in bids)
 
+    # Top-of-book sizes — sum all resting size at the best price level on each side.
+    top_ask_size = sum(float(a["size"]) for a in asks if float(a["price"]) == best_ask)
+    top_bid_size = sum(float(b["size"]) for b in bids if float(b["price"]) == best_bid)
+
     return {
         "best_bid": best_bid,
         "best_ask": best_ask,
         "mid": mid,
         "spread": spread,
         "liquidity": liquidity,
+        "top_ask_size": top_ask_size,
+        "top_bid_size": top_bid_size,
     }
 
 

@@ -68,6 +68,8 @@ def _make_snapshot(probs: list[float]) -> MarketSnapshot:
             mid=p,
             spread=0.02,
             liquidity=1500.0,
+            top_ask_size=500.0,
+            top_bid_size=500.0,
             token_id=f"tok_{i}",
         )
         for i, (b, p) in enumerate(zip(BRACKETS, probs))

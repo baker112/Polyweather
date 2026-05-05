@@ -30,6 +30,10 @@ class ThresholdsConfig(BaseModel):
     market_freshness_minutes: int
     max_kelly_fraction: float = 0.25
     kelly_multiplier: float = 1.0
+    # Liquidity / spread filter (#4): skip or downsize when book depth is thin.
+    min_top_size_usdc: float = 0.0  # skip bracket if depth at top of relevant side < this many USDC
+    depth_safety_factor: float = 0.5  # cap stake at top_size * price * factor (only consume part of TOB)
+    min_net_edge: float = 0.0  # require abs(edge) - spread >= this; default 0 = inactive
 
 
 @lru_cache(maxsize=1)

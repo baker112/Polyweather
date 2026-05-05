@@ -251,12 +251,29 @@ def compute_edges(
         outcome = outcome_map[bp.label]
 
         edge = bp.model_prob - outcome.mid
+        side = "YES" if edge > 0 else "NO"
+
+        # Side-relevant top-of-book depth:
+        #   YES bet → buy YES at best_ask, depth = top_ask_size (shares) * best_ask (price/share)
+        #   NO bet  → buy NO  ≈ sell YES at best_bid (or buy NO at its 1-best_bid ask),
+        #             depth in USDC of NO contracts ≈ top_bid_size * (1 - best_bid)
+        if side == "YES":
+            top_size_shares = outcome.top_ask_size
+            fill_price = outcome.best_ask if outcome.best_ask > 0 else outcome.mid
+        else:
+            top_size_shares = outcome.top_bid_size
+            fill_price = (1.0 - outcome.best_bid) if outcome.best_bid > 0 else (1.0 - outcome.mid)
+        top_size_usdc = top_size_shares * fill_price
+        net_edge = abs(edge) - outcome.spread
+
         gates = {
             "min_edge": abs(edge) >= thresholds.min_edge,
             "max_spread": outcome.spread <= thresholds.max_spread,
             "min_liquidity": outcome.liquidity >= thresholds.min_liquidity,
             "max_raw_prob": bp.model_prob <= thresholds.max_raw_prob,
             "market_fresh": snapshot.fetched_at >= freshness_cutoff,
+            "min_top_size": top_size_usdc >= thresholds.min_top_size_usdc,
+            "min_net_edge": net_edge >= thresholds.min_net_edge,
         }
 
         # Full Kelly fraction: f* = |edge| / price_of_losing_side, capped at max_kelly_fraction
@@ -266,6 +283,12 @@ def compute_edges(
             kelly = abs(edge) / outcome.mid if outcome.mid > 0.0 else 0.0
         kelly = min(kelly, thresholds.max_kelly_fraction) * thresholds.kelly_multiplier
 
+        # Depth-implied stake cap: only consume `depth_safety_factor` of top-of-book.
+        max_stake_usdc = (
+            top_size_usdc * thresholds.depth_safety_factor
+            if top_size_usdc > 0 else None
+        )
+
         candidates.append(Candidate(
             bracket_label=bp.label,
             low=bp.low,
@@ -273,16 +296,19 @@ def compute_edges(
             model_prob=bp.model_prob,
             market_prob=outcome.mid,
             edge=edge,
-            side="YES" if edge > 0 else "NO",
+            side=side,
             spread=outcome.spread,
             liquidity=outcome.liquidity,
             kelly_fraction=round(kelly, 4),
+            max_stake_usdc=round(max_stake_usdc, 2) if max_stake_usdc is not None else None,
             gates=gates,
             raw_values={
                 "edge": edge,
                 "spread": outcome.spread,
                 "liquidity": outcome.liquidity,
                 "model_prob": bp.model_prob,
+                "top_size_usdc": top_size_usdc,
+                "net_edge": net_edge,
             },
         ))
 
@@ -484,5 +510,15 @@ def _summarise_failures(
             failures.append(f"{bp.label}: spread={outcome.spread:.3f}>{thresholds.max_spread}")
         if outcome.liquidity < thresholds.min_liquidity:
             failures.append(f"{bp.label}: liq=${outcome.liquidity:.0f}<${thresholds.min_liquidity:.0f}")
+        side = "YES" if edge > 0 else "NO"
+        if side == "YES":
+            top_usdc = outcome.top_ask_size * (outcome.best_ask or outcome.mid)
+        else:
+            top_usdc = outcome.top_bid_size * (1.0 - (outcome.best_bid or outcome.mid))
+        if top_usdc < thresholds.min_top_size_usdc:
+            failures.append(f"{bp.label}: top=${top_usdc:.1f}<${thresholds.min_top_size_usdc:.0f}")
+        net = abs(edge) - outcome.spread
+        if net < thresholds.min_net_edge:
+            failures.append(f"{bp.label}: net_edge={net:+.3f}<{thresholds.min_net_edge}")
 
     return "; ".join(failures) if failures else "all edges below threshold"

@@ -59,6 +59,8 @@ class MarketOutcome(BaseModel):
     mid: float
     spread: float
     liquidity: float
+    top_ask_size: float = 0.0  # contracts available at best_ask (for buying YES)
+    top_bid_size: float = 0.0  # contracts available at best_bid (for selling YES / buying NO via inverse)
     token_id: str       # YES token
     no_token_id: str = ""  # NO token (clobTokenIds[1])
 
@@ -84,6 +86,7 @@ class Candidate(BaseModel):
     spread: float
     liquidity: float
     kelly_fraction: float = 0.0  # full Kelly stake fraction (cap externally)
+    max_stake_usdc: float | None = None  # depth-implied stake cap; None = no depth cap
     gates: dict[str, bool]
     raw_values: dict[str, float]
 
