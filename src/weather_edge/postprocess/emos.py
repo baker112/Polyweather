@@ -181,7 +181,7 @@ def assemble_training_pairs(
         init_dt = _init_datetime_for(current, lead_hours)
 
         all_values: list[float] = []
-        for model in ("ecmwf", "gefs"):
+        for model in ("ecmwf", "gefs", "icon"):
             df = store.read_forecasts(model, init_dt, station)
             if df is None:
                 continue
@@ -288,7 +288,7 @@ def fit_emos_per_model(
     station: str,
     lead_hours: int,
     as_of: date,
-    models: tuple[str, ...] = ("ecmwf", "gefs"),
+    models: tuple[str, ...] = ("ecmwf", "gefs", "icon"),
     window_days: int = 60,
     now_utc: datetime | None = None,
 ) -> dict[str, EmosParams]:

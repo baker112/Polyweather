@@ -52,7 +52,7 @@ def ingest_forecasts(
     Use --all-stations to ingest every station in stations.yaml.
     """
     from weather_edge.config import get_station, load_stations
-    from weather_edge.ingest import ecmwf, gefs
+    from weather_edge.ingest import ecmwf, gefs, icon
     from weather_edge.store import parquet as store
 
     now_utc = datetime.now(timezone.utc)
@@ -70,7 +70,11 @@ def ingest_forecasts(
     for station_id in station_ids:
         cfg = get_station(station_id)
         _console.print(f"\n[bold]{station_id}[/bold] ({cfg.name})")
-        for model_name, fetch_fn in [("ecmwf", ecmwf.ingest_forecasts), ("gefs", gefs.ingest_forecasts)]:
+        for model_name, fetch_fn in [
+            ("ecmwf", ecmwf.ingest_forecasts),
+            ("gefs", gefs.ingest_forecasts),
+            ("icon", icon.ingest_forecasts),
+        ]:
             try:
                 if model_name == "gefs" and gefs_steps is not None:
                     df = fetch_fn(init_dt, cfg, steps=gefs_steps)

@@ -23,7 +23,7 @@ def _ingest_job(station_id: str) -> None:
     from datetime import timedelta
 
     from weather_edge.config import get_station
-    from weather_edge.ingest import ecmwf, gefs
+    from weather_edge.ingest import ecmwf, gefs, icon
     from weather_edge.logging import log_event
     from weather_edge.pipeline.lock import _most_recent_12z
     from weather_edge.store import parquet as store
@@ -34,7 +34,11 @@ def _ingest_job(station_id: str) -> None:
 
     lines: list[str] = [f"📡 <b>Ingest {station_id}</b> · {init_dt.strftime('%Y-%m-%d %HZ')}"]
     any_fail = False
-    for model_name, fetch_fn in [("ecmwf", ecmwf.ingest_forecasts), ("gefs", gefs.ingest_forecasts)]:
+    for model_name, fetch_fn in [
+        ("ecmwf", ecmwf.ingest_forecasts),
+        ("gefs", gefs.ingest_forecasts),
+        ("icon", icon.ingest_forecasts),
+    ]:
         # Per-call timer — prevents cumulative-since-job-start drift.
         t0 = _time.monotonic()
         try:
