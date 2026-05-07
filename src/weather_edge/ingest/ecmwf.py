@@ -218,7 +218,12 @@ def _lead_hours(init_dt: datetime, valid_date: date, tz: zoneinfo.ZoneInfo) -> i
     return int(round(delta.total_seconds() / 3600 / 24) * 24)
 
 
-def _to_dataframe(rows: list[dict[str, Any]], model: str, init_dt: datetime, station: str) -> pl.DataFrame:
+def _to_dataframe(
+    rows: list[dict[str, Any]],
+    model: str,
+    init_dt: datetime,
+    station: str,
+) -> pl.DataFrame:
     records = [
         {
             "model": model,
