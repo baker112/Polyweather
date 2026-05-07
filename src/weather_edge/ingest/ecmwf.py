@@ -51,7 +51,7 @@ def ingest_forecasts(init_dt: datetime, station: StationConfig) -> pl.DataFrame:
 
     for try_init in fallback_inits:
         try:
-            df = _fetch_one_init(Client(source="ecmwf"), try_init, station)
+            df = _fetch_one_init(Client(source="ecmwf"), try_init, station, try_init)
             if try_init != init_dt:
                 _logger.warning(
                     "ECMWF: requested init %s unavailable, used fallback %s",
@@ -70,7 +70,7 @@ def ingest_forecasts(init_dt: datetime, station: StationConfig) -> pl.DataFrame:
 
 
 def _fetch_one_init(
-    client: Any, init_dt: datetime, station: StationConfig
+    client: Any, init_dt: datetime, station: StationConfig, actual_init_dt: datetime
 ) -> pl.DataFrame:
     """Try to fetch one init cycle; raise IngestError if all streams fail."""
     tz = zoneinfo.ZoneInfo(station.timezone)
@@ -140,7 +140,7 @@ def _fetch_one_init(
         detail = "; ".join(stream_errors) if stream_errors else "unknown"
         raise IngestError(f"ECMWF: no data retrieved for any stream ({detail})")
 
-    return _to_dataframe(rows, _MODEL)
+    return _to_dataframe(rows, _MODEL, actual_init_dt, station.icao)
 
 
 def _extract_rows(
@@ -218,15 +218,14 @@ def _lead_hours(init_dt: datetime, valid_date: date, tz: zoneinfo.ZoneInfo) -> i
     return int(round(delta.total_seconds() / 3600 / 24) * 24)
 
 
-def _to_dataframe(rows: list[dict[str, Any]], model: str) -> pl.DataFrame:
-    now = datetime.now(timezone.utc)
+def _to_dataframe(rows: list[dict[str, Any]], model: str, init_dt: datetime, station: str) -> pl.DataFrame:
     records = [
         {
             "model": model,
             "member_id": r["member_id"],
-            "init_datetime": now,  # set below
+            "init_datetime": init_dt.replace(tzinfo=timezone.utc),
             "valid_date": r["valid_date"],
-            "station": "",  # set below
+            "station": station,
             "daily_max_c": r["daily_max_c"],
             "lead_hours": r["lead_hours"],
         }
