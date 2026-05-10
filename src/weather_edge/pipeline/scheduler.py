@@ -826,74 +826,8 @@ def start(stations: list[str]) -> None:
         return "\n".join(lines)
 
     def _station_breakdown(days: int) -> dict[str, dict]:
-        """Aggregate resolved-bet P&L per station over the last `days` days."""
-        from datetime import timedelta
-        from pathlib import Path
-        import json as _json
-        from weather_edge.execution.polymarket_exec import load_executions
-        from weather_edge.store import parquet as _store
-        now = datetime.now(timezone.utc)
-
-        def _pnl_for(e: dict, label: str) -> float:
-            entry = float(e.get("price", 0) or 0)
-            stake = float(e.get("usdc_stake", 0) or 0)
-            if entry <= 0:
-                return 0.0
-            br_l = e.get("bracket_label", "?")
-            sd = e.get("side", "?")
-            win = (br_l == label and sd == "YES") or (br_l != label and sd == "NO")
-            return (1.0 / entry - 1) * stake if win else -stake
-
-        def _clv_map(sid: str, d) -> dict[str, float]:
-            p = Path(__file__).parents[3] / "data" / "clv_snapshots" / f"station={sid}" / f"{d}.json"
-            if not p.exists():
-                return {}
-            try:
-                data = _json.loads(p.read_text())
-            except Exception:
-                return {}
-            return {o["label"]: float(o["mid"]) for o in data.get("outcomes", [])}
-
-        out: dict[str, dict] = {}
-        for sid in stations:
-            out[sid] = {
-                "live": {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0, "clv_sum": 0.0, "clv_n": 0},
-                "dry":  {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0, "clv_sum": 0.0, "clv_n": 0},
-            }
-        for days_ago in range(1, days + 1):
-            d = (now - timedelta(days=days_ago)).date()
-            for sid in stations:
-                try:
-                    rec = _store.read_resolution(sid, d)
-                except Exception:
-                    rec = None
-                if not (isinstance(rec, dict) and rec.get("resolved")):
-                    continue
-                label = rec.get("resolved_label", "")
-                try:
-                    execs = load_executions(sid, d)
-                except Exception:
-                    continue
-                clv_close = _clv_map(sid, d)
-                for e in execs:
-                    if not isinstance(e, dict):
-                        continue
-                    bucket = out[sid]["dry"] if e.get("dry_run") else out[sid]["live"]
-                    p = _pnl_for(e, label)
-                    bucket["n"] += 1
-                    if p > 0:
-                        bucket["wins"] += 1
-                    bucket["staked"] += float(e.get("usdc_stake", 0) or 0)
-                    bucket["pnl"] += p
-                    br_l = e.get("bracket_label", "?")
-                    sd = e.get("side", "?")
-                    entry = float(e.get("price", 0) or 0)
-                    if entry > 0 and br_l in clv_close:
-                        closing = clv_close[br_l]
-                        clv = (closing - entry) if sd == "YES" else (entry - closing)
-                        bucket["clv_sum"] += clv
-                        bucket["clv_n"] += 1
-        return out
+        from weather_edge.pipeline.reporting import station_breakdown
+        return station_breakdown(list(stations), days)
 
     def _parse_days(args: str, default: int = 7) -> int:
         for tok in args.strip().split():
@@ -1104,6 +1038,32 @@ def start(stations: list[str]) -> None:
             f"{len(targets)} station(s). Results will be posted when done."
         )
 
+    def _cmd_dump(args: str = "") -> str:
+        """Export a JSON snapshot of pipeline state for external analysis.
+
+        /dump          — last 30 days, all stations
+        /dump 60       — last 60 days
+        """
+        days = 30
+        for tok in args.replace(",", " ").split():
+            if tok.isdigit():
+                days = max(1, min(int(tok), 90))
+
+        def _run() -> None:
+            from weather_edge.pipeline.dump import build_state_dump
+            try:
+                path = build_state_dump(list(stations), days=days)
+                size_kb = path.stat().st_size / 1024
+                _tg.send_document(
+                    path,
+                    caption=f"📦 <b>State dump</b> · {days}d · {size_kb:.0f} KB",
+                )
+            except Exception as exc:
+                _tg.send(f"Dump failed: {exc}")
+
+        _spawn("manual-dump", _run)
+        return f"Dump dispatched ({days}d). File will be uploaded when ready."
+
     def _cmd_lock(args: str = "") -> str:
         targets = _resolve_targets(args)
         for sid in targets:
@@ -1169,6 +1129,7 @@ def start(stations: list[str]) -> None:
         "/mode": _cmd_mode,
         "/live": _cmd_live,
         "/backtest": _cmd_backtest,
+        "/dump": _cmd_dump,
     })
     whitelist = _live_stations()
     live_line = f"Live stations: {', '.join(sorted(whitelist))}\n" if whitelist else ""

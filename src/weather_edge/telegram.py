@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Callable
 
 _logger = logging.getLogger(__name__)
@@ -39,6 +40,30 @@ def send(text: str) -> None:
         )
     except Exception as exc:
         _logger.warning("Telegram send failed: %s", exc)
+
+
+def send_document(path: str | Path, caption: str | None = None) -> None:
+    """Upload a file to the configured Telegram chat. No-op if not configured.
+
+    Telegram bot file limit is 50 MB. Uses multipart/form-data — caller need
+    not worry about the file's MIME type beyond the extension being recognisable.
+    """
+    creds = _creds()
+    if not creds:
+        return
+    token, chat_id = creds
+    p = Path(path)
+    try:
+        import httpx
+        with open(p, "rb") as f:
+            httpx.post(
+                f"https://api.telegram.org/bot{token}/sendDocument",
+                data={"chat_id": chat_id, "caption": caption or "", "parse_mode": "HTML"},
+                files={"document": (p.name, f, "application/json")},
+                timeout=60,
+            )
+    except Exception as exc:
+        _logger.warning("Telegram send_document failed: %s", exc)
 
 
 def start_command_listener(handlers: dict[str, Callable[[str], str]]) -> None:
