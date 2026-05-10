@@ -142,6 +142,15 @@ def lock_picks(
         ensemble_values = target_fcs["daily_max_c"].to_list()
         lead_hours = best_lead
 
+    # Strip blown-up ensemble members before fitting. KLGA hit max-sigma 8.9°C
+    # in the May-10 dump because a single outlier inflated ens_var. We use
+    # MAD-based filtering (robust to small-N ensembles) and drop anything more
+    # than 4 MADs from the median — keeps real distribution width, kills bugs.
+    pre_n = len(ensemble_values)
+    ensemble_values = _strip_outliers(ensemble_values)
+    if pre_n - len(ensemble_values):
+        provenance["ensemble_outliers_dropped"] = pre_n - len(ensemble_values)
+
     provenance["ensemble_size"] = len(ensemble_values)
     log_event("ingest_forecasts", station_id, "ok",
               (time.monotonic() - t0) * 1000, ensemble_size=len(ensemble_values))
@@ -158,11 +167,19 @@ def lock_picks(
             & (pl.col("lead_hours") == lead_hours)
         )
         if not _mdf.is_empty():
-            model_values[_model] = _mdf["daily_max_c"].to_list()
+            model_values[_model] = _strip_outliers(_mdf["daily_max_c"].to_list())
 
     dist = _stage3_4(
         station_id, lead_hours, now_utc, target_date, ensemble_values, model_values, provenance
     )
+    if dist.sigma < 0.5:
+        # Belt-and-braces guard. QRFDistribution.sigma already floors at 0.5;
+        # this catches any future predictive-distribution class that forgets to.
+        _logger.warning(
+            "Stage 3+4: sigma collapsed to %.4f for %s %s (mode=%s) — flagging in provenance",
+            dist.sigma, station_id, target_date, provenance.get("mode"),
+        )
+        provenance["sigma_collapse"] = float(dist.sigma)
     log_event("fit_emos", station_id, "ok",
               (time.monotonic() - t1) * 1000,
               mode=provenance.get("mode", "pooled"),
@@ -219,14 +236,20 @@ def lock_picks(
     station_kelly_mult, kelly_reason = effective_kelly_multiplier(station_id)
     provenance["station_kelly_multiplier"] = station_kelly_mult
     provenance["station_kelly_reason"] = kelly_reason
-    candidates = compute_edges(bracket_probs, snapshot, now_utc, station_kelly_mult)
+    candidates = compute_edges(
+        bracket_probs, snapshot, now_utc, station_kelly_mult,
+        station_min_liquidity=station.min_liquidity,
+    )
 
     candidates.sort(key=lambda c: abs(c.edge), reverse=True)
     picks = candidates  # all qualifying brackets
 
     no_edge_reason: str | None = None
     if not picks:
-        failing = _summarise_failures(candidates if candidates else [], bracket_probs, snapshot)
+        failing = _summarise_failures(
+            candidates if candidates else [], bracket_probs, snapshot,
+            station_min_liquidity=station.min_liquidity,
+        )
         no_edge_reason = f"no_edge — gates: {failing}"
         _logger.info("%s %s: %s", station_id, target_date, no_edge_reason)
 
@@ -254,9 +277,14 @@ def compute_edges(
     snapshot: MarketSnapshot,
     now_utc: datetime,
     station_kelly_multiplier: float = 1.0,
+    station_min_liquidity: float | None = None,
 ) -> list[Candidate]:
     thresholds = load_thresholds()
     freshness_cutoff = now_utc - timedelta(minutes=thresholds.market_freshness_minutes)
+    min_liquidity = (
+        station_min_liquidity if station_min_liquidity is not None
+        else thresholds.min_liquidity
+    )
 
     outcome_map = {o.label: o for o in snapshot.outcomes}
     candidates: list[Candidate] = []
@@ -288,7 +316,7 @@ def compute_edges(
         gates = {
             "min_edge": abs(edge) >= thresholds.min_edge,
             "max_spread": outcome.spread <= thresholds.max_spread,
-            "min_liquidity": outcome.liquidity >= thresholds.min_liquidity,
+            "min_liquidity": outcome.liquidity >= min_liquidity,
             "max_raw_prob": bp.model_prob <= thresholds.max_raw_prob,
             "market_fresh": snapshot.fetched_at >= freshness_cutoff,
             "min_top_size": (not has_book_data) or top_size_usdc >= thresholds.min_top_size_usdc,
@@ -411,6 +439,30 @@ def _stage3_4(
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
+def _strip_outliers(values: list[float], k: float = 4.0) -> list[float]:
+    """Drop ensemble members more than `k` MADs from the median.
+
+    Robust outlier filter (MAD is unaffected by the very outliers we're trying
+    to remove, unlike σ). Keeps everything if the ensemble has <5 members or
+    if MAD is 0 (all members identical → nothing to filter).
+    """
+    import numpy as np
+    if len(values) < 5:
+        return values
+    arr = np.asarray(values, dtype=np.float64)
+    med = float(np.median(arr))
+    mad = float(np.median(np.abs(arr - med)))
+    if mad <= 0:
+        return values
+    # 1.4826 scales MAD to match σ for a Gaussian distribution.
+    threshold = k * 1.4826 * mad
+    kept = arr[np.abs(arr - med) <= threshold]
+    # Safety: never strip more than half the ensemble (would mean MAD itself is broken).
+    if len(kept) < len(arr) // 2:
+        return values
+    return kept.tolist()
+
+
 def _most_recent_12z(now_utc: datetime) -> datetime:
     """Return the most recent ECMWF run that should be published (~7h lag for 12z, ~7h lag for 00z).
 
@@ -518,8 +570,13 @@ def _summarise_failures(
     all_candidates: list[Candidate],
     bracket_probs: list[Any],
     snapshot: MarketSnapshot,
+    station_min_liquidity: float | None = None,
 ) -> str:
     thresholds = load_thresholds()
+    min_liq = (
+        station_min_liquidity if station_min_liquidity is not None
+        else thresholds.min_liquidity
+    )
     outcome_map = {o.label: o for o in snapshot.outcomes}
     failures: list[str] = []
 
@@ -532,8 +589,8 @@ def _summarise_failures(
             failures.append(f"{bp.label}: edge={edge:+.3f}<{thresholds.min_edge}")
         if outcome.spread > thresholds.max_spread:
             failures.append(f"{bp.label}: spread={outcome.spread:.3f}>{thresholds.max_spread}")
-        if outcome.liquidity < thresholds.min_liquidity:
-            failures.append(f"{bp.label}: liq=${outcome.liquidity:.0f}<${thresholds.min_liquidity:.0f}")
+        if outcome.liquidity < min_liq:
+            failures.append(f"{bp.label}: liq=${outcome.liquidity:.0f}<${min_liq:.0f}")
         side = "YES" if edge > 0 else "NO"
         has_book_data = outcome.top_ask_size > 0 or outcome.top_bid_size > 0
         if has_book_data:

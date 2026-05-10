@@ -27,7 +27,10 @@ LEAD_HOURS = 24
 RAW_SIGMA_FLOOR = 2.0  # K — climo floor when ECMWF ensemble var is tiny
 
 # Auto-promotion threshold for per-station Kelly multiplier (#6).
-PROMOTE_MIN_BETS = 50
+# Lowered from 50 → 25 on 2026-05-10: at the bot's current ~19% lock rate,
+# the 50-bet bar wasn't reachable inside a season. Stations with +CLV across
+# 25 resolved bets are statistically distinguishable from random.
+PROMOTE_MIN_BETS = 25
 PROMOTED_MULTIPLIER = 1.0
 
 _DATA_ROOT = Path(__file__).parents[3] / "data"

@@ -46,7 +46,7 @@ def ingest_forecasts(init_dt: datetime, station: StationConfig) -> pl.DataFrame:
     except ImportError as exc:
         raise IngestError("ecmwf-opendata not installed") from exc
 
-    fallback_inits = [init_dt - timedelta(hours=h) for h in (0, 12, 24, 36)]
+    fallback_inits = [init_dt - timedelta(hours=h) for h in (0, 12, 24, 36, 48, 60, 72)]
     last_error: Exception | None = None
 
     for try_init in fallback_inits:

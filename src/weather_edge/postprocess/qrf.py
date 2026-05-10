@@ -63,10 +63,17 @@ class QRFDistribution:
 
     @property
     def sigma(self) -> float:
-        """IQR-based sigma estimate (robust to non-Gaussian tails)."""
+        """IQR-based sigma estimate (robust to non-Gaussian tails).
+
+        Floored at 0.5°C: a daily-max temperature is never knowable to better
+        than half a degree once you account for observation rounding +
+        microclimate noise. Without this floor, leaf-collapse (when all
+        matching training obs are near-identical) drove sigma to 1e-4°C and
+        produced delta-like predictive distributions that broke Kelly sizing.
+        """
         q75 = _weighted_quantile(self.leaf_values, 0.75, self.leaf_weights)
         q25 = _weighted_quantile(self.leaf_values, 0.25, self.leaf_weights)
-        return float(max((q75 - q25) / 1.3490, 1e-4))
+        return float(max((q75 - q25) / 1.3490, 0.5))
 
 
 # ─── Feature extraction ───────────────────────────────────────────────────────
@@ -167,6 +174,15 @@ def predict_qrf(
         weights = np.ones(n_train, dtype=np.float64) / n_train
     else:
         weights /= total
+
+    # Leaf-collapse guard: if the effective sample size is tiny (most weight
+    # piled on one or two training obs), blend in uniform mass so bracket_prob
+    # doesn't become a delta function. ESS = 1 / Σwᵢ² ; threshold of 5 keeps
+    # high-confidence days sharp while broadening the pathological ones.
+    ess = 1.0 / max(float(np.sum(weights ** 2)), 1e-12)
+    if ess < 5.0:
+        weights = 0.7 * weights + 0.3 * (np.ones(n_train, dtype=np.float64) / n_train)
+        weights /= weights.sum()
 
     sorter = np.argsort(y_train)
     return QRFDistribution(

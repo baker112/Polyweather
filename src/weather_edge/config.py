@@ -22,10 +22,14 @@ class StationConfig(BaseModel):
     lock_time_utc: str
     # Per-station Kelly multiplier (#6). Conservative default of 0.5 lets young
     # stations accumulate evidence before sizing up. Auto-promoted to 1.0 by
-    # edge_gate.effective_kelly_multiplier once a station has 50+ resolved bets
-    # with positive mean CLV; override here to clamp a station that's earned
-    # promotion back down for risk reasons.
+    # edge_gate.effective_kelly_multiplier once a station has PROMOTE_MIN_BETS+
+    # resolved bets with positive mean CLV; override here to clamp a station
+    # that's earned promotion back down for risk reasons.
     kelly_multiplier: float = 0.5
+    # Optional per-station liquidity floor that overrides ThresholdsConfig.min_liquidity.
+    # Asian markets (RKSI/ZSPD/RCSS) are persistently thin, so a global floor of $100
+    # rejects most of their otherwise-positive-edge opportunities.
+    min_liquidity: float | None = None
 
 
 class ThresholdsConfig(BaseModel):

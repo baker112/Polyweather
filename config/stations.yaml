@@ -28,6 +28,7 @@ RKSI:
   market_slug_pattern: "highest-temperature-in-seoul-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "08:00"  # 17:00 KST — D-1
+  min_liquidity: 25  # Asian markets persistently thin at lock time
 
 ZSPD:
   name: Shanghai Pudong International Airport
@@ -38,6 +39,7 @@ ZSPD:
   market_slug_pattern: "highest-temperature-in-shanghai-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "08:03"  # 16:03 CST — D-1
+  min_liquidity: 25  # Asian markets persistently thin at lock time
 
 RCSS:
   name: Taipei Songshan Airport
@@ -48,6 +50,7 @@ RCSS:
   market_slug_pattern: "highest-temperature-in-taipei-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "08:06"  # 16:06 TST — D-1
+  min_liquidity: 25  # Asian markets persistently thin at lock time
 
 VHHH:
   name: Hong Kong International Airport
@@ -70,6 +73,7 @@ VILK:
   market_slug_pattern: "highest-temperature-in-lucknow-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "08:12"  # 13:42 IST — D-1
+  min_liquidity: 25  # Asian markets persistently thin at lock time
 
 # ── European group — lock 19:30-19:33z (12z ECMWF, D-1 local evening) ─────────
 
@@ -145,12 +149,16 @@ KBKF:
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "21:12"  # 15:12 MDT — D-1 afternoon
 
-MMMX:
-  name: Mexico City Benito Juarez International Airport
-  lat: 19.4363
-  lon: -99.0721
-  timezone: America/Mexico_City
-  unit: celsius
-  market_slug_pattern: "highest-temperature-in-mexico-city-on-{month_lower}-{day}-{year}"
-  resolution_field: "daily_max_metar_local_wholedeg"
-  lock_time_utc: "21:15"  # 15:15 CST — D-1 afternoon
+# MMMX disabled 2026-05-10: 0/3 win rate, −100% ROI, mean CLV −0.57,
+# EMOS coefficients (a=+22, b=+0.22) suggest the linear-Gaussian form does
+# not fit Mexico City's altitude/diurnal cycle. Re-enable after 60+ resolved
+# training pairs and a working backtest at the new station.
+# MMMX:
+#   name: Mexico City Benito Juarez International Airport
+#   lat: 19.4363
+#   lon: -99.0721
+#   timezone: America/Mexico_City
+#   unit: celsius
+#   market_slug_pattern: "highest-temperature-in-mexico-city-on-{month_lower}-{day}-{year}"
+#   resolution_field: "daily_max_metar_local_wholedeg"
+#   lock_time_utc: "21:15"  # 15:15 CST — D-1 afternoon

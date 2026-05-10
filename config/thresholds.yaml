@@ -1,4 +1,4 @@
-min_edge: 0.04
+min_edge: 0.025  # was 0.04 — too strict given 19% lock rate; min_net_edge still filters post-spread
 max_spread: 0.04
 min_liquidity: 100
 max_raw_prob: 0.85
