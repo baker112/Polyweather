@@ -38,14 +38,24 @@ from weather_edge.exceptions import IngestError
 _logger = logging.getLogger(__name__)
 _MODEL = "weathernext"
 
-# Column-name assumptions. If the BQ schema differs, override these once after
-# inspecting the table (see scripts/weathernext_schema.py) — no other code
-# changes needed.
+# Schema (verified 2026-05-13 against the linked Analytics Hub share):
+#   init_time                TIMESTAMP
+#   geography                GEOGRAPHY   (POINT lon/lat of the 0.25° cell centre)
+#   geography_polygon        GEOGRAPHY
+#   forecast                 RECORD REPEATED
+#     time                   TIMESTAMP  (valid time of this lead)
+#     hours                  INT64       (lead hours)
+#     ensemble               RECORD REPEATED
+#       ensemble_member      STRING      ("00".."49")
+#       2m_temperature       FLOAT64     (Kelvin)
+#       ... other variables (winds, MSLP, etc.) ...
 _COL_INIT_TIME = "init_time"
-_COL_VALID_TIME = "valid_time"
-_COL_MEMBER = "ensemble_member"
 _COL_GEOG = "geography"
-_COL_T2M = "`2m_temperature`"  # backticked because the identifier starts with a digit
+_COL_FORECAST = "forecast"
+_FCS_VALID_TIME = "time"
+_FCS_ENSEMBLE = "ensemble"
+_ENS_MEMBER = "ensemble_member"
+_ENS_T2M = "`2m_temperature`"  # backticked: identifier starts with a digit
 
 # Bounding box (degrees) around station lat/lon: pull all grid cells inside this
 # half-width. 0.3° at 50°N covers roughly the nearest 4 cells of a 0.25° grid,
@@ -153,17 +163,23 @@ def _query_and_reduce(
             bigquery.ArrayQueryParameter("init_hours", "INT64", list(init_hours))
         )
 
+    # The table is one row per (grid-cell × init). Forecast leads and ensemble
+    # members are nested arrays — double-UNNEST to flatten. Predicates on the
+    # top-level columns (init_time, geography) prune partitions BEFORE UNNEST,
+    # so the bytes-scanned cost scales with bbox+time-window, not the global grid.
     sql = f"""
         SELECT
-          {_COL_INIT_TIME}  AS init_time,
-          {_COL_VALID_TIME} AS valid_time,
-          {_COL_MEMBER}     AS member,
-          ST_Y({_COL_GEOG}) AS lat,
-          ST_X({_COL_GEOG}) AS lon,
-          {_COL_T2M}        AS t2m_k
-        FROM {table}
+          {_COL_INIT_TIME}    AS init_time,
+          ST_Y({_COL_GEOG})   AS lat,
+          ST_X({_COL_GEOG})   AS lon,
+          f.{_FCS_VALID_TIME} AS valid_time,
+          e.{_ENS_MEMBER}     AS member,
+          e.{_ENS_T2M}        AS t2m_k
+        FROM {table},
+        UNNEST({_COL_FORECAST}) AS f,
+        UNNEST(f.{_FCS_ENSEMBLE}) AS e
         WHERE {_COL_INIT_TIME} BETWEEN @init_start AND @init_end
-          AND {_COL_VALID_TIME} <= @valid_end
+          AND f.{_FCS_VALID_TIME} <= @valid_end
           AND ST_Y({_COL_GEOG}) BETWEEN @lat_lo AND @lat_hi
           AND ST_X({_COL_GEOG}) BETWEEN @lon_lo AND @lon_hi
           {hours_clause}
