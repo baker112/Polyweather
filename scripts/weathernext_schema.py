@@ -30,10 +30,17 @@ def main() -> None:
     ref = client.get_table(f"{project}.{dataset}.{table}")
     print(f"\nTable: {ref.full_table_id}")
     print(f"Rows : {ref.num_rows:,}   Size: {ref.num_bytes / 1e9:.1f} GB\n")
-    print(f"{'NAME':<30} {'TYPE':<12} MODE")
-    print("-" * 60)
-    for f in ref.schema:
-        print(f"{f.name:<30} {f.field_type:<12} {f.mode}")
+    print(f"{'NAME':<34} {'TYPE':<12} MODE")
+    print("-" * 64)
+
+    def _show(fields: list, depth: int = 0) -> None:
+        for fld in fields:
+            indent = "  " * depth
+            print(f"{indent}{fld.name:<{34 - len(indent)}} {fld.field_type:<12} {fld.mode}")
+            if fld.field_type == "RECORD":
+                _show(list(fld.fields), depth + 1)
+
+    _show(list(ref.schema))
 
 
 if __name__ == "__main__":
