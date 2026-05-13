@@ -62,6 +62,12 @@ _ENS_T2M = "`2m_temperature`"  # backticked: identifier starts with a digit
 # which is enough for a simple inverse-distance interpolation.
 _BBOX_HALFWIDTH_DEG = 0.3
 
+# Cap forecast lead in BigQuery so we don't scan the full 15-day horizon.
+# The pipeline's EMOS/BMA use lead buckets (24, 48, 72); 96h buffers all of
+# those. Bumping this would let you experiment with longer leads later, at
+# 1× scan-cost growth per ~24h added.
+_MAX_LEAD_HOURS = 96
+
 
 def _bq_client() -> Any:
     try:
@@ -93,12 +99,9 @@ def ingest_forecasts(init_dt: datetime, station: StationConfig) -> pl.DataFrame:
     Columns: model, member_id, init_datetime, valid_date, station, daily_max_c, lead_hours
     """
     init_utc = init_dt.replace(tzinfo=timezone.utc)
-    # We need ~4 days of leads to cover D-1..D+3 daily max under any UTC offset.
-    end_valid = init_utc + timedelta(hours=96)
     return _query_and_reduce(
         init_start=init_utc,
         init_end=init_utc + timedelta(seconds=1),  # exact-init match
-        valid_end=end_valid,
         station=station,
     )
 
@@ -120,11 +123,9 @@ def ingest_historic(
     """
     init_start = datetime(start_date.year, start_date.month, start_date.day, 0, tzinfo=timezone.utc)
     init_end = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, tzinfo=timezone.utc)
-    valid_end = init_end + timedelta(hours=96)
     return _query_and_reduce(
         init_start=init_start,
         init_end=init_end,
-        valid_end=valid_end,
         station=station,
         init_hours=init_hours,
     )
@@ -133,7 +134,6 @@ def ingest_historic(
 def _query_and_reduce(
     init_start: datetime,
     init_end: datetime,
-    valid_end: datetime,
     station: StationConfig,
     init_hours: tuple[int, ...] | None = None,
 ) -> pl.DataFrame:
@@ -157,7 +157,7 @@ def _query_and_reduce(
     params = [
         bigquery.ScalarQueryParameter("init_start", "TIMESTAMP", init_start),
         bigquery.ScalarQueryParameter("init_end", "TIMESTAMP", init_end),
-        bigquery.ScalarQueryParameter("valid_end", "TIMESTAMP", valid_end),
+        bigquery.ScalarQueryParameter("max_lead", "INT64", _MAX_LEAD_HOURS),
         bigquery.ScalarQueryParameter("lat_lo", "FLOAT64", lat_lo),
         bigquery.ScalarQueryParameter("lat_hi", "FLOAT64", lat_hi),
         bigquery.ScalarQueryParameter("lon_lo", "FLOAT64", lon_lo),
@@ -191,7 +191,7 @@ def _query_and_reduce(
           UNNEST({_COL_FORECAST}) AS f,
           UNNEST(f.{_FCS_ENSEMBLE}) AS e
           WHERE {_COL_INIT_TIME} BETWEEN @init_start AND @init_end
-            AND f.{_FCS_VALID_TIME} <= @valid_end
+            AND f.hours <= @max_lead
             AND ST_Y({_COL_GEOG}) BETWEEN @lat_lo AND @lat_hi
             AND ST_X({_COL_GEOG}) BETWEEN @lon_lo AND @lon_hi
             {hours_clause}
