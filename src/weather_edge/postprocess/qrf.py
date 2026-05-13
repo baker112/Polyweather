@@ -235,7 +235,7 @@ def assemble_qrf_training_pairs(
         init_dt = _init_datetime_for(current, lead_hours)
         all_values: list[float] = []
 
-        for model in ("ecmwf", "gefs", "icon"):
+        for model in ("ecmwf", "gefs", "icon", "weathernext"):
             df = store.read_forecasts(model, init_dt, station)
             if df is None:
                 continue

@@ -23,7 +23,7 @@ def _ingest_job(station_id: str) -> None:
     from datetime import timedelta
 
     from weather_edge.config import get_station
-    from weather_edge.ingest import ecmwf, gefs, icon
+    from weather_edge.ingest import ecmwf, gefs, icon, weathernext
     from weather_edge.logging import log_event
     from weather_edge.pipeline.lock import _most_recent_12z
     from weather_edge.store import parquet as store
@@ -38,6 +38,7 @@ def _ingest_job(station_id: str) -> None:
         ("ecmwf", ecmwf.ingest_forecasts),
         ("gefs", gefs.ingest_forecasts),
         ("icon", icon.ingest_forecasts),
+        ("weathernext", weathernext.ingest_forecasts),
     ]:
         # Per-call timer — prevents cumulative-since-job-start drift.
         t0 = _time.monotonic()
@@ -366,7 +367,7 @@ def _closing_snapshot_job(station_id: str) -> None:
 def _refit_job(station_id: str) -> None:
     from datetime import date
 
-    from weather_edge.postprocess.emos import assemble_training_pairs, fit_emos
+    from weather_edge.postprocess.emos import assemble_training_pairs, fit_emos, fit_emos_per_model
     from weather_edge.postprocess.qrf import assemble_qrf_training_pairs, fit_qrf
     from weather_edge.store import parquet as store
 
@@ -379,6 +380,19 @@ def _refit_job(station_id: str) -> None:
             params = fit_emos(pairs, station_id, lead)
             store.write_emos_params(params.model_dump(), station_id, lead, params.valid_from)
             _logger.info("Re-fitted EMOS %s lead=%dh n=%d CRPS=%.4f", station_id, lead, params.n_samples, params.train_crps)
+
+        # Per-model EMOS for BMA. Without this the BMA path can't pick up newer
+        # ensembles (e.g. WeatherNext after onboarding) — only the pooled fit
+        # above would refresh, leaving per-model params stale.
+        per_model = fit_emos_per_model(station_id, lead, as_of, now_utc=now_utc)
+        for model_name, params in per_model.items():
+            store.write_emos_params(
+                params.model_dump(), station_id, lead, params.valid_from, model=model_name
+            )
+            _logger.info(
+                "Re-fitted EMOS %s lead=%dh model=%s n=%d CRPS=%.4f",
+                station_id, lead, model_name, params.n_samples, params.train_crps,
+            )
 
     pairs_qrf = assemble_qrf_training_pairs(station_id, 24, as_of, window_days=90)
     if len(pairs_qrf) >= 10:

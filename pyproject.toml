@@ -30,6 +30,7 @@ dependencies = [
     "plotly>=5.22.0",
     "apscheduler>=3.10.0",
     "py-clob-client>=0.16.0",
+    "google-cloud-bigquery>=3.20.0",
 ]
 
 [project.optional-dependencies]

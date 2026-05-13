@@ -129,7 +129,7 @@ def rolling_model_crps(
 
         y = obs_map[current]
 
-        for model in ("ecmwf", "gefs", "icon"):
+        for model in ("ecmwf", "gefs", "icon", "weathernext"):
             raw = store.read_emos_params(station, lead_hours, as_of=datetime(
                 current.year, current.month, current.day, 18, tzinfo=timezone.utc
             ), model=model)

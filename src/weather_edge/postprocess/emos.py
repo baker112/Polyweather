@@ -288,7 +288,7 @@ def fit_emos_per_model(
     station: str,
     lead_hours: int,
     as_of: date,
-    models: tuple[str, ...] = ("ecmwf", "gefs", "icon"),
+    models: tuple[str, ...] = ("ecmwf", "gefs", "icon", "weathernext"),
     window_days: int = 60,
     now_utc: datetime | None = None,
 ) -> dict[str, EmosParams]:

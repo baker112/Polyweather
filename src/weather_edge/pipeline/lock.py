@@ -106,6 +106,15 @@ def lock_picks(
         _logger.warning("ICON ingest failed: %s", exc)
         provenance["icon_error"] = str(exc)
 
+    try:
+        from weather_edge.ingest import weathernext
+        df_wn = _load_or_fetch_forecasts("weathernext", init_dt, station, weathernext.ingest_forecasts)
+        forecast_dfs.append(df_wn)
+        provenance["weathernext_members"] = int(df_wn.filter(pl.col("valid_date") == target_date).height)
+    except (IngestError, Exception) as exc:
+        _logger.warning("WeatherNext ingest failed: %s", exc)
+        provenance["weathernext_error"] = str(exc)
+
     if not forecast_dfs:
         raise IngestError("All forecast sources failed")
 
@@ -160,7 +169,7 @@ def lock_picks(
 
     # Separate per-model forecast values for BMA path
     model_values: dict[str, list[float]] = {}
-    for _model in ("ecmwf", "gefs", "icon"):
+    for _model in ("ecmwf", "gefs", "icon", "weathernext"):
         _mdf = all_forecasts.filter(
             (pl.col("model") == _model)
             & (pl.col("valid_date") == target_date)
@@ -401,7 +410,7 @@ def _stage3_4(
     # ── Phase 2: BMA ─────────────────────────────────────────────────────────
     # Attempt to load per-model EMOS params (Phase 2 path)
     per_model: dict[str, EmosParams] = {}
-    for model in ("ecmwf", "gefs", "icon"):
+    for model in ("ecmwf", "gefs", "icon", "weathernext"):
         raw = store.read_emos_params(station_id, lead_hours, now_utc, model=model)
         if raw is not None and model in model_values and len(model_values[model]) >= 3:
             per_model[model] = EmosParams(**raw)
