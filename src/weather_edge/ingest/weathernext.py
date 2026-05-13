@@ -137,7 +137,13 @@ def _query_and_reduce(
     station: StationConfig,
     init_hours: tuple[int, ...] | None = None,
 ) -> pl.DataFrame:
-    """Run the BQ query, interpolate to station, reduce to per-member daily max."""
+    """Run the BQ aggregation query and assemble the parquet-shaped DataFrame.
+
+    All heavy work (UNNEST, nearest-cell pick, local-timezone bucketing, daily
+    max) runs in BigQuery — Python only sees ~50 members × ~6 valid_dates per
+    init in the result set, so monthly chunks return ~20k rows instead of
+    ~720k. A pure-Python row loop on that scale was the previous bottleneck.
+    """
     from google.cloud import bigquery  # type: ignore[import-untyped]
 
     client = _bq_client()
@@ -156,6 +162,9 @@ def _query_and_reduce(
         bigquery.ScalarQueryParameter("lat_hi", "FLOAT64", lat_hi),
         bigquery.ScalarQueryParameter("lon_lo", "FLOAT64", lon_lo),
         bigquery.ScalarQueryParameter("lon_hi", "FLOAT64", lon_hi),
+        bigquery.ScalarQueryParameter("station_lat", "FLOAT64", station.lat),
+        bigquery.ScalarQueryParameter("station_lon", "FLOAT64", station.lon),
+        bigquery.ScalarQueryParameter("tz", "STRING", station.timezone),
     ]
     if init_hours:
         hours_clause = f"AND EXTRACT(HOUR FROM {_COL_INIT_TIME}) IN UNNEST(@init_hours)"
@@ -163,26 +172,45 @@ def _query_and_reduce(
             bigquery.ArrayQueryParameter("init_hours", "INT64", list(init_hours))
         )
 
-    # The table is one row per (grid-cell × init). Forecast leads and ensemble
-    # members are nested arrays — double-UNNEST to flatten. Predicates on the
-    # top-level columns (init_time, geography) prune partitions BEFORE UNNEST,
-    # so the bytes-scanned cost scales with bbox+time-window, not the global grid.
+    # Strategy (all in SQL):
+    #   1. UNNEST the nested forecast/ensemble arrays inside the bbox+time window.
+    #   2. For each (init, member, valid_time), pick the single nearest grid
+    #      cell — interpolating across 4 cells gives sub-0.1°C gain that EMOS
+    #      bias correction absorbs anyway, not worth the row blowup.
+    #   3. Bucket valid_time into the station's LOCAL date via DATE(ts, @tz).
+    #   4. MAX over the local day → one row per (init, member, local_date).
     sql = f"""
+        WITH expanded AS (
+          SELECT
+            {_COL_INIT_TIME}    AS init_time,
+            f.{_FCS_VALID_TIME} AS valid_time,
+            e.{_ENS_MEMBER}     AS member,
+            e.{_ENS_T2M}        AS t2m_k,
+            ST_DISTANCE({_COL_GEOG}, ST_GEOGPOINT(@station_lon, @station_lat)) AS dist_m
+          FROM {table},
+          UNNEST({_COL_FORECAST}) AS f,
+          UNNEST(f.{_FCS_ENSEMBLE}) AS e
+          WHERE {_COL_INIT_TIME} BETWEEN @init_start AND @init_end
+            AND f.{_FCS_VALID_TIME} <= @valid_end
+            AND ST_Y({_COL_GEOG}) BETWEEN @lat_lo AND @lat_hi
+            AND ST_X({_COL_GEOG}) BETWEEN @lon_lo AND @lon_hi
+            {hours_clause}
+        ),
+        nearest AS (
+          SELECT init_time, valid_time, member, t2m_k
+          FROM expanded
+          QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY init_time, valid_time, member ORDER BY dist_m
+          ) = 1
+        )
         SELECT
-          {_COL_INIT_TIME}    AS init_time,
-          ST_Y({_COL_GEOG})   AS lat,
-          ST_X({_COL_GEOG})   AS lon,
-          f.{_FCS_VALID_TIME} AS valid_time,
-          e.{_ENS_MEMBER}     AS member,
-          e.{_ENS_T2M}        AS t2m_k
-        FROM {table},
-        UNNEST({_COL_FORECAST}) AS f,
-        UNNEST(f.{_FCS_ENSEMBLE}) AS e
-        WHERE {_COL_INIT_TIME} BETWEEN @init_start AND @init_end
-          AND f.{_FCS_VALID_TIME} <= @valid_end
-          AND ST_Y({_COL_GEOG}) BETWEEN @lat_lo AND @lat_hi
-          AND ST_X({_COL_GEOG}) BETWEEN @lon_lo AND @lon_hi
-          {hours_clause}
+          init_time,
+          member,
+          DATE(valid_time, @tz) AS local_date,
+          MAX(t2m_k) - 273.15   AS daily_max_c
+        FROM nearest
+        WHERE t2m_k IS NOT NULL
+        GROUP BY init_time, member, local_date
     """
 
     cfg = bigquery.QueryJobConfig(query_parameters=params)
@@ -197,76 +225,22 @@ def _query_and_reduce(
             f"WeatherNext: no rows for {station.icao} init in [{init_start}, {init_end}]"
         )
 
-    return _reduce_to_daily_max(rows, station, init_start)
-
-
-def _reduce_to_daily_max(
-    rows: list[Any],
-    station: StationConfig,
-    init_start: datetime,
-) -> pl.DataFrame:
-    """Inverse-distance-weight the per-cell values onto station lat/lon, then
-    reduce per (init, member) to local-timezone daily max."""
-    import math
-
     tz = zoneinfo.ZoneInfo(station.timezone)
-
-    # Group rows by (init, member, valid_time) → list of (cell_lat, cell_lon, t2m_k)
-    cells: dict[tuple[datetime, Any, datetime], list[tuple[float, float, float]]] = {}
-    for r in rows:
-        key = (r["init_time"], r["member"], r["valid_time"])
-        cells.setdefault(key, []).append((float(r["lat"]), float(r["lon"]), float(r["t2m_k"])))
-
-    # Interpolate each timestep to station lat/lon via inverse-distance weighting.
-    # Squared-distance weight matches a 2-D linear approximation closely enough
-    # for sub-grid points; falls back to nearest if a cell is exactly on station.
-    point_temps: dict[tuple[datetime, Any, datetime], float] = {}
-    for (init_time, member, valid_time), cell_vals in cells.items():
-        num = 0.0
-        den = 0.0
-        nearest = None
-        for clat, clon, t_k in cell_vals:
-            dlat = clat - station.lat
-            dlon = clon - station.lon
-            d2 = dlat * dlat + dlon * dlon
-            if d2 < 1e-12:
-                nearest = t_k
-                break
-            w = 1.0 / d2
-            num += w * t_k
-            den += w
-        t2m_k = nearest if nearest is not None else (num / den if den > 0 else None)
-        if t2m_k is None or not math.isfinite(t2m_k):
-            continue
-        point_temps[(init_time, member, valid_time)] = t2m_k - 273.15
-
-    # Reduce per (init, member, local_date) to max
-    day_max: dict[tuple[datetime, Any, date], float] = {}
-    for (init_time, member, valid_time), tc in point_temps.items():
-        valid_utc = valid_time if valid_time.tzinfo else valid_time.replace(tzinfo=timezone.utc)
-        local_day = valid_utc.astimezone(tz).date()
-        key = (init_time, member, local_day)
-        prev = day_max.get(key, -999.0)
-        if tc > prev:
-            day_max[key] = tc
-
     rows_out: list[dict[str, Any]] = []
-    for (init_time, member, local_day), tmax in day_max.items():
-        init_utc = init_time if init_time.tzinfo else init_time.replace(tzinfo=timezone.utc)
+    for r in rows:
+        init_utc = r["init_time"]
+        if init_utc.tzinfo is None:
+            init_utc = init_utc.replace(tzinfo=timezone.utc)
+        local_day = r["local_date"]  # already a `date` object from BQ DATE()
         rows_out.append({
             "model": _MODEL,
-            "member_id": _coerce_member_int(member),
+            "member_id": _coerce_member_int(r["member"]),
             "init_datetime": init_utc,
             "valid_date": local_day,
             "station": station.icao,
-            "daily_max_c": tmax,
+            "daily_max_c": float(r["daily_max_c"]),
             "lead_hours": _lead_hours(init_utc, local_day, tz),
         })
-
-    if not rows_out:
-        raise IngestError(
-            f"WeatherNext: no usable temperature samples after reduction for {station.icao}"
-        )
 
     return pl.DataFrame(rows_out)
 
