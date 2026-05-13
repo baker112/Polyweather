@@ -44,6 +44,43 @@ _logger = logging.getLogger(__name__)
 
 _DEFAULT_LEAD_HOURS = 24  # primary lead bucket for the 12z run targeting D+1
 
+# Floor on the predictive σ before computing bracket probabilities. The pre-2026-05-13
+# /dump analysis showed bot betting NO on the exact resolved bracket ~30% of picks
+# (vs ~17% expected for well-calibrated 6-bracket markets) — symptom of over-narrow
+# distributions where σ collapsed to the inner classes' 0.5°C floor. Lifting to 1.5°C
+# spreads bracket probability away from the central mass and stops the catastrophic
+# "NO on the exact answer" failure mode.
+_MIN_SIGMA = 1.5
+
+
+class _SigmaFloored:
+    """Wrap a predictive distribution so bracket_prob uses max(σ, _MIN_SIGMA).
+
+    Falls back to a single Gaussian when the floor activates — strictly less
+    flexible than the underlying BMA mixture / QRF kernel, but only kicks in
+    when the distribution was so concentrated the mixture structure had
+    collapsed anyway.
+    """
+
+    def __init__(self, inner: Any, min_sigma: float) -> None:
+        self._inner = inner
+        self.mu = float(inner.mu)
+        self._raw_sigma = float(inner.sigma)
+        self._sigma_eff = max(self._raw_sigma, min_sigma)
+        self._floored = self._sigma_eff > self._raw_sigma
+
+    @property
+    def sigma(self) -> float:
+        return self._sigma_eff
+
+    def bracket_prob(self, low: float | None, high: float | None) -> float:
+        if not self._floored:
+            return self._inner.bracket_prob(low, high)
+        from scipy.stats import norm  # type: ignore[import-untyped]
+        p_low = 0.0 if low is None else float(norm.cdf(low, self.mu, self._sigma_eff))
+        p_high = 1.0 if high is None else float(norm.cdf(high, self.mu, self._sigma_eff))
+        return p_high - p_low
+
 
 def lock_picks(
     target_date: date,
@@ -181,14 +218,15 @@ def lock_picks(
     dist = _stage3_4(
         station_id, lead_hours, now_utc, target_date, ensemble_values, model_values, provenance
     )
-    if dist.sigma < 0.5:
-        # Belt-and-braces guard. QRFDistribution.sigma already floors at 0.5;
-        # this catches any future predictive-distribution class that forgets to.
-        _logger.warning(
-            "Stage 3+4: sigma collapsed to %.4f for %s %s (mode=%s) — flagging in provenance",
-            dist.sigma, station_id, target_date, provenance.get("mode"),
+    raw_sigma = float(dist.sigma)
+    dist = _SigmaFloored(dist, _MIN_SIGMA)
+    if dist._floored:
+        _logger.info(
+            "Stage 3+4: σ floored %.2f → %.2f for %s %s (mode=%s)",
+            raw_sigma, dist.sigma, station_id, target_date, provenance.get("mode"),
         )
-        provenance["sigma_collapse"] = float(dist.sigma)
+        provenance["sigma_raw"] = raw_sigma
+        provenance["sigma_floored"] = True
     log_event("fit_emos", station_id, "ok",
               (time.monotonic() - t1) * 1000,
               mode=provenance.get("mode", "pooled"),
@@ -248,6 +286,7 @@ def lock_picks(
     candidates = compute_edges(
         bracket_probs, snapshot, now_utc, station_kelly_mult,
         station_min_liquidity=station.min_liquidity,
+        predictive_mu=dist.mu,
     )
 
     candidates.sort(key=lambda c: abs(c.edge), reverse=True)
@@ -287,6 +326,7 @@ def compute_edges(
     now_utc: datetime,
     station_kelly_multiplier: float = 1.0,
     station_min_liquidity: float | None = None,
+    predictive_mu: float | None = None,
 ) -> list[Candidate]:
     thresholds = load_thresholds()
     freshness_cutoff = now_utc - timedelta(minutes=thresholds.market_freshness_minutes)
@@ -305,6 +345,20 @@ def compute_edges(
 
         edge = bp.model_prob - outcome.mid
         side = "YES" if edge > 0 else "NO"
+
+        # Guard against betting NO on the bracket that contains the predictive
+        # mean. The /dump 2026-05-13 analysis showed this was the dominant
+        # losing-mode: when the bot's μ landed inside bracket X, it would
+        # *still* compute NO edge on X (because market priced X higher than
+        # model's narrow-distribution prob) and then lose hard when truth
+        # actually landed in X. Skip silently — no candidate, no gate failure.
+        if (
+            side == "NO"
+            and predictive_mu is not None
+            and bp.low is not None and bp.high is not None
+            and bp.low <= predictive_mu < bp.high
+        ):
+            continue
 
         # Side-relevant top-of-book depth:
         #   YES bet → buy YES at best_ask, depth = top_ask_size (shares) * best_ask (price/share)
