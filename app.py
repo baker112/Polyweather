@@ -75,6 +75,48 @@ from weather_edge.store import parquet as store
 
 STATIONS = ["EGLC", "EGLL", "EHAM", "EDDF", "LFPB", "KJFK", "KLAX", "KORD", "KMIA"]
 
+# ─── Fleet stats (computed once, used by sidebar + overview tab) ──────────────
+
+@st.cache_data(ttl=60)
+def _fleet_stats() -> list[dict]:
+    out = []
+    for s in STATIONS:
+        picks = store.read_all_picks(s)
+        resolutions = store.read_all_resolutions(s)
+        resolved = [r for r in resolutions if r.get("resolved")]
+        pnl = sum(r.get("total_pnl_per_unit", 0) for r in resolved)
+        wins = sum(1 for r in resolved if r.get("total_pnl_per_unit", 0) > 0)
+        lock_dates = sorted({p["date"] for p in picks})
+        out.append({
+            "station": s,
+            "n_lock_dates": len(lock_dates),
+            "n_resolved": len(resolved),
+            "pnl": pnl,
+            "wins": wins,
+            "latest_lock": lock_dates[-1] if lock_dates else None,
+            "lock_dates": lock_dates,
+        })
+    return out
+
+fleet = _fleet_stats()
+fleet_by_station = {f["station"]: f for f in fleet}
+active_stations = [f for f in fleet if f["n_lock_dates"] > 0]
+
+total_pnl = sum(f["pnl"] for f in fleet)
+total_resolved = sum(f["n_resolved"] for f in fleet)
+total_wins = sum(f["wins"] for f in fleet)
+overall_win_rate = (total_wins / total_resolved * 100) if total_resolved else 0
+latest_lock_any = max((f["latest_lock"] for f in fleet if f["latest_lock"]), default=None)
+today = date.today()
+
+# Default station: the one with the most recent lock, else first in list
+if active_stations:
+    default_station = max(active_stations, key=lambda f: f["latest_lock"] or "")["station"]
+    default_idx = STATIONS.index(default_station)
+else:
+    default_idx = 0
+
+
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
 
 with st.sidebar:
@@ -82,9 +124,22 @@ with st.sidebar:
     st.caption("Ensemble forecast → Polymarket edge")
     st.divider()
 
-    station = st.selectbox("Station", STATIONS, label_visibility="collapsed",
-                           format_func=lambda s: f"📍 {s}")
-    today = date.today()
+    def _station_label(s: str) -> str:
+        f = fleet_by_station[s]
+        if f["n_lock_dates"] == 0:
+            return f"📍 {s}  ·  no data"
+        return f"📍 {s}  ·  {f['n_lock_dates']} locks  ·  {f['pnl']:+.3f}"
+
+    station = st.selectbox(
+        "Station", STATIONS, index=default_idx,
+        label_visibility="collapsed", format_func=_station_label,
+    )
+
+    f_sel = fleet_by_station[station]
+    if f_sel["latest_lock"]:
+        st.caption(f"Latest lock: **{f_sel['latest_lock']}** · {f_sel['n_resolved']}/{f_sel['n_lock_dates']} resolved")
+    else:
+        st.caption("_No picks locked for this station yet._")
 
     st.divider()
     auto_refresh = st.toggle("Auto-refresh (60s)", value=False)
@@ -100,17 +155,65 @@ with st.sidebar:
 
 # ─── Page header ──────────────────────────────────────────────────────────────
 
-col_h1, col_h2 = st.columns([3, 1])
+col_h1, col_h2, col_h3, col_h4 = st.columns([3, 2, 2, 2])
 with col_h1:
     st.markdown(f"# {station}")
 with col_h2:
-    st.markdown("<br>", unsafe_allow_html=True)
+    pnl_color = "#00d4aa" if total_pnl >= 0 else "#ff6b6b"
+    st.markdown(
+        f'<div style="text-align:right;padding-top:24px;">'
+        f'<div style="font-size:0.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em;">Fleet P&L</div>'
+        f'<div style="font-size:1.4rem;font-weight:700;color:{pnl_color};">{total_pnl:+.4f}</div>'
+        f'</div>', unsafe_allow_html=True)
+with col_h3:
+    st.markdown(
+        f'<div style="text-align:right;padding-top:24px;">'
+        f'<div style="font-size:0.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em;">Win rate</div>'
+        f'<div style="font-size:1.4rem;font-weight:700;color:#e6edf3;">{overall_win_rate:.0f}%</div>'
+        f'</div>', unsafe_allow_html=True)
+with col_h4:
+    st.markdown(
+        f'<div style="text-align:right;padding-top:24px;">'
+        f'<div style="font-size:0.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em;">Latest lock</div>'
+        f'<div style="font-size:1.4rem;font-weight:700;color:#e6edf3;">{latest_lock_any or "—"}</div>'
+        f'</div>', unsafe_allow_html=True)
+
 
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
 
-tab_today, tab_history, tab_data, tab_model, tab_calibration = st.tabs(
-    ["🎯 Today", "📈 History", "🗄 Data", "🔬 Model", "📐 Calibration"]
+tab_overview, tab_today, tab_history, tab_data, tab_model, tab_calibration = st.tabs(
+    ["🛰 Fleet", "🎯 Today", "📈 History", "🗄 Data", "🔬 Model", "📐 Calibration"]
 )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FLEET OVERVIEW TAB
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_overview:
+    st.markdown('<div class="section-header">Per-station summary</div>', unsafe_allow_html=True)
+    if not active_stations:
+        st.markdown("""
+        <div style="background:#161b22;border:1px dashed #30363d;border-radius:10px;
+                    padding:32px;text-align:center;color:#8b949e;margin:20px 0;">
+            <div style="font-size:2rem;margin-bottom:8px;">📭</div>
+            <div style="font-weight:600;">No locks recorded yet</div>
+            <div style="font-size:0.85rem;margin-top:8px;">
+                Once the scheduler runs <code>we lock</code>, picks will appear here.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        rows = [{
+            "Station": f["station"],
+            "Locks": f["n_lock_dates"],
+            "Resolved": f["n_resolved"],
+            "Wins": f["wins"],
+            "Win %": f"{(f['wins']/f['n_resolved']*100):.0f}%" if f["n_resolved"] else "—",
+            "P&L (per unit)": f"{f['pnl']:+.4f}",
+            "Latest lock": f["latest_lock"] or "—",
+        } for f in fleet]
+        st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -118,23 +221,41 @@ tab_today, tab_history, tab_data, tab_model, tab_calibration = st.tabs(
 # ══════════════════════════════════════════════════════════════════════════════
 
 with tab_today:
-    target_date = st.date_input(
-        "Target date", value=today + timedelta(days=1),
-        label_visibility="collapsed",
-    )
+    station_lock_dates = [date.fromisoformat(d) for d in fleet_by_station[station]["lock_dates"]]
+    default_target = station_lock_dates[-1] if station_lock_dates else today + timedelta(days=1)
+
+    col_d1, col_d2 = st.columns([2, 5])
+    with col_d1:
+        target_date = st.date_input(
+            "Target date", value=default_target,
+            label_visibility="collapsed",
+        )
+    with col_d2:
+        if station_lock_dates:
+            recent_strs = [d.isoformat() for d in station_lock_dates[-5:][::-1]]
+            st.caption("Recent locks: " + " · ".join(f"**{d}**" for d in recent_strs))
 
     picks_data = store.read_picks(station, target_date)
 
     if picks_data is None:
-        st.markdown("""
+        if station_lock_dates:
+            hint = (
+                f"Try one of <strong style='color:#e6edf3;'>{' · '.join(d.isoformat() for d in station_lock_dates[-5:][::-1])}</strong>"
+                f" — those are the most recent dates with locks for {station}."
+            )
+        else:
+            hint = f"No locks recorded for <strong>{station}</strong> yet. The scheduler locks tomorrow's pick around 17:30z."
+        st.markdown(f"""
         <div style="background:#161b22;border:1px dashed #30363d;border-radius:10px;
                     padding:32px;text-align:center;color:#8b949e;margin:20px 0;">
             <div style="font-size:2rem;margin-bottom:8px;">🔒</div>
-            <div style="font-weight:600;">No lock found</div>
-            <div style="font-size:0.85rem;margin-top:4px;">Run <code>we lock --station {station} --date {date}</code></div>
+            <div style="font-weight:600;">No lock for {target_date}</div>
+            <div style="font-size:0.85rem;margin-top:10px;">{hint}</div>
+            <div style="font-size:0.75rem;margin-top:14px;opacity:0.6;">
+                Lock manually: <code>we lock --station {station} --date {target_date}</code>
+            </div>
         </div>
-        """.replace("{station}", station).replace("{date}", str(target_date)),
-        unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
     else:
         import plotly.graph_objects as go
         import numpy as np
