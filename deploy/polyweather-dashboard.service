@@ -6,8 +6,8 @@ After=network.target
 Type=simple
 User=ohbaker1
 WorkingDirectory=/home/ohbaker1/Polyweather
-Environment=PATH=/home/ohbaker1/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/ohbaker1/.local/bin/streamlit run app.py \
+Environment=PATH=/home/ohbaker1/Polyweather/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ohbaker1/Polyweather/.venv/bin/streamlit run app.py \
     --server.address=127.0.0.1 \
     --server.port=8501 \
     --server.headless=true \
