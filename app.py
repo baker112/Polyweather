@@ -116,16 +116,47 @@ def _layout(height: int = 360, **overrides):
 
 # ─── Fleet stats (computed once, used by sidebar + overview tab) ──────────────
 
+_DATA_ROOT_EARLY = Path(__file__).parent / "data"
+
 @st.cache_data(ttl=60)
-def _fleet_stats() -> list[dict]:
+def _discover_stations() -> list[str]:
+    """Find every station mentioned anywhere in data/. Returns sorted, unique."""
+    found: set[str] = set()
+    # picks: data/picks/date=*/station=*/picks.json
+    for p in (_DATA_ROOT_EARLY / "picks").glob("date=*/station=*"):
+        found.add(p.name.replace("station=", ""))
+    # observations / forecasts / executions / market_snapshots / clv_snapshots /
+    # predictions / qrf_params / emos_params — all use station=* somewhere.
+    for sub in ("observations", "executions", "market_snapshots", "predictions",
+                "qrf_params", "emos_params", "clv_snapshots", "resolutions"):
+        base = _DATA_ROOT_EARLY / sub
+        if not base.exists():
+            continue
+        for p in base.rglob("station=*"):
+            found.add(p.name.replace("station=", ""))
+    # Forecasts are partitioned by model first: data/forecasts/model=*/init_date=*/init_hour=*/station=*
+    fc = _DATA_ROOT_EARLY / "forecasts"
+    if fc.exists():
+        for p in fc.glob("model=*/init_date=*/init_hour=*/station=*"):
+            found.add(p.name.replace("station=", ""))
+    return sorted(found)
+
+
+@st.cache_data(ttl=60)
+def _fleet_stats(stations: tuple[str, ...]) -> list[dict]:
     out = []
-    for s in STATIONS:
+    for s in stations:
         picks = store.read_all_picks(s)
         resolutions = store.read_all_resolutions(s)
         resolved = [r for r in resolutions if r.get("resolved")]
         pnl = sum(r.get("total_pnl_per_unit", 0) for r in resolved)
         wins = sum(1 for r in resolved if r.get("total_pnl_per_unit", 0) > 0)
         lock_dates = sorted({p["date"] for p in picks})
+        # Probe other artefacts so we can show what data each station has even
+        # without locks
+        has_obs = (_DATA_ROOT_EARLY / "observations" / f"station={s}" / "data.parquet").exists()
+        has_forecasts = any((_DATA_ROOT_EARLY / "forecasts").glob(f"model=*/init_date=*/init_hour=*/station={s}"))
+        has_snapshots = any((_DATA_ROOT_EARLY / "market_snapshots" / f"station={s}").glob("date=*"))
         out.append({
             "station": s,
             "n_lock_dates": len(lock_dates),
@@ -134,13 +165,23 @@ def _fleet_stats() -> list[dict]:
             "wins": wins,
             "latest_lock": lock_dates[-1] if lock_dates else None,
             "lock_dates": lock_dates,
+            "has_observations": has_obs,
+            "has_forecasts": has_forecasts,
+            "has_snapshots": has_snapshots,
+            "has_any_data": bool(lock_dates) or has_obs or has_forecasts or has_snapshots,
         })
     return out
 
-fleet = _fleet_stats()
+# Union of the hard-coded list (so manual additions still show) with anything
+# the data dir reveals (so the dashboard auto-discovers stations the scheduler
+# starts ingesting without code edits).
+_discovered = _discover_stations()
+all_stations = sorted(set(STATIONS) | set(_discovered))
+
+fleet = _fleet_stats(tuple(all_stations))
 fleet_by_station = {f["station"]: f for f in fleet}
 active_stations = [f for f in fleet if f["n_lock_dates"] > 0]
-populated_station_names = [f["station"] for f in active_stations]
+populated_station_names = [f["station"] for f in fleet if f["has_any_data"]]
 
 total_pnl = sum(f["pnl"] for f in fleet)
 total_resolved = sum(f["n_resolved"] for f in fleet)
@@ -196,7 +237,7 @@ dry_bankroll = _load_bankroll("dry")
 if active_stations:
     default_station = max(active_stations, key=lambda f: f["latest_lock"] or "")["station"]
 else:
-    default_station = STATIONS[0]
+    default_station = (populated_station_names or all_stations)[0]
 
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
@@ -206,17 +247,28 @@ with st.sidebar:
     st.caption("Ensemble forecast → Polymarket edge")
     st.divider()
 
+    n_empty = len(all_stations) - len(populated_station_names)
     show_all = st.toggle(
-        "Show stations with no data", value=False,
-        help=f"{len(STATIONS) - len(populated_station_names)} of {len(STATIONS)} stations have no locks yet.",
+        "Show empty stations", value=False,
+        help=f"{n_empty} of {len(all_stations)} stations have no data yet.",
     )
-    station_options = STATIONS if show_all else (populated_station_names or STATIONS)
+    station_options = all_stations if show_all else (populated_station_names or all_stations)
 
     def _station_label(s: str) -> str:
         f = fleet_by_station[s]
-        if f["n_lock_dates"] == 0:
-            return f"📍 {s}  ·  no data"
-        return f"📍 {s}  ·  {f['n_lock_dates']} locks  ·  {f['pnl']:+.3f}"
+        if f["n_lock_dates"] > 0:
+            return f"📍 {s}  ·  {f['n_lock_dates']} locks  ·  {f['pnl']:+.3f}"
+        # No locks — describe what data we do have so it's not just "no data"
+        tags = []
+        if f["has_observations"]:
+            tags.append("obs")
+        if f["has_forecasts"]:
+            tags.append("forecasts")
+        if f["has_snapshots"]:
+            tags.append("market")
+        if tags:
+            return f"📍 {s}  ·  " + " · ".join(tags)
+        return f"📍 {s}  ·  no data"
 
     default_idx = station_options.index(default_station) if default_station in station_options else 0
     station = st.selectbox(
@@ -662,6 +714,10 @@ with tab_bankroll:
     if not execs:
         st.info(f"No executions recorded for {station}.")
     else:
+        def _num(d: dict, key: str, default: float = 0.0) -> float:
+            v = d.get(key)
+            return float(v) if v is not None else default
+
         rows = []
         for e in reversed(execs[-50:]):
             rows.append({
@@ -669,10 +725,10 @@ with tab_bankroll:
                 "Time": str(e.get("submitted_at", ""))[11:19],
                 "Bracket": e.get("bracket_label", "?"),
                 "Side": e.get("side", "?"),
-                "Shares": f"{e.get('shares', 0):.2f}",
-                "Price": f"{e.get('price', 0):.3f}",
-                "Stake": f"${e.get('usdc_stake', 0):.2f}",
-                "Edge": f"{e.get('edge', 0)*100:+.1f}pp",
+                "Shares": f"{_num(e, 'shares'):.2f}",
+                "Price": f"{_num(e, 'price'):.3f}",
+                "Stake": f"${_num(e, 'usdc_stake'):.2f}",
+                "Edge": f"{_num(e, 'edge')*100:+.1f}pp",
                 "Dry-run": "✓" if e.get("dry_run") else "",
                 "Status": e.get("status", "?"),
             })
