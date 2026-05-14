@@ -140,6 +140,7 @@ def _fleet_stats() -> list[dict]:
 fleet = _fleet_stats()
 fleet_by_station = {f["station"]: f for f in fleet}
 active_stations = [f for f in fleet if f["n_lock_dates"] > 0]
+populated_station_names = [f["station"] for f in active_stations]
 
 total_pnl = sum(f["pnl"] for f in fleet)
 total_resolved = sum(f["n_resolved"] for f in fleet)
@@ -148,12 +149,54 @@ overall_win_rate = (total_wins / total_resolved * 100) if total_resolved else 0
 latest_lock_any = max((f["latest_lock"] for f in fleet if f["latest_lock"]), default=None)
 today = date.today()
 
+
+# ─── Bankroll loaders ─────────────────────────────────────────────────────────
+
+_DATA_ROOT = Path(__file__).parent / "data"
+
+@st.cache_data(ttl=30)
+def _load_bankroll(kind: str) -> dict | None:
+    """kind = 'live' or 'dry'."""
+    path = _DATA_ROOT / ("bankroll.json" if kind == "live" else "dry_bankroll.json")
+    if not path.exists():
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+@st.cache_data(ttl=30)
+def _load_executions(station: str) -> list[dict]:
+    base = _DATA_ROOT / "executions" / f"station={station}"
+    if not base.exists():
+        return []
+    records: list[dict] = []
+    for date_dir in sorted(base.glob("date=*")):
+        d = date_dir.name.replace("date=", "")
+        for p in sorted(date_dir.glob("*.json")):
+            if p.name.startswith("_") or p.name.endswith(".tmp") or ".corrupt-" in p.name:
+                continue
+            try:
+                with open(p) as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            items = data if isinstance(data, list) else [data]
+            for it in items:
+                it = {**it, "_date": d}
+                records.append(it)
+    return records
+
+live_bankroll = _load_bankroll("live")
+dry_bankroll = _load_bankroll("dry")
+
+
 # Default station: the one with the most recent lock, else first in list
 if active_stations:
     default_station = max(active_stations, key=lambda f: f["latest_lock"] or "")["station"]
-    default_idx = STATIONS.index(default_station)
 else:
-    default_idx = 0
+    default_station = STATIONS[0]
 
 
 # ─── Sidebar ──────────────────────────────────────────────────────────────────
@@ -163,14 +206,21 @@ with st.sidebar:
     st.caption("Ensemble forecast → Polymarket edge")
     st.divider()
 
+    show_all = st.toggle(
+        "Show stations with no data", value=False,
+        help=f"{len(STATIONS) - len(populated_station_names)} of {len(STATIONS)} stations have no locks yet.",
+    )
+    station_options = STATIONS if show_all else (populated_station_names or STATIONS)
+
     def _station_label(s: str) -> str:
         f = fleet_by_station[s]
         if f["n_lock_dates"] == 0:
             return f"📍 {s}  ·  no data"
         return f"📍 {s}  ·  {f['n_lock_dates']} locks  ·  {f['pnl']:+.3f}"
 
+    default_idx = station_options.index(default_station) if default_station in station_options else 0
     station = st.selectbox(
-        "Station", STATIONS, index=default_idx,
+        "Station", station_options, index=default_idx,
         label_visibility="collapsed", format_func=_station_label,
     )
 
@@ -179,6 +229,29 @@ with st.sidebar:
         st.caption(f"Latest lock: **{f_sel['latest_lock']}** · {f_sel['n_resolved']}/{f_sel['n_lock_dates']} resolved")
     else:
         st.caption("_No picks locked for this station yet._")
+
+    # Bankroll mini-summary in the sidebar
+    if live_bankroll or dry_bankroll:
+        st.divider()
+        st.caption("**Bankroll**")
+        if live_bankroll:
+            live_pnl = live_bankroll.get("total_pnl", 0)
+            pnl_color = "#00d4aa" if live_pnl >= 0 else "#ff6b6b"
+            st.markdown(
+                f"<div style='font-size:0.85rem;color:#e6edf3;'>"
+                f"Live: <strong>${live_bankroll.get('current_usdc',0):.2f}</strong> "
+                f"<span style='color:{pnl_color};'>({live_pnl:+.2f})</span></div>",
+                unsafe_allow_html=True,
+            )
+        if dry_bankroll:
+            dry_pnl = dry_bankroll.get("total_pnl", 0)
+            pnl_color = "#00d4aa" if dry_pnl >= 0 else "#ff6b6b"
+            st.markdown(
+                f"<div style='font-size:0.85rem;color:#8b949e;'>"
+                f"Paper: <strong>${dry_bankroll.get('current_usdc',0):.2f}</strong> "
+                f"<span style='color:{pnl_color};'>({dry_pnl:+.2f})</span></div>",
+                unsafe_allow_html=True,
+            )
 
     st.divider()
     auto_refresh = st.toggle("Auto-refresh (60s)", value=False)
@@ -194,34 +267,43 @@ with st.sidebar:
 
 # ─── Page header ──────────────────────────────────────────────────────────────
 
-col_h1, col_h2, col_h3, col_h4 = st.columns([3, 2, 2, 2])
+def _hdr_metric(label: str, value: str, value_color: str = "#e6edf3") -> str:
+    return (
+        f'<div style="text-align:right;padding-top:24px;">'
+        f'<div style="font-size:0.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em;">{label}</div>'
+        f'<div style="font-size:1.4rem;font-weight:700;color:{value_color};">{value}</div>'
+        f'</div>'
+    )
+
+col_h1, col_h2, col_h3, col_h4, col_h5 = st.columns([2.5, 2, 2, 2, 2])
 with col_h1:
     st.markdown(f"# {station}")
 with col_h2:
-    pnl_color = "#00d4aa" if total_pnl >= 0 else "#ff6b6b"
-    st.markdown(
-        f'<div style="text-align:right;padding-top:24px;">'
-        f'<div style="font-size:0.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em;">Fleet P&L</div>'
-        f'<div style="font-size:1.4rem;font-weight:700;color:{pnl_color};">{total_pnl:+.4f}</div>'
-        f'</div>', unsafe_allow_html=True)
+    if live_bankroll:
+        bk_pnl = live_bankroll.get("total_pnl", 0)
+        bk_color = "#00d4aa" if bk_pnl >= 0 else "#ff6b6b"
+        st.markdown(_hdr_metric("Bankroll", f"${live_bankroll.get('current_usdc', 0):.2f}", bk_color),
+                    unsafe_allow_html=True)
+    elif dry_bankroll:
+        st.markdown(_hdr_metric("Paper bankroll", f"${dry_bankroll.get('current_usdc', 0):.2f}"),
+                    unsafe_allow_html=True)
+    else:
+        st.markdown(_hdr_metric("Bankroll", "—"), unsafe_allow_html=True)
 with col_h3:
-    st.markdown(
-        f'<div style="text-align:right;padding-top:24px;">'
-        f'<div style="font-size:0.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em;">Win rate</div>'
-        f'<div style="font-size:1.4rem;font-weight:700;color:#e6edf3;">{overall_win_rate:.0f}%</div>'
-        f'</div>', unsafe_allow_html=True)
+    pnl_color = "#00d4aa" if total_pnl >= 0 else "#ff6b6b"
+    st.markdown(_hdr_metric("Fleet P&L", f"{total_pnl:+.4f}", pnl_color), unsafe_allow_html=True)
 with col_h4:
-    st.markdown(
-        f'<div style="text-align:right;padding-top:24px;">'
-        f'<div style="font-size:0.7rem;color:#8b949e;text-transform:uppercase;letter-spacing:0.05em;">Latest lock</div>'
-        f'<div style="font-size:1.4rem;font-weight:700;color:#e6edf3;">{latest_lock_any or "—"}</div>'
-        f'</div>', unsafe_allow_html=True)
+    st.markdown(_hdr_metric("Win rate", f"{overall_win_rate:.0f}%"), unsafe_allow_html=True)
+with col_h5:
+    st.markdown(_hdr_metric("Latest lock", latest_lock_any or "—"), unsafe_allow_html=True)
 
 
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
 
-tab_overview, tab_today, tab_history, tab_data, tab_model, tab_calibration = st.tabs(
-    ["🛰 Fleet", "🎯 Today", "📈 History", "🗄 Data", "🔬 Model", "📐 Calibration"]
+(tab_overview, tab_today, tab_market, tab_bankroll, tab_history,
+ tab_data, tab_model, tab_calibration) = st.tabs(
+    ["🛰 Fleet", "🎯 Today", "📊 Market", "💰 Bankroll", "📈 History",
+     "🗄 Data", "🔬 Model", "📐 Calibration"]
 )
 
 
@@ -322,9 +404,31 @@ with tab_today:
         # Metrics row
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Forecast μ", f"{mu:.2f}°C")
-        c2.metric("Forecast σ", f"{sigma:.2f}°C")
+        sigma_delta = None
+        prov = picks_data.get("provenance", {})
+        if prov.get("sigma_floored"):
+            sigma_delta = f"floored from {prov.get('sigma_raw', 0):.2f}"
+        c2.metric("Forecast σ", f"{sigma:.2f}°C", delta=sigma_delta, delta_color="off")
         c3.metric("Ensemble size", str(ensemble_size))
         c4.metric("Picks found", str(len(picks)))
+
+        # Per-model breakdown: members + BMA weights if available
+        model_members = {m: prov.get(f"{m}_members") for m in ("ecmwf", "gefs", "icon", "weathernext")}
+        active_models = {m: n for m, n in model_members.items() if n}
+        bma_weights = prov.get("bma_weights", {})
+        if active_models:
+            st.markdown('<div class="section-header">Model contributions</div>', unsafe_allow_html=True)
+            model_cols = st.columns(len(active_models))
+            for (m, n), col in zip(active_models.items(), model_cols):
+                w = bma_weights.get(m)
+                weight_str = f"weight {w:.2f}" if w is not None else "no BMA"
+                col.metric(m.upper(), f"{n} members", delta=weight_str, delta_color="off")
+            if mode == "bma" and bma_weights:
+                st.caption(f"BMA weights derived from rolling per-model CRPS — sum={sum(bma_weights.values()):.2f}")
+            elif mode == "qrf":
+                st.caption(f"QRF trained on {prov.get('qrf_n_train','?')} samples (per-model EMOS bypassed)")
+            elif mode == "pooled":
+                st.caption(f"Pooled EMOS · n={prov.get('emos_n_samples','?')} · train CRPS={prov.get('emos_train_crps',0):.4f}")
 
         # Pick cards
         if picks:
@@ -430,6 +534,150 @@ with tab_today:
                 yaxis=dict(title="Probability (%)"),
             ))
             st.plotly_chart(fig, use_container_width=True, config=PLOT_CONFIG)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKET TAB — live Polymarket snapshot for selected station + date
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_market:
+    m_lock_dates = [date.fromisoformat(d) for d in fleet_by_station[station]["lock_dates"]]
+    m_default = m_lock_dates[-1] if m_lock_dates else today
+
+    col_m1, col_m2 = st.columns([2, 5])
+    with col_m1:
+        market_date = st.date_input(
+            "Market date", value=m_default,
+            label_visibility="collapsed", key="market_date",
+        )
+
+    snap_dir = _DATA_ROOT / "market_snapshots" / f"station={station}" / f"date={market_date}"
+    snaps: list = []
+    if snap_dir.exists():
+        snaps = sorted(p for p in snap_dir.glob("*.json")
+                       if not p.name.endswith(".tmp") and ".corrupt-" not in p.name)
+
+    if not snaps:
+        st.markdown(f"""
+        <div style="background:#161b22;border:1px dashed #30363d;border-radius:10px;
+                    padding:32px;text-align:center;color:#8b949e;margin:20px 0;">
+            <div style="font-size:2rem;margin-bottom:8px;">📭</div>
+            <div style="font-weight:600;">No market snapshots for {market_date}</div>
+            <div style="font-size:0.85rem;margin-top:6px;">
+                Snapshots are written during <code>we lock</code> and <code>we scheduler</code>.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        with col_m2:
+            st.caption(f"{len(snaps)} snapshot(s) recorded · latest at **{snaps[-1].stem[:8]} {snaps[-1].stem[9:11]}:{snaps[-1].stem[11:13]}**z")
+
+        with open(snaps[-1]) as f:
+            snap = json.load(f)
+        outcomes = snap.get("outcomes", [])
+
+        c1, c2, c3 = st.columns(3)
+        total_liq = sum(o.get("liquidity", 0) for o in outcomes)
+        avg_spread = sum(o.get("spread", o.get("ask", 0) - o.get("bid", 0)) for o in outcomes) / max(len(outcomes), 1)
+        c1.metric("Brackets", len(outcomes))
+        c2.metric("Total liquidity", f"${total_liq:,.0f}")
+        c3.metric("Avg spread", f"{avg_spread:.3f}")
+
+        rows = []
+        for o in outcomes:
+            bid = o.get("bid", 0)
+            ask = o.get("ask", 0)
+            mid = o.get("mid", (bid + ask) / 2 if (bid or ask) else 0)
+            rows.append({
+                "Bracket": o.get("label", "?"),
+                "Bid": f"{bid:.3f}",
+                "Mid": f"{mid:.3f}",
+                "Ask": f"{ask:.3f}",
+                "Spread": f"{(ask - bid):.3f}",
+                "Liquidity": f"${o.get('liquidity', 0):,.0f}",
+                "Implied %": f"{mid*100:.1f}%",
+            })
+        st.markdown('<div class="section-header">Order book mids</div>', unsafe_allow_html=True)
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        # Bid/ask chart per bracket
+        if outcomes:
+            import plotly.graph_objects as go
+            labels = [o.get("label", "?") for o in outcomes]
+            mids = [o.get("mid", 0) * 100 for o in outcomes]
+            bids = [o.get("bid", 0) * 100 for o in outcomes]
+            asks = [o.get("ask", 0) * 100 for o in outcomes]
+            fig = go.Figure()
+            fig.add_bar(name="Bid", x=labels, y=bids, marker_color="#58a6ff", opacity=0.6)
+            fig.add_bar(name="Ask", x=labels, y=asks, marker_color="#e3b341", opacity=0.6)
+            fig.add_scatter(name="Mid", x=labels, y=mids,
+                            mode="markers", marker=dict(size=10, color="#00d4aa", symbol="diamond"))
+            fig.update_layout(**_layout(
+                height=380, barmode="group",
+                xaxis=dict(title="Bracket", tickangle=-30),
+                yaxis=dict(title="Price (¢ per share)"),
+            ))
+            st.plotly_chart(fig, use_container_width=True, config=PLOT_CONFIG)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BANKROLL TAB — live + dry-run bankroll, recent executions
+# ══════════════════════════════════════════════════════════════════════════════
+
+with tab_bankroll:
+    if not live_bankroll and not dry_bankroll:
+        st.markdown("""
+        <div style="background:#161b22;border:1px dashed #30363d;border-radius:10px;
+                    padding:32px;text-align:center;color:#8b949e;margin:20px 0;">
+            <div style="font-size:2rem;margin-bottom:8px;">💰</div>
+            <div style="font-weight:600;">No bankroll initialised</div>
+            <div style="font-size:0.85rem;margin-top:6px;">
+                Run <code>we init-bankroll --usdc &lt;amount&gt;</code> to seed the live bankroll.
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        for label, bk, accent in (("Live", live_bankroll, "#00d4aa"), ("Paper (dry-run)", dry_bankroll, "#58a6ff")):
+            if not bk:
+                continue
+            st.markdown(f'<div class="section-header">{label}</div>', unsafe_allow_html=True)
+            initial = bk.get("initial_usdc", 0)
+            current = bk.get("current_usdc", 0)
+            reserved = bk.get("reserved_usdc", 0)
+            pnl = bk.get("total_pnl", 0)
+            n_trades = bk.get("n_trades", 0)
+            pnl_pct = (pnl / initial * 100) if initial else 0
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Initial", f"${initial:.2f}")
+            c2.metric("Current", f"${current:.2f}", delta=f"{pnl_pct:+.1f}%", delta_color="normal")
+            c3.metric("Reserved", f"${reserved:.2f}")
+            c4.metric("Total P&L", f"${pnl:+.2f}")
+            c5.metric("Trades", str(n_trades))
+            last_updated = bk.get("last_updated", "?")
+            st.caption(f"Last updated: {str(last_updated)[:19].replace('T', ' ')} UTC")
+
+    st.markdown('<div class="section-header">Recent executions</div>', unsafe_allow_html=True)
+    execs = _load_executions(station)
+    if not execs:
+        st.info(f"No executions recorded for {station}.")
+    else:
+        rows = []
+        for e in reversed(execs[-50:]):
+            rows.append({
+                "Date": e.get("_date", "?"),
+                "Time": str(e.get("submitted_at", ""))[11:19],
+                "Bracket": e.get("bracket_label", "?"),
+                "Side": e.get("side", "?"),
+                "Shares": f"{e.get('shares', 0):.2f}",
+                "Price": f"{e.get('price', 0):.3f}",
+                "Stake": f"${e.get('usdc_stake', 0):.2f}",
+                "Edge": f"{e.get('edge', 0)*100:+.1f}pp",
+                "Dry-run": "✓" if e.get("dry_run") else "",
+                "Status": e.get("status", "?"),
+            })
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.caption(f"Showing latest {len(rows)} of {len(execs)} total")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
