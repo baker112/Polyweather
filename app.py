@@ -75,6 +75,45 @@ from weather_edge.store import parquet as store
 
 STATIONS = ["EGLC", "EGLL", "EHAM", "EDDF", "LFPB", "KJFK", "KLAX", "KORD", "KMIA"]
 
+# ─── Plotly defaults (consistent across every chart) ──────────────────────────
+
+PLOT_BG = "#0d1117"
+GRID = "#21262d"
+TEXT = "#e6edf3"
+MUTED = "#8b949e"
+
+PLOT_CONFIG = {
+    "displayModeBar": False,
+    "responsive": True,
+    "staticPlot": False,
+}
+
+def _layout(height: int = 360, **overrides):
+    """Shared layout: dark theme, automargin, no toolbar, room for legend."""
+    base = dict(
+        plot_bgcolor=PLOT_BG,
+        paper_bgcolor=PLOT_BG,
+        font=dict(color=TEXT, size=12),
+        xaxis=dict(gridcolor=GRID, automargin=True, tickfont=dict(size=11)),
+        yaxis=dict(gridcolor=GRID, automargin=True, tickfont=dict(size=11)),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom", y=1.02,
+            xanchor="right", x=1,
+            bgcolor="rgba(0,0,0,0)",
+            font=dict(size=11),
+        ),
+        height=height,
+        margin=dict(l=10, r=10, t=40, b=10),
+        hoverlabel=dict(bgcolor="#161b22", font=dict(color=TEXT)),
+    )
+    for k, v in overrides.items():
+        if k in ("xaxis", "yaxis") and isinstance(v, dict):
+            base[k] = {**base[k], **v}
+        else:
+            base[k] = v
+    return base
+
 # ─── Fleet stats (computed once, used by sidebar + overview tab) ──────────────
 
 @st.cache_data(ttl=60)
@@ -383,18 +422,14 @@ with tab_today:
                 line=dict(color="#00d4aa", width=2, dash="dot"),
             )
 
-            fig.update_layout(
+            fig.update_layout(**_layout(
+                height=420,
                 barmode="group",
-                plot_bgcolor="#0d1117",
-                paper_bgcolor="#0d1117",
-                font=dict(color="#e6edf3"),
-                xaxis=dict(gridcolor="#21262d", title="Bracket"),
-                yaxis=dict(gridcolor="#21262d", title="Probability (%)"),
-                legend=dict(orientation="h", bgcolor="rgba(0,0,0,0)"),
-                height=380,
-                margin=dict(l=0, r=0, t=10, b=0),
-            )
-            st.plotly_chart(fig, use_container_width=True)
+                bargap=0.15,
+                xaxis=dict(title="Bracket", tickangle=-30),
+                yaxis=dict(title="Probability (%)"),
+            ))
+            st.plotly_chart(fig, use_container_width=True, config=PLOT_CONFIG)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -447,15 +482,12 @@ with tab_history:
             line=dict(color="#e3b341", width=2),
             marker=dict(size=6),
         )
-        fig.update_layout(
-            plot_bgcolor="#0d1117", paper_bgcolor="#0d1117",
-            font=dict(color="#e6edf3"),
-            xaxis=dict(gridcolor="#21262d"),
-            yaxis=dict(gridcolor="#21262d", title="P&L per unit"),
-            legend=dict(orientation="h", bgcolor="rgba(0,0,0,0)"),
-            height=320, margin=dict(l=0, r=0, t=10, b=0),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(**_layout(
+            height=380,
+            xaxis=dict(title="Date", tickangle=-30, type="category"),
+            yaxis=dict(title="P&L per unit"),
+        ))
+        st.plotly_chart(fig, use_container_width=True, config=PLOT_CONFIG)
 
         st.markdown('<div class="section-header">Pick History</div>', unsafe_allow_html=True)
         rows = []
@@ -524,15 +556,13 @@ with tab_data:
             line=dict(color="#00d4aa", width=1.5),
             name="Daily max °C",
         ))
-        fig.update_layout(
-            plot_bgcolor="#0d1117", paper_bgcolor="#0d1117",
-            font=dict(color="#e6edf3"),
-            xaxis=dict(gridcolor="#21262d"),
-            yaxis=dict(gridcolor="#21262d", title="Temp (°C)"),
-            height=260, margin=dict(l=0, r=0, t=10, b=0),
+        fig.update_layout(**_layout(
+            height=320,
+            xaxis=dict(title="Date"),
+            yaxis=dict(title="Temp (°C)"),
             showlegend=False,
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        ))
+        st.plotly_chart(fig, use_container_width=True, config=PLOT_CONFIG)
 
     st.markdown('<div class="section-header">Forecast Cache</div>', unsafe_allow_html=True)
     fc_base = Path("data/forecasts")
@@ -657,15 +687,12 @@ with tab_calibration:
         fig.add_scatter(x=bin_centers.tolist(), y=obs_freq, mode="markers+lines",
                         name="Observed", marker=dict(size=8, color="#00d4aa"),
                         line=dict(color="#00d4aa", width=2))
-        fig.update_layout(
-            plot_bgcolor="#0d1117", paper_bgcolor="#0d1117",
-            font=dict(color="#e6edf3"),
-            xaxis=dict(gridcolor="#21262d", range=[0, 1], title="Forecast probability"),
-            yaxis=dict(gridcolor="#21262d", range=[0, 1], title="Observed frequency"),
-            height=300, margin=dict(l=0, r=0, t=10, b=0),
-            legend=dict(bgcolor="rgba(0,0,0,0)"),
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(**_layout(
+            height=380,
+            xaxis=dict(range=[0, 1], title="Forecast probability"),
+            yaxis=dict(range=[0, 1], title="Observed frequency"),
+        ))
+        st.plotly_chart(fig, use_container_width=True, config=PLOT_CONFIG)
         st.caption(f"{len(calibration_rows)} bracket-outcome pairs")
     else:
         st.info(f"Need ≥5 resolved picks for reliability diagram — have {len(calibration_rows)}.")
@@ -680,15 +707,13 @@ with tab_calibration:
         expected = len(pit_values) / 10
         fig.add_hline(y=expected, line_dash="dash", line_color="#30363d",
                       annotation_text="Uniform", annotation_font_color="#8b949e")
-        fig.update_layout(
-            plot_bgcolor="#0d1117", paper_bgcolor="#0d1117",
-            font=dict(color="#e6edf3"),
-            xaxis=dict(gridcolor="#21262d", title="PIT value"),
-            yaxis=dict(gridcolor="#21262d", title="Count"),
-            height=260, margin=dict(l=0, r=0, t=10, b=0),
+        fig.update_layout(**_layout(
+            height=320,
+            xaxis=dict(title="PIT value"),
+            yaxis=dict(title="Count"),
             showlegend=False,
-        )
-        st.plotly_chart(fig, use_container_width=True)
+        ))
+        st.plotly_chart(fig, use_container_width=True, config=PLOT_CONFIG)
         st.caption(f"{len(pit_values)} resolved lock dates")
     else:
         st.info(f"Need ≥5 resolved dates for PIT histogram — have {len(pit_values)}.")
