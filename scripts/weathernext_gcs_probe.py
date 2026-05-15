@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from typing import Any
 
 
 def main() -> None:
@@ -97,12 +98,22 @@ def main() -> None:
         sys.exit(1)
 
 
-def _list_and_probe(uri: str) -> None:
-    """Walk the bucket prefix, find candidate Zarr stores, and open one.
+_SENTINELS = (".zmetadata", ".zgroup", "zarr.json")
 
-    Identifies a Zarr store by the presence of a `.zgroup` / `.zarray` / `zarr.json`
-    marker. Prints the first 50 top-level prefixes and tries to open the first
-    candidate it finds so we can confirm the dim names.
+
+def _find_zarr_marker(fs: Any, prefix: str) -> str | None:
+    for s in _SENTINELS:
+        if fs.exists(f"{prefix}/{s}"):
+            return s
+    return None
+
+
+def _list_and_probe(uri: str) -> None:
+    """Walk the bucket prefix to depth 2, find Zarr stores, and open one.
+
+    Identifies a Zarr store by the presence of a `.zgroup` / `.zmetadata` /
+    `zarr.json` marker. Prints what it finds and tries to open the first
+    candidate it sees so we can confirm dim/var names.
     """
     import gcsfs
     import xarray as xr
@@ -117,36 +128,46 @@ def _list_and_probe(uri: str) -> None:
         print(f"  Cannot list bucket: {exc}")
         return
 
-    print(f"  Found {len(entries)} top-level entries. First 50:")
-    for e in entries[:50]:
-        marker = ""
-        # Cheap check: is this prefix itself a Zarr store?
-        for sentinel in (".zgroup", ".zmetadata", "zarr.json"):
-            if fs.exists(f"{e}/{sentinel}"):
-                marker = f"  ← Zarr store ({sentinel})"
-                break
-        print(f"    gs://{e}{marker}")
+    candidates: list[tuple[str, str]] = []  # (prefix, sentinel)
+    for top in entries:
+        if top.rstrip("/") == bucket_path:
+            continue  # the bucket path itself shows up; skip
+        marker = _find_zarr_marker(fs, top)
+        suffix = f"  ← Zarr store ({marker})" if marker else ""
+        print(f"    gs://{top}{suffix}")
+        if marker:
+            candidates.append((top, marker))
 
-    # Find the first Zarr store and try to open it.
-    candidates = []
-    for e in entries:
-        for sentinel in (".zmetadata", ".zgroup", "zarr.json"):
-            if fs.exists(f"{e}/{sentinel}"):
-                candidates.append((e, sentinel))
-                break
+    # Drill one level deeper into any non-Zarr top-level prefixes.
+    deeper = [t for t in entries if t.rstrip("/") != bucket_path and not _find_zarr_marker(fs, t)]
+    for sub in deeper:
+        print(f"  ls gs://{sub}/")
+        try:
+            sub_entries = fs.ls(sub, detail=False)
+        except Exception as exc:
+            print(f"    (skip — {exc})")
+            continue
+        # Show the first 30 to keep output bounded.
+        for child in sub_entries[:30]:
+            if child.rstrip("/") == sub.rstrip("/"):
+                continue
+            marker = _find_zarr_marker(fs, child)
+            suffix = f"  ← Zarr store ({marker})" if marker else ""
+            print(f"    gs://{child}{suffix}")
+            if marker:
+                candidates.append((child, marker))
+        if len(sub_entries) > 30:
+            print(f"    … and {len(sub_entries) - 30} more")
 
     if not candidates:
         print()
-        print("  No Zarr store markers at the top level.")
-        print("  Try one level deeper. Examples to inspect manually:")
-        for e in entries[:5]:
-            print(f"    gsutil ls gs://{e}/")
+        print("  No Zarr store markers found within depth 2.")
         return
 
     target, sentinel = candidates[0]
     target_uri = f"gs://{target}/"
     print()
-    print(f"  Opening first candidate: {target_uri} (marker: {sentinel})")
+    print(f"  Found {len(candidates)} Zarr store(s). Opening first: {target_uri}")
     try:
         consolidated = sentinel == ".zmetadata"
         ds = xr.open_zarr(target_uri, consolidated=consolidated, chunks={})
@@ -154,12 +175,14 @@ def _list_and_probe(uri: str) -> None:
         print(f"  Open failed: {exc}")
         return
     print()
-    print(f"  ✓ Opened. Total candidate stores: {len(candidates)}.")
     print(f"  Dims  : {dict(ds.dims)}")
     print(f"  Vars  : {list(ds.data_vars)}")
     print(f"  Coords: {list(ds.coords)}")
+    if "2m_temperature" in ds.data_vars or "t2m" in ds.data_vars:
+        t2m = "2m_temperature" if "2m_temperature" in ds.data_vars else "t2m"
+        print(f"  {t2m} units: {ds[t2m].attrs.get('units', '?')}  shape: {ds[t2m].shape}")
     print()
-    print(f"  Re-run probe against the actual store:")
+    print("  Re-run probe against the actual store:")
     print(f"    python scripts/weathernext_gcs_probe.py --uri {target_uri}")
 
 
