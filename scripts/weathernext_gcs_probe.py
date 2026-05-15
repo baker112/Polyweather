@@ -26,7 +26,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--uri",
-        default=os.getenv("WEATHERNEXT_GCS_URI", "gs://weathernext/weathernext_2_0_0/"),
+        default=os.getenv("WEATHERNEXT_GCS_URI", "gs://weathernext/weathernext_2_0_0/zarr/"),
     )
     args = parser.parse_args()
 
@@ -99,6 +99,16 @@ def main() -> None:
 
 
 _SENTINELS = (".zmetadata", ".zgroup", "zarr.json")
+# Subdir names we never want to recurse into — they aren't Zarr stores and can
+# hold huge trees (e.g. Earth Engine asset listings) that hang `ls`.
+_SKIP_NAMES = ("ee_assets",)
+# Hard cap on how many entries to enumerate under any one prefix. Keeps the
+# probe responsive on directories that contain thousands of per-init zarrs.
+_MAX_ENTRIES_PER_PREFIX = 200
+
+
+def _basename(path: str) -> str:
+    return path.rstrip("/").rsplit("/", 1)[-1]
 
 
 def _find_zarr_marker(fs: Any, prefix: str) -> str | None:
@@ -129,17 +139,28 @@ def _list_and_probe(uri: str) -> None:
         return
 
     candidates: list[tuple[str, str]] = []  # (prefix, sentinel)
+    skipped_top: list[str] = []
     for top in entries:
         if top.rstrip("/") == bucket_path:
             continue  # the bucket path itself shows up; skip
+        name = _basename(top)
+        if name in _SKIP_NAMES:
+            skipped_top.append(top)
+            print(f"    gs://{top}  (skipping — known non-Zarr prefix)")
+            continue
         marker = _find_zarr_marker(fs, top)
         suffix = f"  ← Zarr store ({marker})" if marker else ""
         print(f"    gs://{top}{suffix}")
         if marker:
             candidates.append((top, marker))
 
-    # Drill one level deeper into any non-Zarr top-level prefixes.
-    deeper = [t for t in entries if t.rstrip("/") != bucket_path and not _find_zarr_marker(fs, t)]
+    # Drill one level deeper into any non-Zarr top-level prefixes (excluding skips).
+    deeper = [
+        t for t in entries
+        if t.rstrip("/") != bucket_path
+        and _basename(t) not in _SKIP_NAMES
+        and not _find_zarr_marker(fs, t)
+    ]
     for sub in deeper:
         print(f"  ls gs://{sub}/")
         try:
@@ -147,8 +168,9 @@ def _list_and_probe(uri: str) -> None:
         except Exception as exc:
             print(f"    (skip — {exc})")
             continue
-        # Show the first 30 to keep output bounded.
-        for child in sub_entries[:30]:
+        if len(sub_entries) > _MAX_ENTRIES_PER_PREFIX:
+            print(f"    (large prefix — {len(sub_entries)} entries; showing first {_MAX_ENTRIES_PER_PREFIX})")
+        for child in sub_entries[:_MAX_ENTRIES_PER_PREFIX]:
             if child.rstrip("/") == sub.rstrip("/"):
                 continue
             marker = _find_zarr_marker(fs, child)
@@ -156,8 +178,8 @@ def _list_and_probe(uri: str) -> None:
             print(f"    gs://{child}{suffix}")
             if marker:
                 candidates.append((child, marker))
-        if len(sub_entries) > 30:
-            print(f"    … and {len(sub_entries) - 30} more")
+        if len(sub_entries) > _MAX_ENTRIES_PER_PREFIX:
+            print(f"    … and {len(sub_entries) - _MAX_ENTRIES_PER_PREFIX} more")
 
     if not candidates:
         print()
