@@ -43,7 +43,11 @@ def main() -> None:
     try:
         ds = xr.open_zarr(args.uri, consolidated=True, chunks={})
     except Exception as exc:
-        sys.exit(f"FAIL: {exc}")
+        print(f"Root open failed: {exc}")
+        print()
+        print("Listing bucket contents to find actual Zarr store paths…")
+        _list_and_probe(args.uri)
+        sys.exit(1)
 
     print()
     print("=== Dimensions ===")
@@ -91,6 +95,72 @@ def main() -> None:
         print("✗ Backend constants need editing in src/weather_edge/ingest/weathernext.py")
         print("  Look for _pick_dim/_pick_var calls in _gcs_query_and_reduce.")
         sys.exit(1)
+
+
+def _list_and_probe(uri: str) -> None:
+    """Walk the bucket prefix, find candidate Zarr stores, and open one.
+
+    Identifies a Zarr store by the presence of a `.zgroup` / `.zarray` / `zarr.json`
+    marker. Prints the first 50 top-level prefixes and tries to open the first
+    candidate it finds so we can confirm the dim names.
+    """
+    import gcsfs
+    import xarray as xr
+
+    fs = gcsfs.GCSFileSystem()
+    bucket_path = uri.replace("gs://", "").rstrip("/")
+
+    print(f"  ls {uri}")
+    try:
+        entries = fs.ls(bucket_path, detail=False)
+    except Exception as exc:
+        print(f"  Cannot list bucket: {exc}")
+        return
+
+    print(f"  Found {len(entries)} top-level entries. First 50:")
+    for e in entries[:50]:
+        marker = ""
+        # Cheap check: is this prefix itself a Zarr store?
+        for sentinel in (".zgroup", ".zmetadata", "zarr.json"):
+            if fs.exists(f"{e}/{sentinel}"):
+                marker = f"  ← Zarr store ({sentinel})"
+                break
+        print(f"    gs://{e}{marker}")
+
+    # Find the first Zarr store and try to open it.
+    candidates = []
+    for e in entries:
+        for sentinel in (".zmetadata", ".zgroup", "zarr.json"):
+            if fs.exists(f"{e}/{sentinel}"):
+                candidates.append((e, sentinel))
+                break
+
+    if not candidates:
+        print()
+        print("  No Zarr store markers at the top level.")
+        print("  Try one level deeper. Examples to inspect manually:")
+        for e in entries[:5]:
+            print(f"    gsutil ls gs://{e}/")
+        return
+
+    target, sentinel = candidates[0]
+    target_uri = f"gs://{target}/"
+    print()
+    print(f"  Opening first candidate: {target_uri} (marker: {sentinel})")
+    try:
+        consolidated = sentinel == ".zmetadata"
+        ds = xr.open_zarr(target_uri, consolidated=consolidated, chunks={})
+    except Exception as exc:
+        print(f"  Open failed: {exc}")
+        return
+    print()
+    print(f"  ✓ Opened. Total candidate stores: {len(candidates)}.")
+    print(f"  Dims  : {dict(ds.dims)}")
+    print(f"  Vars  : {list(ds.data_vars)}")
+    print(f"  Coords: {list(ds.coords)}")
+    print()
+    print(f"  Re-run probe against the actual store:")
+    print(f"    python scripts/weathernext_gcs_probe.py --uri {target_uri}")
 
 
 if __name__ == "__main__":
