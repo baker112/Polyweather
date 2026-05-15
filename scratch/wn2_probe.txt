@@ -1,66 +1,249 @@
-Opening Zarr: gs://weathernext/weathernext_2_0_0/
-Root open failed: No group found in store 'gs://weathernext/weathernext_2_0_0/' at path ''
+Opening Zarr: gs://weathernext/weathernext_2_0_0/zarr/
+Root open failed: No group found in store 'gs://weathernext/weathernext_2_0_0/zarr/' at path ''
 
 Listing bucket contents to find actual Zarr store paths…
-  ls gs://weathernext/weathernext_2_0_0/
-    gs://weathernext/weathernext_2_0_0/ee_assets
-    gs://weathernext/weathernext_2_0_0/zarr
-  ls gs://weathernext/weathernext_2_0_0/ee_assets/
+  ls gs://weathernext/weathernext_2_0_0/zarr/
+    gs://weathernext/weathernext_2_0_0/zarr/2022_to_2023
+    gs://weathernext/weathernext_2_0_0/zarr/2023_to_2024
+    gs://weathernext/weathernext_2_0_0/zarr/2024_to_2025
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present
+    gs://weathernext/weathernext_2_0_0/zarr/weathernext_2_0_0_file_structure.pdf
+  ls gs://weathernext/weathernext_2_0_0/zarr/2022_to_2023/
+    gs://weathernext/weathernext_2_0_0/zarr/2022_to_2023/predictions.zarr  ← Zarr store (.zmetadata)
+    gs://weathernext/weathernext_2_0_0/zarr/2022_to_2023/success
+  ls gs://weathernext/weathernext_2_0_0/zarr/2023_to_2024/
+    gs://weathernext/weathernext_2_0_0/zarr/2023_to_2024/predictions.zarr  ← Zarr store (.zmetadata)
+    gs://weathernext/weathernext_2_0_0/zarr/2023_to_2024/success
+  ls gs://weathernext/weathernext_2_0_0/zarr/2024_to_2025/
+    gs://weathernext/weathernext_2_0_0/zarr/2024_to_2025/predictions.zarr  ← Zarr store (.zmetadata)
+    gs://weathernext/weathernext_2_0_0/zarr/2024_to_2025/success
+  ls gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/
+    (large prefix — 1998 entries; showing first 200)
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250101_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250101_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250101_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250101_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250102_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250102_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250102_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250102_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250103_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250103_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250103_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250103_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250104_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250104_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250104_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250104_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250105_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250105_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250105_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250105_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250106_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250106_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250106_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250106_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250107_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250107_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250107_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250107_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250108_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250108_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250108_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250108_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250109_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250109_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250109_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250109_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250110_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250110_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250110_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250110_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250111_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250111_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250111_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250111_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250112_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250112_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250112_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250112_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250113_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250113_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250113_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250113_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250114_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250114_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250114_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250114_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250115_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250115_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250115_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250115_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250116_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250116_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250116_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250116_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250117_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250117_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250117_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250117_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250118_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250118_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250118_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250118_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250119_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250119_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250119_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250119_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250120_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250120_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250120_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250120_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250121_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250121_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250121_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250121_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250122_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250122_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250122_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250122_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250123_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250123_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250123_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250123_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250124_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250124_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250124_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250124_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250125_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250125_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250125_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250125_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250126_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250126_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250126_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250126_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250127_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250127_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250127_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250127_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250128_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250128_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250128_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250128_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250129_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250129_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250129_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250129_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250130_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250130_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250130_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250130_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250131_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250131_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250131_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250131_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250201_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250201_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250201_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250201_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250202_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250202_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250202_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250202_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250203_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250203_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250203_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250203_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250204_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250204_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250204_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250204_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250205_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250205_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250205_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250205_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250206_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250206_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250206_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250206_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250207_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250207_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250207_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250207_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250208_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250208_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250208_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250208_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250209_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250209_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250209_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250209_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250210_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250210_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250210_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250210_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250211_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250211_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250211_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250211_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250212_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250212_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250212_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250212_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250213_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250213_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250213_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250213_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250214_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250214_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250214_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250214_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250215_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250215_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250215_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250215_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250216_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250216_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250216_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250216_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250217_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250217_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250217_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250217_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250218_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250218_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250218_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250218_18hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250219_00hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250219_06hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250219_12hr_01_preds
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250219_18hr_01_preds
+    … and 1798 more
+  ls gs://weathernext/weathernext_2_0_0/zarr/weathernext_2_0_0_file_structure.pdf/
+
+  Found 3 Zarr store(s). Opening first: gs://weathernext/weathernext_2_0_0/zarr/2022_to_2023/predictions.zarr/
+  Open failed: chunk manager 'dask' is not available. Please make sure 'dask' is installed and importable.
 Traceback (most recent call last):
-  File "/home/ohbaker1/Polyweather/scripts/weathernext_gcs_probe.py", line 45, in main
-    ds = xr.open_zarr(args.uri, consolidated=True, chunks={})
-         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/xarray/backends/zarr.py", line 1658, in open_zarr
-    ds = open_dataset(
-         ^^^^^^^^^^^^^
-  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/xarray/backends/api.py", line 607, in open_dataset
-    backend_ds = backend.open_dataset(
-                 ^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/xarray/backends/zarr.py", line 1732, in open_dataset
-    store = ZarrStore.open_group(
-            ^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/xarray/backends/zarr.py", line 771, in open_group
-    ) = _get_open_params(
-        ^^^^^^^^^^^^^^^^^
-  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/xarray/backends/zarr.py", line 1936, in _get_open_params
-    zarr_root_group = zarr.open_consolidated(store, **open_kwargs)
-                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/zarr/api/synchronous.py", line 234, in open_consolidated
-    sync(async_api.open_consolidated(*args, use_consolidated=use_consolidated, **kwargs))
-  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/zarr/core/sync.py", line 158, in sync
+  File "/usr/lib/python3.12/weakref.py", line 666, in _exitfunc
+    f()
+  File "/usr/lib/python3.12/weakref.py", line 590, in __call__
+    return info.func(*info.args, **(info.kwargs or {}))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/gcsfs/core.py", line 406, in close_session
+    asyn.sync(asyn.loop[0], session.close, timeout=0.1)
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/fsspec/asyn.py", line 103, in sync
     raise return_result
-  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/zarr/core/sync.py", line 118, in _runner
-    return await coro
-           ^^^^^^^^^^
-  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/zarr/api/asynchronous.py", line 396, in open_consolidated
-    return await open_group(*args, use_consolidated=use_consolidated, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/zarr/api/asynchronous.py", line 846, in open_group
-    raise GroupNotFoundError(msg)
-zarr.errors.GroupNotFoundError: No group found in store 'gs://weathernext/weathernext_2_0_0/' at path ''
-
-During handling of the above exception, another exception occurred:
-
-Traceback (most recent call last):
-  File "/home/ohbaker1/Polyweather/scripts/weathernext_gcs_probe.py", line 190, in <module>
-    main()
-  File "/home/ohbaker1/Polyweather/scripts/weathernext_gcs_probe.py", line 50, in main
-    _list_and_probe(args.uri)
-  File "/home/ohbaker1/Polyweather/scripts/weathernext_gcs_probe.py", line 146, in _list_and_probe
-    sub_entries = fs.ls(sub, detail=False)
-                  ^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/fsspec/asyn.py", line 118, in wrapper
-    return sync(self.loop, func, *args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/fsspec/asyn.py", line 91, in sync
-    if event.wait(1):
-       ^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/threading.py", line 655, in wait
-    signaled = self._cond.wait(timeout)
-               ^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/usr/lib/python3.12/threading.py", line 359, in wait
-    gotit = waiter.acquire(True, timeout)
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-KeyboardInterrupt
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/fsspec/asyn.py", line 56, in _runner
+    result[0] = await coro
+                ^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/tasks.py", line 520, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/aiohttp/client.py", line 1360, in close
+    await self._connector.close()
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/aiohttp/connector.py", line 1086, in close
+    await super().close(abort_ssl=abort_ssl or self._ssl_shutdown_timeout == 0)
+RuntimeError: Task <Task pending name='Task-2008' coro=<_runner() running at /home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/fsspec/asyn.py:56> cb=[_chain_future.<locals>._call_set_state() at /usr/lib/python3.12/asyncio/futures.py:394]> got Future <Task pending name='Task-2009' coro=<_wait_for_close() running at /home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/aiohttp/connector.py:138> wait_for=<_GatheringFuture pending cb=[Task.task_wakeup()]>> attached to a different loop
 Task was destroyed but it is pending!
-task: <Task pending name='Task-62' coro=<_runner() running at /home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/fsspec/asyn.py:56> wait_for=<Future pending cb=[Task.task_wakeup()]> cb=[_chain_future.<locals>._call_set_state() at /usr/lib/python3.12/asyncio/futures.py:394]>
+task: <Task pending name='Task-2009' coro=<_wait_for_close() done, defined at /home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/aiohttp/connector.py:136> wait_for=<_GatheringFuture pending cb=[Task.task_wakeup()]>>
