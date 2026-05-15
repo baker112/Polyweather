@@ -42,7 +42,8 @@ def main() -> None:
 
     print(f"Opening Zarr: {args.uri}")
     try:
-        ds = xr.open_zarr(args.uri, consolidated=True, chunks={})
+        # chunks=None avoids the dask requirement — fine for metadata inspection.
+        ds = xr.open_zarr(args.uri, consolidated=True, chunks=None)
     except Exception as exc:
         print(f"Root open failed: {exc}")
         print()
@@ -126,7 +127,6 @@ def _list_and_probe(uri: str) -> None:
     candidate it sees so we can confirm dim/var names.
     """
     import gcsfs
-    import xarray as xr
 
     fs = gcsfs.GCSFileSystem()
     bucket_path = uri.replace("gs://", "").rstrip("/")
@@ -161,6 +161,9 @@ def _list_and_probe(uri: str) -> None:
         and _basename(t) not in _SKIP_NAMES
         and not _find_zarr_marker(fs, t)
     ]
+    # Subdirs whose children had no zarr sentinel — we'll still try opening one
+    # at the end (handles unconsolidated zarr stores like 2025_to_present/).
+    markerless_first_children: list[str] = []
     for sub in deeper:
         print(f"  ls gs://{sub}/")
         try:
@@ -170,6 +173,7 @@ def _list_and_probe(uri: str) -> None:
             continue
         if len(sub_entries) > _MAX_ENTRIES_PER_PREFIX:
             print(f"    (large prefix — {len(sub_entries)} entries; showing first {_MAX_ENTRIES_PER_PREFIX})")
+        found_marker_in_sub = False
         for child in sub_entries[:_MAX_ENTRIES_PER_PREFIX]:
             if child.rstrip("/") == sub.rstrip("/"):
                 continue
@@ -178,34 +182,69 @@ def _list_and_probe(uri: str) -> None:
             print(f"    gs://{child}{suffix}")
             if marker:
                 candidates.append((child, marker))
+                found_marker_in_sub = True
         if len(sub_entries) > _MAX_ENTRIES_PER_PREFIX:
             print(f"    … and {len(sub_entries) - _MAX_ENTRIES_PER_PREFIX} more")
+        if not found_marker_in_sub:
+            first_real = next(
+                (c for c in sub_entries if c.rstrip("/") != sub.rstrip("/")),
+                None,
+            )
+            if first_real:
+                markerless_first_children.append(first_real)
 
-    if not candidates:
+    if candidates:
+        target, sentinel = candidates[0]
+        target_uri = f"gs://{target}/"
+        print()
+        print(f"  Found {len(candidates)} Zarr store(s). Opening first: {target_uri}")
+        consolidated = sentinel == ".zmetadata"
+        _print_store(target_uri, consolidated=consolidated)
+        print()
+        print("  Re-run probe against the actual store:")
+        print(f"    python scripts/weathernext_gcs_probe.py --uri {target_uri}")
+    else:
         print()
         print("  No Zarr store markers found within depth 2.")
-        return
 
-    target, sentinel = candidates[0]
-    target_uri = f"gs://{target}/"
-    print()
-    print(f"  Found {len(candidates)} Zarr store(s). Opening first: {target_uri}")
-    try:
-        consolidated = sentinel == ".zmetadata"
-        ds = xr.open_zarr(target_uri, consolidated=consolidated, chunks={})
-    except Exception as exc:
-        print(f"  Open failed: {exc}")
-        return
-    print()
-    print(f"  Dims  : {dict(ds.dims)}")
-    print(f"  Vars  : {list(ds.data_vars)}")
-    print(f"  Coords: {list(ds.coords)}")
+    if markerless_first_children:
+        print()
+        print("  Subdirs with no sentinel — trying to open first child of each as zarr:")
+        for path in markerless_first_children:
+            test_uri = f"gs://{path}/"
+            print(f"    {test_uri}")
+            opened = False
+            for cons in (True, False):
+                try:
+                    _print_store(test_uri, consolidated=cons, indent="      ")
+                    print(f"      (consolidated={cons})")
+                    opened = True
+                    break
+                except Exception as exc:
+                    print(f"      consolidated={cons} → {type(exc).__name__}: {exc}")
+            if not opened:
+                print("      Could not open as zarr.")
+
+
+def _print_store(uri: str, *, consolidated: bool, indent: str = "  ") -> None:
+    """Open one Zarr store with `chunks=None` (no dask needed) and print dims/vars."""
+    import xarray as xr  # type: ignore[import-untyped]
+
+    ds = xr.open_zarr(uri, consolidated=consolidated, chunks=None)
+    print(f"{indent}Dims  : {dict(ds.dims)}")
+    print(f"{indent}Vars  : {list(ds.data_vars)}")
+    print(f"{indent}Coords: {list(ds.coords)}")
     if "2m_temperature" in ds.data_vars or "t2m" in ds.data_vars:
         t2m = "2m_temperature" if "2m_temperature" in ds.data_vars else "t2m"
-        print(f"  {t2m} units: {ds[t2m].attrs.get('units', '?')}  shape: {ds[t2m].shape}")
-    print()
-    print("  Re-run probe against the actual store:")
-    print(f"    python scripts/weathernext_gcs_probe.py --uri {target_uri}")
+        print(f"{indent}{t2m} units: {ds[t2m].attrs.get('units', '?')}  shape: {ds[t2m].shape}")
+    # Print first few values of each coord — tiny, doesn't fetch much.
+    for cname in ds.coords:
+        try:
+            c = ds[cname]
+            sample = c.values[:3] if c.size > 3 else c.values
+            print(f"{indent}coord {cname}: dtype={c.dtype} shape={c.shape} first={sample}")
+        except Exception as exc:
+            print(f"{indent}coord {cname}: <unreadable: {exc}>")
 
 
 if __name__ == "__main__":

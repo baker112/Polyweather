@@ -33,6 +33,7 @@ dependencies = [
     "google-cloud-bigquery>=3.20.0",
     "zarr>=2.17.0",
     "gcsfs>=2024.3.0",
+    "dask[array]>=2024.3.0",
 ]
 
 [project.optional-dependencies]
