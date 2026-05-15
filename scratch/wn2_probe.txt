@@ -200,9 +200,7 @@ Listing bucket contents to find actual Zarr store paths…
     gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250214_12hr_01_preds
     gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250214_18hr_01_preds
     gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250215_00hr_01_preds
-    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250215_06hr_01_preds/home/ohbaker1/Polyweather/scripts/weathernext_gcs_probe.py:234: FutureWarning: The return type of `Dataset.dims` will be changed to return a set of dimension names in future, in order to be more consistent with `DataArray.dims`. To access a mapping from dimension names to lengths, please use `Dataset.sizes`.
-  print(f"{indent}Dims  : {dict(ds.dims)}")
-
+    gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250215_06hr_01_preds
     gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250215_12hr_01_preds
     gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250215_18hr_01_preds
     gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250216_00hr_01_preds
@@ -228,7 +226,8 @@ Listing bucket contents to find actual Zarr store paths…
   Dims  : {'time': 1460, 'sample': 64, 'prediction_timedelta': 60, 'lat': 721, 'lon': 1440, 'level': 13}
   Vars  : ['100m_u_component_of_wind', '100m_v_component_of_wind', '10m_u_component_of_wind', '10m_v_component_of_wind', '2m_temperature', 'geopotential', 'mean_sea_level_pressure', 'sea_surface_temperature', 'specific_humidity', 'temperature', 'total_precipitation_6hr', 'u_component_of_wind', 'v_component_of_wind', 'vertical_velocity']
   Coords: ['lat', 'lead_time_secs', 'level', 'lon', 'prediction_timedelta', 'sample', 'time']
-  2m_temperature units: ?  shape: (1460, 64, 60, 721, 1440)
+  2m_temperature: units=? dims=('time', 'sample', 'prediction_timedelta', 'lat', 'lon') shape=(1460, 64, 60, 721, 1440) chunks=(1, 4, 1, 721, 1440)
+    → one chunk = ~15.84 MiB (cost ~$0 same-region)
   coord lat: dtype=float32 shape=(721,) first=[-90.   -89.75 -89.5 ]
   coord lead_time_secs: dtype=int64 shape=(60,) first=[21600 43200 64800]
   coord level: dtype=int32 shape=(13,) first=[ 50 100 150]
@@ -245,7 +244,23 @@ Listing bucket contents to find actual Zarr store paths…
     gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250101_00hr_01_preds/
       consolidated=True → GroupNotFoundError: No group found in store 'gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250101_00hr_01_preds/' at path ''
       consolidated=False → GroupNotFoundError: No group found in store 'gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250101_00hr_01_preds/' at path ''
-      Could not open as zarr.
+      ls inside (2 entries, first 20):
+        gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250101_00hr_01_preds/predictions.zarr  ← Zarr store (.zmetadata)
+        gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250101_00hr_01_preds/success
+      Opening nested store: gs://weathernext/weathernext_2_0_0/zarr/2025_to_present/20250101_00hr_01_preds/predictions.zarr/
+        Dims  : {'sample': 64, 'time': 60, 'lat': 721, 'lon': 1440, 'level': 13}
+        Vars  : ['100m_u_component_of_wind', '100m_v_component_of_wind', '10m_u_component_of_wind', '10m_v_component_of_wind', '2m_temperature', 'geopotential', 'mean_sea_level_pressure', 'sea_surface_temperature', 'specific_humidity', 'temperature', 'total_precipitation_6hr', 'u_component_of_wind', 'v_component_of_wind', 'vertical_velocity']
+        Coords: ['datetime', 'init_time', 'lat', 'level', 'lon', 'sample', 'time']
+        2m_temperature: units=? dims=('sample', 'time', 'lat', 'lon') shape=(64, 60, 721, 1440) chunks=(1, 1, 721, 1440)
+          → one chunk = ~3.96 MiB (cost ~$0 same-region)
+        coord datetime: dtype=datetime64[ns] shape=(60,) first=['2025-01-01T06:00:00.000000000' '2025-01-01T12:00:00.000000000'
+ '2025-01-01T18:00:00.000000000']
+        coord init_time: dtype=datetime64[ns] shape=() first=2025-01-01T00:00:00.000000000
+        coord lat: dtype=float32 shape=(721,) first=[-90.   -89.75 -89.5 ]
+        coord level: dtype=int32 shape=(13,) first=[ 50 100 150]
+        coord lon: dtype=float32 shape=(1440,) first=[0.   0.25 0.5 ]
+        coord sample: dtype=int64 shape=(64,) first=[0 1 2]
+        coord time: dtype=timedelta64[ns] shape=(60,) first=[21600000000000 43200000000000 64800000000000]
 Traceback (most recent call last):
   File "/usr/lib/python3.12/weakref.py", line 666, in _exitfunc
     f()
@@ -266,6 +281,6 @@ Traceback (most recent call last):
     await self._connector.close()
   File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/aiohttp/connector.py", line 1086, in close
     await super().close(abort_ssl=abort_ssl or self._ssl_shutdown_timeout == 0)
-RuntimeError: Task <Task pending name='Task-2022' coro=<_runner() running at /home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/fsspec/asyn.py:56> cb=[_chain_future.<locals>._call_set_state() at /usr/lib/python3.12/asyncio/futures.py:394]> got Future <Task pending name='Task-2023' coro=<_wait_for_close() running at /home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/aiohttp/connector.py:138> wait_for=<_GatheringFuture pending cb=[Task.task_wakeup()]>> attached to a different loop
+RuntimeError: Task <Task pending name='Task-2094' coro=<_runner() running at /home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/fsspec/asyn.py:56> cb=[_chain_future.<locals>._call_set_state() at /usr/lib/python3.12/asyncio/futures.py:394]> got Future <Task pending name='Task-2095' coro=<_wait_for_close() running at /home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/aiohttp/connector.py:138> wait_for=<_GatheringFuture pending cb=[Task.task_wakeup()]>> attached to a different loop
 Task was destroyed but it is pending!
-task: <Task pending name='Task-2023' coro=<_wait_for_close() done, defined at /home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/aiohttp/connector.py:136> wait_for=<_GatheringFuture pending cb=[Task.task_wakeup()]>>
+task: <Task pending name='Task-2095' coro=<_wait_for_close() done, defined at /home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/aiohttp/connector.py:136> wait_for=<_GatheringFuture pending cb=[Task.task_wakeup()]>>
