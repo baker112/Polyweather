@@ -1,11 +1,16 @@
-"""One-chunk egress test for WN2 GCS.
+"""Egress test for WN2 GCS — pulls ~5 GiB so the cost is visible in billing.
 
-Fetches a single full chunk of 2m_temperature from the historic 2022_to_2023
-store. Prints elapsed time and bytes transferred so we can correlate with the
-Cloud Billing report afterwards.
+Fetches 1 init × 64 members × 20 leads × full lat/lon of 2m_temperature from
+the historic 2022_to_2023 store. ~320 chunks at 16 MiB each.
 
-Cost: ~$0.08 cross-region or $0 same-region (newer pricing).
-Run once, then check Console -> Billing -> Reports filtered to today.
+Expected cost at common GCP egress rates:
+  Same-region / premium tier:    $0     (no line item)
+  Cross-region same continent:   ~$0.11 ($0.02/GiB)
+  Cross-continent:               ~$0.27 ($0.05/GiB)
+  US-multi to non-NA / non-EU:   ~$0.64 ($0.12/GiB)
+
+Run once, wait ~5-15 min for billing to update, then check:
+  Cloud Console -> Billing -> Reports -> Service: Cloud Storage -> Today
 """
 import time
 
@@ -15,25 +20,45 @@ URI = "gs://weathernext/weathernext_2_0_0/zarr/2022_to_2023/predictions.zarr/"
 
 print(f"Opening: {URI}")
 ds = xr.open_zarr(URI, consolidated=True, chunks=None)
-print(f"  2m_temperature shape: {ds['2m_temperature'].shape}")
-print(f"  2m_temperature chunks: {ds['2m_temperature'].encoding.get('chunks')}")
+t2m = ds["2m_temperature"]
+print(f"  full shape: {t2m.shape}")
+print(f"  chunks:     {t2m.encoding.get('chunks')}")
 
+# 1 init × 64 members × 20 leads × 721 lat × 1440 lon × 4 bytes (float32)
+n_init, n_member, n_lead = 1, 64, 20
+n_lat, n_lon = 721, 1440
+est_bytes = n_init * n_member * n_lead * n_lat * n_lon * 4
+est_gib = est_bytes / 1024**3
 print()
-print("Fetching one chunk's worth (time=0, sample=0..3, lead=0, all lat/lon)…")
+print(f"Will fetch: {n_init} inits × {n_member} members × {n_lead} leads × {n_lat}×{n_lon}")
+print(f"Estimated transfer: ~{est_gib:.2f} GiB")
+print(f"Expected cost @ $0.02/GiB: ${est_gib * 0.02:.2f}")
+print(f"Worst case  @ $0.12/GiB: ${est_gib * 0.12:.2f}")
+print()
+print("Starting fetch in 5 seconds — Ctrl-C to abort…")
+time.sleep(5)
+
+print("Fetching…")
 t0 = time.time()
-val = ds["2m_temperature"].isel(
+val = t2m.isel(
     time=0,
-    sample=slice(0, 4),
-    prediction_timedelta=0,
+    sample=slice(0, n_member),
+    prediction_timedelta=slice(0, n_lead),
 ).values
 elapsed = time.time() - t0
 
 mib = val.nbytes / 1024**2
+gib = mib / 1024
 print()
 print(f"Got shape {val.shape}, dtype {val.dtype}")
-print(f"Transferred {mib:.2f} MiB in {elapsed:.1f}s")
+print(f"Transferred {gib:.2f} GiB ({mib:.0f} MiB) in {elapsed:.1f}s")
+print(f"Effective throughput: {mib / elapsed:.0f} MiB/s")
 print()
-print("Now check Cloud Console -> Billing -> Reports -> filter to today")
-print("Look for 'Multi-region Network Egress' or 'GCS Internet Egress' line items.")
-print(f"  - If you see ~${mib / 1024 * 0.02:.4f} charged: cross-region ($0.02/GiB)")
-print("  - If you see $0:   you're effectively same-region, all reads free")
+print("Now wait ~5-15 minutes and check:")
+print("  Cloud Console -> Billing -> Reports")
+print("  Filters: Service = Cloud Storage, Time range = Today")
+print()
+print(f"Look for an egress line item near ~${gib * 0.02:.2f}")
+print("  - If you see ~$0.11:    cross-region NA pricing ($0.02/GiB) applies")
+print("  - If you see ~$0.27:    cross-continent pricing ($0.05/GiB)")
+print("  - If you see $0:        same-region under premium tier — backfill is free")
