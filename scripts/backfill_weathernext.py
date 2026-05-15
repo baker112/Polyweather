@@ -38,6 +38,7 @@ from weather_edge.store import parquet as store  # noqa: E402
 
 _logger = logging.getLogger("backfill_weathernext")
 _WINDOW_DAYS = 30  # monthly query chunks
+_USD_PER_TIB = 6.25  # BQ on-demand pricing
 
 
 def _station_init_hours(station: StationConfig) -> tuple[int, ...]:
@@ -54,6 +55,30 @@ def _station_init_hours(station: StationConfig) -> tuple[int, ...]:
 def _already_have(station_id: str, init_dt: datetime) -> bool:
     """Skip if parquet already exists for this (station, init)."""
     return store.read_forecasts("weathernext", init_dt, station_id) is not None
+
+
+def estimate_total_cost(targets: list[StationConfig], start: date, end: date) -> tuple[int, float]:
+    """Dry-run every monthly chunk for every station and return (bytes, USD).
+
+    Charges nothing — dry_run jobs are free. Use this to decide whether the
+    real backfill is within budget before kicking it off.
+    """
+    total_bytes = 0
+    for station in targets:
+        cursor = start
+        init_hours = _station_init_hours(station)
+        while cursor <= end:
+            window_end = min(cursor + timedelta(days=_WINDOW_DAYS - 1), end)
+            b = weathernext.estimate_historic_bytes(cursor, window_end, station, init_hours)
+            total_bytes += b
+            _logger.info(
+                "[%s] %s → %s  est %.2f GiB ($%.4f)",
+                station.icao, cursor, window_end,
+                b / 1024**3, (b / 1024**4) * _USD_PER_TIB,
+            )
+            cursor = window_end + timedelta(days=1)
+    usd = (total_bytes / 1024**4) * _USD_PER_TIB
+    return total_bytes, usd
 
 
 def backfill_station(station: StationConfig, start: date, end: date, dry_run: bool) -> dict:
@@ -112,6 +137,17 @@ def main() -> None:
         help="Specific ICAOs to backfill (default: all active in config/stations.yaml)",
     )
     parser.add_argument("--dry-run", action="store_true", help="Query but don't write parquet")
+    parser.add_argument(
+        "--estimate-cost",
+        action="store_true",
+        help="Dry-run every chunk and print total bytes + USD, then exit. Charges nothing.",
+    )
+    parser.add_argument(
+        "--max-cost-usd",
+        type=float,
+        default=None,
+        help="Abort if estimated total exceeds this USD budget (runs --estimate-cost first).",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args()
 
@@ -133,6 +169,19 @@ def main() -> None:
         "Backfill: %d station(s) × %s → %s (%s)",
         len(targets), args.start, args.end, "DRY RUN" if args.dry_run else "live writes",
     )
+
+    if args.estimate_cost or args.max_cost_usd is not None:
+        bytes_, usd = estimate_total_cost(targets, args.start, args.end)
+        _logger.info(
+            "ESTIMATE  total %.2f GiB  $%.4f at $%.2f/TiB",
+            bytes_ / 1024**3, usd, _USD_PER_TIB,
+        )
+        if args.estimate_cost:
+            return
+        if args.max_cost_usd is not None and usd > args.max_cost_usd:
+            raise SystemExit(
+                f"Estimated cost ${usd:.4f} exceeds budget ${args.max_cost_usd:.4f}; aborting."
+            )
 
     grand = {"queries": 0, "rows_written": 0, "inits_written": 0, "skipped": 0, "errors": 0}
     for station in targets:
