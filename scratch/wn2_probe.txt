@@ -1,0 +1,66 @@
+Opening Zarr: gs://weathernext/weathernext_2_0_0/
+Root open failed: No group found in store 'gs://weathernext/weathernext_2_0_0/' at path ''
+
+Listing bucket contents to find actual Zarr store paths…
+  ls gs://weathernext/weathernext_2_0_0/
+    gs://weathernext/weathernext_2_0_0/ee_assets
+    gs://weathernext/weathernext_2_0_0/zarr
+  ls gs://weathernext/weathernext_2_0_0/ee_assets/
+Traceback (most recent call last):
+  File "/home/ohbaker1/Polyweather/scripts/weathernext_gcs_probe.py", line 45, in main
+    ds = xr.open_zarr(args.uri, consolidated=True, chunks={})
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/xarray/backends/zarr.py", line 1658, in open_zarr
+    ds = open_dataset(
+         ^^^^^^^^^^^^^
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/xarray/backends/api.py", line 607, in open_dataset
+    backend_ds = backend.open_dataset(
+                 ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/xarray/backends/zarr.py", line 1732, in open_dataset
+    store = ZarrStore.open_group(
+            ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/xarray/backends/zarr.py", line 771, in open_group
+    ) = _get_open_params(
+        ^^^^^^^^^^^^^^^^^
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/xarray/backends/zarr.py", line 1936, in _get_open_params
+    zarr_root_group = zarr.open_consolidated(store, **open_kwargs)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/zarr/api/synchronous.py", line 234, in open_consolidated
+    sync(async_api.open_consolidated(*args, use_consolidated=use_consolidated, **kwargs))
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/zarr/core/sync.py", line 158, in sync
+    raise return_result
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/zarr/core/sync.py", line 118, in _runner
+    return await coro
+           ^^^^^^^^^^
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/zarr/api/asynchronous.py", line 396, in open_consolidated
+    return await open_group(*args, use_consolidated=use_consolidated, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/zarr/api/asynchronous.py", line 846, in open_group
+    raise GroupNotFoundError(msg)
+zarr.errors.GroupNotFoundError: No group found in store 'gs://weathernext/weathernext_2_0_0/' at path ''
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/ohbaker1/Polyweather/scripts/weathernext_gcs_probe.py", line 190, in <module>
+    main()
+  File "/home/ohbaker1/Polyweather/scripts/weathernext_gcs_probe.py", line 50, in main
+    _list_and_probe(args.uri)
+  File "/home/ohbaker1/Polyweather/scripts/weathernext_gcs_probe.py", line 146, in _list_and_probe
+    sub_entries = fs.ls(sub, detail=False)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/fsspec/asyn.py", line 118, in wrapper
+    return sync(self.loop, func, *args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/fsspec/asyn.py", line 91, in sync
+    if event.wait(1):
+       ^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/threading.py", line 655, in wait
+    signaled = self._cond.wait(timeout)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/threading.py", line 359, in wait
+    gotit = waiter.acquire(True, timeout)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+Task was destroyed but it is pending!
+task: <Task pending name='Task-62' coro=<_runner() running at /home/ohbaker1/Polyweather/.venv/lib/python3.12/site-packages/fsspec/asyn.py:56> wait_for=<Future pending cb=[Task.task_wakeup()]> cb=[_chain_future.<locals>._call_set_state() at /usr/lib/python3.12/asyncio/futures.py:394]>
