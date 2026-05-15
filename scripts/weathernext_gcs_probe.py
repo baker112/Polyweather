@@ -223,7 +223,31 @@ def _list_and_probe(uri: str) -> None:
                 except Exception as exc:
                     print(f"      consolidated={cons} → {type(exc).__name__}: {exc}")
             if not opened:
-                print("      Could not open as zarr.")
+                # Drill in and ls — the zarr might be nested one level deeper.
+                try:
+                    children = fs.ls(path, detail=False)
+                    print(f"      ls inside ({len(children)} entries, first 20):")
+                    for child in children[:20]:
+                        if child.rstrip("/") == path.rstrip("/"):
+                            continue
+                        marker = _find_zarr_marker(fs, child)
+                        suffix = f"  ← Zarr store ({marker})" if marker else ""
+                        print(f"        gs://{child}{suffix}")
+                    # If we found a nested zarr, try opening it.
+                    nested_zarr = next(
+                        (c for c in children if c.rstrip("/") != path.rstrip("/") and _find_zarr_marker(fs, c)),
+                        None,
+                    )
+                    if nested_zarr:
+                        nested_uri = f"gs://{nested_zarr}/"
+                        print(f"      Opening nested store: {nested_uri}")
+                        marker = _find_zarr_marker(fs, nested_zarr)
+                        try:
+                            _print_store(nested_uri, consolidated=marker == ".zmetadata", indent="        ")
+                        except Exception as exc:
+                            print(f"        Failed: {exc}")
+                except Exception as exc:
+                    print(f"      ls failed: {exc}")
 
 
 def _print_store(uri: str, *, consolidated: bool, indent: str = "  ") -> None:
@@ -231,12 +255,24 @@ def _print_store(uri: str, *, consolidated: bool, indent: str = "  ") -> None:
     import xarray as xr  # type: ignore[import-untyped]
 
     ds = xr.open_zarr(uri, consolidated=consolidated, chunks=None)
-    print(f"{indent}Dims  : {dict(ds.dims)}")
+    print(f"{indent}Dims  : {dict(ds.sizes)}")
     print(f"{indent}Vars  : {list(ds.data_vars)}")
     print(f"{indent}Coords: {list(ds.coords)}")
     if "2m_temperature" in ds.data_vars or "t2m" in ds.data_vars:
         t2m = "2m_temperature" if "2m_temperature" in ds.data_vars else "t2m"
-        print(f"{indent}{t2m} units: {ds[t2m].attrs.get('units', '?')}  shape: {ds[t2m].shape}")
+        v = ds[t2m]
+        units = v.attrs.get("units", "?")
+        # Chunks live in the zarr encoding, not on the xarray DataArray itself
+        # when chunks=None. Pull from encoding so we know fetch sizes.
+        chunks = v.encoding.get("chunks", "?")
+        print(f"{indent}{t2m}: units={units} dims={v.dims} shape={v.shape} chunks={chunks}")
+        # Estimate bytes for a single-cell fetch (1 lat × 1 lon, all members × leads).
+        if isinstance(chunks, tuple):
+            bytes_per_chunk = 1
+            for cs in chunks:
+                bytes_per_chunk *= cs
+            bytes_per_chunk *= 4  # float32 typical
+            print(f"{indent}  → one chunk = ~{bytes_per_chunk / 1024**2:.2f} MiB (cost ~$0 same-region)")
     # Print first few values of each coord — tiny, doesn't fetch much.
     for cname in ds.coords:
         try:
