@@ -169,12 +169,14 @@ def _intraday_run(station_id: str, mode: str = "wn2_only") -> None:
     now_utc = datetime.now(timezone.utc)
     target_date = now_utc.date()
     # Try the freshest init first, fall back to progressively older ones if
-    # WN2 publication latency exceeded our expected lag. Three attempts:
-    # ~6h lag → ~12h lag → ~18h lag.
+    # WN2 publication latency exceeded our expected lag. Start at 5h
+    # (typical WN2 latency) so freshly-published 06z/12z inits get picked
+    # up when their lock fires ~5h after publication. Retry chain steps
+    # back by full 6h init cycles on failure.
     result = None
     last_exc: Exception | None = None
     init_dt = None
-    for min_lag in (6, 12, 18):
+    for min_lag in (5, 11, 17):
         init_dt = _most_recent_init(now_utc, min_lag_hours=min_lag)
         try:
             result = lock_picks(
