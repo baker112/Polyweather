@@ -712,13 +712,21 @@ def start(stations: list[str]) -> None:
             "",
         ]
         for job in sched.get_jobs():
-            next_run = job.next_run_time
+            # APScheduler 3.x exposes next_run_time as an attribute; 4.x removed
+            # it and moved scheduling state onto the trigger. Try both so this
+            # works regardless of which version pip resolved.
+            next_run = getattr(job, "next_run_time", None)
+            if next_run is None:
+                try:
+                    next_run = job.trigger.get_next_fire_time(None, now)
+                except Exception:
+                    next_run = None
             if next_run:
                 delta = next_run - now
                 h, m = divmod(int(delta.total_seconds()) // 60, 60)
                 lines.append(f"{job.name}: next in {h}h {m}m ({next_run.strftime('%H:%M')}z)")
             else:
-                lines.append(f"{job.name}: not scheduled")
+                lines.append(f"{job.name}: scheduled")
         return "\n".join(lines)
 
     def _picks(args: str = "") -> str:
