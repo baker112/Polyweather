@@ -444,10 +444,18 @@ def _stage3_4(
     """Return a PredictedDistribution, BMAMixture, or QRFDistribution.
 
     Priority order:
+      Phase 0 — WN2-only short-circuit when station.bma_mode == "wn2_only"
       Phase 3 — QRF (if fitted params exist on disk)
       Phase 2 — BMA mixture (if per-model EMOS params exist for ≥2 models)
       Phase 1 — Pooled EMOS fallback
     """
+    # ── Phase 0: WN2-only short-circuit ─────────────────────────────────────
+    station_cfg = get_station(station_id)
+    if station_cfg.bma_mode == "wn2_only":
+        return _wn2_only_distribution(
+            station_id, lead_hours, now_utc, target_date, model_values, provenance
+        )
+
     # ── Phase 3: QRF ─────────────────────────────────────────────────────────
     qrf_data = store.read_qrf_params(station_id, lead_hours, now_utc)
     if qrf_data is not None:
@@ -498,6 +506,61 @@ def _stage3_4(
     provenance["emos_train_crps"] = emos_params.train_crps
     _logger.info("Stage 3+4: pooled EMOS (n=%d)", emos_params.n_samples)
     return predict_pdf(ensemble_values, emos_params, target_date)
+
+
+def _wn2_only_distribution(
+    station_id: str,
+    lead_hours: int,
+    now_utc: datetime,
+    target_date: date,
+    model_values: dict[str, list[float]],
+    provenance: dict[str, Any],
+) -> PredictedDistribution:
+    """WN2-only path: μ/σ come from the 64-member WN2 ensemble alone.
+
+    Uses WN2-specific EMOS via predict_pdf when cached params exist; otherwise
+    falls back to raw ensemble mean and (ddof=1) std. The σ floor in lock_picks
+    still applies downstream, so a narrow raw ensemble won't break bracket
+    probabilities.
+    """
+    import numpy as np
+
+    wn2_values = model_values.get("weathernext", [])
+    if len(wn2_values) < 3:
+        raise IngestError(
+            f"wn2_only mode but only {len(wn2_values)} WeatherNext members "
+            f"for {station_id} {target_date} lead={lead_hours}h — needs ≥3"
+        )
+
+    raw_emos = store.read_emos_params(station_id, lead_hours, now_utc, model="weathernext")
+    if raw_emos is not None:
+        emos_params = EmosParams(**raw_emos)
+        dist = predict_pdf(wn2_values, emos_params, target_date)
+        provenance["mode"] = "wn2_only_emos"
+        provenance["wn2_emos_n_samples"] = emos_params.n_samples
+        provenance["wn2_emos_train_crps"] = emos_params.train_crps
+        provenance["wn2_n_members"] = len(wn2_values)
+        _logger.info(
+            "Stage 3+4: WN2-only EMOS (n_train=%d, members=%d)",
+            emos_params.n_samples, len(wn2_values),
+        )
+        return dist
+
+    mu = float(np.mean(wn2_values))
+    sigma = float(np.std(wn2_values, ddof=1)) if len(wn2_values) > 1 else 0.5
+    provenance["mode"] = "wn2_only_raw"
+    provenance["wn2_n_members"] = len(wn2_values)
+    _logger.info(
+        "Stage 3+4: WN2-only raw (members=%d, μ=%.2f, σ=%.2f) — no WN2 EMOS yet",
+        len(wn2_values), mu, sigma,
+    )
+    return PredictedDistribution(
+        mu=mu,
+        sigma=sigma,
+        station=station_id,
+        valid_date=target_date,
+        lead_hours=lead_hours,
+    )
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────

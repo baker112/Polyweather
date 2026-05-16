@@ -16,6 +16,16 @@
 #   US group     (21:xx z): D-1 local afternoon, uses 12z ECMWF run (2h old)
 #   Ingest fires 30 min before lock (computed automatically by scheduler).
 #   Execute fires 5 min after lock.
+#
+# Forecast aggregation mode (optional per-station field `bma_mode`):
+#   bma       (default) — Bayesian model averaging across ECMWF / GEFS / ICON / WN2.
+#   wn2_only            — Use only the WeatherNext 2 64-member ensemble (sampled
+#                         at the nearest 0.25° grid cell to the station, 6h cadence).
+#                         μ/σ come from the WN2 members directly (WN2-specific EMOS
+#                         applied if cached). Use this to benchmark WN2 alone or
+#                         when other ingests are unreliable. Lock job will still
+#                         ingest the other models for future analysis, but won't
+#                         use them for the pick.
 
 # ── Asian group — lock 08:00-08:12z (00z ECMWF, D-1 local afternoon) ──────────
 

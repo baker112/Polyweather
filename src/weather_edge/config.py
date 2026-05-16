@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel
@@ -30,6 +30,13 @@ class StationConfig(BaseModel):
     # Asian markets (RKSI/ZSPD/RCSS) are persistently thin, so a global floor of $100
     # rejects most of their otherwise-positive-edge opportunities.
     min_liquidity: float | None = None
+    # Forecast aggregation mode:
+    #   "bma"      — Bayesian model averaging across ECMWF / GEFS / ICON / WN2 (default).
+    #   "wn2_only" — Use only WeatherNext 2's 64-member ensemble; ignore other models.
+    #                μ/σ come from the WN2 members directly (with WN2-specific EMOS
+    #                applied if cached params exist). Useful for benchmarking the ML
+    #                model in isolation against the BMA blend.
+    bma_mode: Literal["bma", "wn2_only"] = "bma"
 
 
 class ThresholdsConfig(BaseModel):
