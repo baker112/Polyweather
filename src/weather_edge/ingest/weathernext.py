@@ -1,4 +1,4 @@
-"""WeatherNext 2 ingestion — GCS/Zarr (default) or BigQuery (opt-in).
+"""WeatherNext 2 ingestion — GCS/Zarr only. BigQuery is hard-disabled.
 
 Google DeepMind's diffusion-based ensemble model:
   - 64-member ensemble (`sample` dim)
@@ -23,35 +23,36 @@ The historic and per-init stores use different dim names (`time` is init in
 the former, lead in the latter). _open_and_normalize() renames everything to
 canonical (init_time, prediction_timedelta, sample, lat, lon) before concat.
 
-Backends:
-  gcs (default)  — reads from gs://weathernext/. Each (init, station) fetch
-                   transfers ~4 GiB (chunks span the full lat/lon grid; we
-                   pull one chunk per (member, lead) we want). Egress is
-                   covered by Google for this public dataset — empirically
-                   verified 2026-05-16: 5 GiB test pull from Toronto VPS
-                   resulted in £0 Cloud Storage charge. Backfill is free.
-  bigquery       — opt-in only via WEATHERNEXT_BACKEND=bigquery. Each query is
-                   capped by maximum_bytes_billed. Historically a backfill via
-                   this backend nearly cost $1.2k; treat any BQ scan as expensive.
+BigQuery backend — HARD-DISABLED:
+  The library used to support a BigQuery backend via WEATHERNEXT_BACKEND=bigquery.
+  That code path nearly cost £215 (199 TiB scanned) in 2026-05 and has been
+  intentionally disabled at the entrypoints (`ingest_forecasts`, `ingest_historic`)
+  via `_assert_no_bq_backend()`. The BQ helper functions below remain in the file
+  for reference, but no public entrypoint dispatches to them. The associated
+  backfill script (`scripts/backfill_weathernext.py`) is also stubbed.
 
-Backend selector:
-  WEATHERNEXT_BACKEND             — "gcs" (default) or "bigquery"
+  To re-enable BigQuery (you almost certainly do not want to), you must:
+    1. Delete `_assert_no_bq_backend()` calls in `ingest_forecasts` / `ingest_historic`.
+    2. Restore the env-var dispatch (`if backend == "bigquery": ...`).
+    3. Restore `scripts/backfill_weathernext.py` from git.
+  Three locks, by design.
 
-GCS backend env vars:
+GCS backend (the only live path):
+  Reads from gs://weathernext/. Each (init, station) fetch transfers ~4 GiB
+  (chunks span the full lat/lon grid; we pull one chunk per (member, lead)
+  we want). Egress is covered by Google for this public dataset — empirically
+  verified 2026-05-16: 5 GiB test pull from Toronto VPS resulted in £0 Cloud
+  Storage charge. Backfill is free.
+
+GCS env vars:
   WEATHERNEXT_GCS_BASE            — Zarr collection root (default
                                     "gs://weathernext/weathernext_2_0_0/zarr/").
                                     Resolver appends year-range or per-init suffixes.
   GOOGLE_APPLICATION_CREDENTIALS  — service-account JSON (optional on a GCE VM
                                     with the default SA already allowlisted)
-
-BigQuery backend env vars (only used when WEATHERNEXT_BACKEND=bigquery):
-  WEATHERNEXT_PROJECT             — GCP project ID
-  WEATHERNEXT_DATASET             — BQ dataset where the Analytics Hub share is linked
-  WEATHERNEXT_TABLE               — table name (default "weathernext_2_0_0")
-  GOOGLE_APPLICATION_CREDENTIALS  — service-account JSON
-  WEATHERNEXT_MAX_BYTES_BILLED_GB — hard ceiling per query (default 2 GB ≈ $0.012).
-                                    A real-time single-init query is well under this;
-                                    anything larger is almost certainly an accident.
+  WEATHERNEXT_BACKEND             — if set to anything other than "gcs" (case-
+                                    insensitive), ingest raises IngestError.
+                                    Set to "gcs" or leave unset.
 
 Daily-max caveat: WN2's 6h temporal resolution under-samples the true afternoon
 peak by 1-2°C versus the hourly ICON / 3-hourly GEFS feeds. The EMOS bias term
@@ -118,8 +119,20 @@ _DEFAULT_GCS_BASE = "gs://weathernext/weathernext_2_0_0/zarr/"
 _PER_INIT_FROM_YEAR = 2025
 
 
-def _backend() -> str:
-    return os.getenv("WEATHERNEXT_BACKEND", "gcs").lower()
+def _assert_no_bq_backend() -> None:
+    """Block any code path that would route ingest through BigQuery.
+
+    After the 199 TiB / £215 near-miss, BQ is hard-disabled at the entrypoints.
+    A stale WEATHERNEXT_BACKEND=bigquery env var on the VPS would have silently
+    re-enabled the BQ path; this check turns that into a loud IngestError.
+    """
+    raw = os.getenv("WEATHERNEXT_BACKEND")
+    if raw and raw.lower() != "gcs":
+        raise IngestError(
+            f"WEATHERNEXT_BACKEND={raw!r} is set, but the BigQuery backend is "
+            "hard-disabled. Unset or set to 'gcs'. See weathernext.py docstring "
+            "for the reason."
+        )
 
 
 def _max_bytes_billed() -> int:
@@ -152,25 +165,21 @@ def _fq_table() -> str:
 
 
 def ingest_forecasts(init_dt: datetime, station: StationConfig) -> pl.DataFrame:
-    """Fetch 50-member WN2 2m temperature for a single init and return per-member daily max.
+    """Fetch 64-member WN2 2m temperature for a single init and return per-member daily max.
 
     Columns: model, member_id, init_datetime, valid_date, station, daily_max_c, lead_hours
+
+    Always uses the GCS Zarr backend. BigQuery dispatch is hard-disabled here
+    after the 199 TiB / £215 near-miss in 2026-05. To re-enable BQ you must
+    delete the guard below AND remove the disable in `ingest_historic`.
     """
+    _assert_no_bq_backend()
     init_utc = init_dt.replace(tzinfo=timezone.utc)
-    backend = _backend()
-    if backend == "gcs":
-        return _gcs_query_and_reduce(
-            init_start=init_utc,
-            init_end=init_utc + timedelta(seconds=1),
-            station=station,
-        )
-    if backend == "bigquery":
-        return _bq_query_and_reduce(
-            init_start=init_utc,
-            init_end=init_utc + timedelta(seconds=1),
-            station=station,
-        )
-    raise IngestError(f"Unknown WEATHERNEXT_BACKEND: {backend!r} (expected 'gcs' or 'bigquery')")
+    return _gcs_query_and_reduce(
+        init_start=init_utc,
+        init_end=init_utc + timedelta(seconds=1),
+        station=station,
+    )
 
 
 def ingest_historic(
@@ -188,24 +197,15 @@ def ingest_historic(
     `init_hours` defaults to (0, 12) which covers every station's production
     lock cycle: Asian stations use the 00z run, European/US stations use 12z.
     """
+    _assert_no_bq_backend()
     init_start = datetime(start_date.year, start_date.month, start_date.day, 0, tzinfo=timezone.utc)
     init_end = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, tzinfo=timezone.utc)
-    backend = _backend()
-    if backend == "gcs":
-        return _gcs_query_and_reduce(
-            init_start=init_start,
-            init_end=init_end,
-            station=station,
-            init_hours=init_hours,
-        )
-    if backend == "bigquery":
-        return _bq_query_and_reduce(
-            init_start=init_start,
-            init_end=init_end,
-            station=station,
-            init_hours=init_hours,
-        )
-    raise IngestError(f"Unknown WEATHERNEXT_BACKEND: {backend!r} (expected 'gcs' or 'bigquery')")
+    return _gcs_query_and_reduce(
+        init_start=init_start,
+        init_end=init_end,
+        station=station,
+        init_hours=init_hours,
+    )
 
 
 def _bq_query_and_reduce(
