@@ -26,6 +26,15 @@
 #                         when other ingests are unreliable. Lock job will still
 #                         ingest the other models for future analysis, but won't
 #                         use them for the pick.
+#
+# Intraday short-lead lock (optional per-station field `intraday_lock_time_utc`):
+#   Format "HH:MM" UTC. When set, the scheduler fires an EXTRA lock at this time
+#   that targets the SAME day's daily max using the freshest WN2 init (6-12h lead
+#   to local afternoon peak) — independent of the regular D-1 evening lock.
+#   bma_mode is forced to wn2_only for the intraday run regardless of the
+#   per-station bma_mode. The execute job follows 5 minutes after, gated by the
+#   same TRADING_ENABLED / LIVE_TRADING / LIVE_STATIONS flags as regular trades.
+#   Pick a time ~1-2h before the station's local afternoon peak (~14:00-16:00 local).
 
 # ── Asian group — lock 08:00-08:12z (00z ECMWF, D-1 local afternoon) ──────────
 
@@ -96,6 +105,7 @@ EGLC:
   market_slug_pattern: "highest-temperature-in-london-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "19:30"  # 20:30 BST — D-1 evening
+  intraday_lock_time_utc: "12:30"  # ~1.5h before London peak ~14z; uses 06z WN2 init
 
 LFPB:
   name: Paris Le Bourget Airport
@@ -118,6 +128,7 @@ KLGA:
   market_slug_pattern: "highest-temperature-in-nyc-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "21:00"  # 17:00 EDT — D-1 afternoon
+  intraday_lock_time_utc: "17:30"  # ~1.5h before NYC peak ~19z; uses 12z WN2 init
 
 KDAL:
   name: Dallas Love Field
@@ -128,6 +139,7 @@ KDAL:
   market_slug_pattern: "highest-temperature-in-dallas-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "21:03"  # 16:03 CDT — D-1 afternoon
+  intraday_lock_time_utc: "18:30"  # ~1.5h before Dallas peak ~20z; uses 12z WN2 init
 
 KHOU:
   name: Houston William P. Hobby Airport
@@ -138,6 +150,7 @@ KHOU:
   market_slug_pattern: "highest-temperature-in-houston-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "21:06"  # 16:06 CDT — D-1 afternoon
+  intraday_lock_time_utc: "18:33"  # ~1.5h before Houston peak ~20z; uses 12z WN2 init
 
 KORD:
   name: Chicago O'Hare International Airport
@@ -148,6 +161,7 @@ KORD:
   market_slug_pattern: "highest-temperature-in-chicago-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "21:09"  # 16:09 CDT — D-1 afternoon
+  intraday_lock_time_utc: "18:36"  # ~1.5h before Chicago peak ~20z; uses 12z WN2 init
 
 KBKF:
   name: Buckley Space Force Base (Aurora, Denver metro)

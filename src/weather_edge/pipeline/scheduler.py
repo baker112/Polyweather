@@ -102,6 +102,62 @@ def _lock_job(station_id: str) -> None:
         _tg.send(f"❌ <b>Lock FAILED: {station_id}</b> · {target_date}\n{exc}")
 
 
+def _intraday_lock_job(station_id: str) -> None:
+    """Same-day short-lead lock using the freshest WN2 init.
+
+    Fires at the station's `intraday_lock_time_utc`. Targets TODAY's daily max
+    (not D+1). Forces bma_mode='wn2_only' so we use just the WN2 64-member
+    ensemble at short lead (typically 6-12h to local afternoon peak).
+
+    The subsequent execute job (5 min later) places orders via the same
+    TRADING_ENABLED / LIVE_TRADING flow as the regular lock.
+    """
+    from weather_edge.pipeline.lock import lock_picks, _most_recent_init
+    from weather_edge.exceptions import AlreadyLockedError
+
+    now_utc = datetime.now(timezone.utc)
+    target_date = now_utc.date()
+    init_dt = _most_recent_init(now_utc, min_lag_hours=4)
+    try:
+        # force=True: an intraday run may follow the same-day regular lock, so
+        # overwrite — the intraday picks are intentionally the fresher view.
+        result = lock_picks(
+            target_date, station_id, now_utc,
+            force=True,
+            bma_mode_override="wn2_only",
+            init_dt_override=init_dt,
+        )
+        lead_h = int((datetime(target_date.year, target_date.month, target_date.day, 12, tzinfo=timezone.utc) - init_dt).total_seconds() // 3600)
+        _logger.info(
+            "Intraday locked %s %s: mu=%.2f sigma=%.2f picks=%d (init=%s, lead≈%dh)",
+            station_id, target_date, result.mu, result.sigma, len(result.picks),
+            init_dt.strftime("%Y-%m-%d %HZ"), lead_h,
+        )
+        if result.picks:
+            lines = [
+                f"⚡ <b>Intraday pick: {station_id}</b> · {target_date}",
+                f"   init={init_dt.strftime('%H')}z lead≈{lead_h}h · μ={result.mu:.1f}°C σ={result.sigma:.2f}",
+            ]
+            for p in result.picks:
+                cap_str = f"  cap=${p.max_stake_usdc:.0f}" if p.max_stake_usdc is not None else ""
+                lines.append(
+                    f"  {'🟢' if p.side == 'YES' else '🔴'} {p.side} {p.bracket_label}"
+                    f"  model={p.model_prob:.0%}  mkt={p.market_prob:.0%}  edge={p.edge:+.1%}"
+                    f"  kelly={p.kelly_fraction:.1%}{cap_str}"
+                )
+            _tg.send("\n".join(lines))
+        else:
+            _tg.send(
+                f"⚡ <b>Intraday no-edge: {station_id}</b> · {target_date} (init={init_dt.strftime('%H')}z)"
+                f"\n{result.no_edge_reason or 'all edges below threshold'}"
+            )
+    except AlreadyLockedError:
+        _logger.info("Intraday: already locked %s %s — skipping", station_id, target_date)
+    except Exception as exc:
+        _logger.error("Intraday lock failed %s %s: %s", station_id, target_date, exc)
+        _tg.send(f"❌ <b>Intraday FAILED: {station_id}</b> · {target_date}\n{exc}")
+
+
 def _resolve_and_observe_job(station_id: str) -> None:
     import asyncio
     from datetime import timedelta
@@ -693,6 +749,28 @@ def start(stations: list[str]) -> None:
             "Scheduled %s: ingest@%02d:%02dz lock@%02d:%02dz execute@%02d:%02dz",
             station_id, ingest_h, ingest_m, lock_h, lock_m, exec_h, exec_m,
         )
+
+        # Optional intraday short-lead lock — fires once a day, targets TODAY's
+        # daily max using the freshest WN2 init. The subsequent execute job
+        # (5 min after) places orders via the existing TRADING_ENABLED flow.
+        if cfg.intraday_lock_time_utc:
+            intra_h, intra_m = map(int, cfg.intraday_lock_time_utc.split(":"))
+            intra_exec_total_m = intra_h * 60 + intra_m + 5
+            intra_exec_h, intra_exec_m = divmod(intra_exec_total_m, 60)
+            sched.add_job(
+                _intraday_lock_job, CronTrigger(hour=intra_h, minute=intra_m),
+                args=[station_id], id=f"intraday_lock_{station_id}",
+                name=f"Intraday lock {station_id}",
+            )
+            sched.add_job(
+                _execute_job, CronTrigger(hour=intra_exec_h, minute=intra_exec_m),
+                args=[station_id], id=f"intraday_execute_{station_id}",
+                name=f"Intraday execute {station_id}",
+            )
+            _logger.info(
+                "Scheduled %s intraday: lock@%02d:%02dz execute@%02d:%02dz",
+                station_id, intra_h, intra_m, intra_exec_h, intra_exec_m,
+            )
 
     # Daily consolidated digest: yesterday P&L + bankroll + tomorrow's picks
     sched.add_job(

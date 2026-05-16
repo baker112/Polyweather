@@ -37,6 +37,14 @@ class StationConfig(BaseModel):
     #                applied if cached params exist). Useful for benchmarking the ML
     #                model in isolation against the BMA blend.
     bma_mode: Literal["bma", "wn2_only"] = "bma"
+    # Optional intraday lock — fire a SECOND lock during the day targeting the SAME
+    # day (not D+1) using a short-lead WN2 forecast. Format "HH:MM" UTC. When set,
+    # the scheduler registers an extra job at this time that:
+    #   - picks the most recent published WN2 init (with min 4h publication lag),
+    #   - forces bma_mode = "wn2_only" for the run,
+    #   - targets the current UTC date (so the bet is on today's daily max).
+    # Recommend ~1-2h before local-afternoon peak so the 6h-12h lead covers it.
+    intraday_lock_time_utc: str | None = None
 
 
 class ThresholdsConfig(BaseModel):

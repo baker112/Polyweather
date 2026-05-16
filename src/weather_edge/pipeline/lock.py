@@ -87,11 +87,19 @@ def lock_picks(
     station_id: str,
     now_utc: datetime,
     force: bool = False,
+    bma_mode_override: str | None = None,
+    init_dt_override: datetime | None = None,
 ) -> LockedPicks:
     """Orchestrate stages 1-6 and write immutable picks file.
 
     Raises AlreadyLockedError if picks already exist for this (date, station).
     Pass force=True to overwrite existing picks with fresh market data.
+
+    bma_mode_override: if provided, replaces station.bma_mode for this call.
+        Used by the intraday lock job to force WN2-only without touching yaml.
+    init_dt_override: if provided, skips the default `_most_recent_12z` choice
+        and uses this init datetime. Used by the intraday lock job to pull the
+        freshest available init (e.g. today's 06z) rather than yesterday's 12z.
     """
     from weather_edge.logging import log_event
 
@@ -112,8 +120,10 @@ def lock_picks(
     # version reused the pipeline-start timer, conflating later stages'
     # latency with the ingest figure on long lock_picks runs.
     t0 = time.monotonic()
-    init_dt = _most_recent_12z(now_utc)
+    init_dt = init_dt_override if init_dt_override is not None else _most_recent_12z(now_utc)
     provenance["init_dt"] = init_dt.isoformat()
+    if bma_mode_override:
+        provenance["bma_mode_override"] = bma_mode_override
     forecast_dfs: list[pl.DataFrame] = []
 
     try:
@@ -216,7 +226,8 @@ def lock_picks(
             model_values[_model] = _strip_outliers(_mdf["daily_max_c"].to_list())
 
     dist = _stage3_4(
-        station_id, lead_hours, now_utc, target_date, ensemble_values, model_values, provenance
+        station_id, lead_hours, now_utc, target_date, ensemble_values, model_values, provenance,
+        bma_mode_override=bma_mode_override,
     )
     raw_sigma = float(dist.sigma)
     dist = _SigmaFloored(dist, _MIN_SIGMA)
@@ -440,18 +451,21 @@ def _stage3_4(
     ensemble_values: list[float],
     model_values: dict[str, list[float]],
     provenance: dict[str, Any],
+    bma_mode_override: str | None = None,
 ) -> Any:
     """Return a PredictedDistribution, BMAMixture, or QRFDistribution.
 
     Priority order:
       Phase 0 — WN2-only short-circuit when station.bma_mode == "wn2_only"
+                or when bma_mode_override == "wn2_only" (intraday job).
       Phase 3 — QRF (if fitted params exist on disk)
       Phase 2 — BMA mixture (if per-model EMOS params exist for ≥2 models)
       Phase 1 — Pooled EMOS fallback
     """
     # ── Phase 0: WN2-only short-circuit ─────────────────────────────────────
     station_cfg = get_station(station_id)
-    if station_cfg.bma_mode == "wn2_only":
+    effective_mode = bma_mode_override or station_cfg.bma_mode
+    if effective_mode == "wn2_only":
         return _wn2_only_distribution(
             station_id, lead_hours, now_utc, target_date, model_values, provenance
         )
@@ -603,6 +617,25 @@ def _most_recent_12z(now_utc: datetime) -> datetime:
         return today_00z
     yesterday = now_utc - timedelta(days=1)
     return yesterday.replace(hour=12, minute=0, second=0, microsecond=0)
+
+
+def _most_recent_init(now_utc: datetime, min_lag_hours: int = 4) -> datetime:
+    """Return the most recent WN2 init (00/06/12/18 UTC) published at least `min_lag_hours` ago.
+
+    Used by the intraday lock job: at 11:00 UTC with min_lag=4, we'd get the day's
+    06z init (5h old). At 17:00 UTC we'd get 12z (5h old). Falls back to earlier
+    inits if the desired one hasn't published yet.
+
+    WN2 release latency in practice is ~3-5 hours, so a min_lag of 4 is the
+    conservative-but-fresh sweet spot for an intraday short-lead forecast.
+    """
+    now_utc = now_utc.replace(tzinfo=timezone.utc)
+    cutoff = now_utc - timedelta(hours=min_lag_hours)
+    # Walk back hour-by-hour to find the most recent 00/06/12/18 at or before cutoff.
+    candidate = cutoff.replace(minute=0, second=0, microsecond=0)
+    while candidate.hour not in (0, 6, 12, 18):
+        candidate -= timedelta(hours=1)
+    return candidate
 
 
 def _load_or_fetch_forecasts(
