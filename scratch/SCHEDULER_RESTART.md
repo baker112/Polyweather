@@ -19,6 +19,20 @@ git pull
 You should see the new commit(s) touching `config.py`, `lock.py`, and
 `stations.yaml`.
 
+### 1a. Refresh dependencies (one-time after the BQ nuke)
+
+google-cloud-bigquery was removed from pyproject.toml as part of the BQ
+hard-disable. Refresh the venv so the package is gone (defence in depth —
+even unreachable code can't import it now):
+
+```bash
+pip install -e . --upgrade
+pip uninstall -y google-cloud-bigquery   # in case pip leaves the unused dep behind
+pip show google-cloud-bigquery 2>&1 | grep -E "Name:" || echo "✓ google-cloud-bigquery uninstalled"
+```
+
+The final line should print the green-check confirmation.
+
 ---
 
 ## 2. Optional: flip one station to WN2-only

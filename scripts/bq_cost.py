@@ -1,60 +1,25 @@
-"""Show BigQuery spend for recent jobs in this project.
+"""DISABLED — used to report recent BigQuery spend via list_jobs().
 
-Sums `total_bytes_billed` across the project's BQ jobs in a time window and
-prints GiB scanned + USD at on-demand pricing ($6.25/TiB).
+The BigQuery Python client was removed from the project's dependencies
+(google-cloud-bigquery is no longer in pyproject.toml). Even though this
+script only read free metadata, it would now ImportError on first run.
 
-Usage:
-    python scripts/bq_cost.py                    # last 24h, default project
-    python scripts/bq_cost.py --hours 48
-    python scripts/bq_cost.py --project my-proj  # override project
+If you genuinely need BQ cost reporting, query the billing-export table
+instead (see scratch/billing_check.sql).
 """
 from __future__ import annotations
 
-import argparse
-import os
-from datetime import datetime, timedelta, timezone
-
-USD_PER_TIB = 6.25
+import sys
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--hours", type=int, default=24)
-    parser.add_argument(
-        "--project",
-        default=os.getenv("WEATHERNEXT_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT"),
+    print(
+        "ERROR: scripts/bq_cost.py is disabled — google-cloud-bigquery is no "
+        "longer a dependency. Query the billing-export table via "
+        "scratch/billing_check.sql instead.",
+        file=sys.stderr,
     )
-    args = parser.parse_args()
-
-    if not args.project:
-        raise SystemExit(
-            "No project. Pass --project, or set WEATHERNEXT_PROJECT / GOOGLE_CLOUD_PROJECT."
-        )
-
-    from google.cloud import bigquery  # type: ignore[import-untyped]
-
-    client = bigquery.Client(project=args.project)
-    since = datetime.now(timezone.utc) - timedelta(hours=args.hours)
-
-    n = 0
-    total_bytes = 0
-    for job in client.list_jobs(min_creation_time=since, all_users=True):
-        if job.job_type != "query":
-            continue
-        billed = getattr(job, "total_bytes_billed", None) or 0
-        if billed:
-            n += 1
-            total_bytes += billed
-
-    gib = total_bytes / 1024**3
-    tib = total_bytes / 1024**4
-    usd = tib * USD_PER_TIB
-
-    print(f"Project        : {args.project}")
-    print(f"Window         : last {args.hours}h")
-    print(f"Billed queries : {n}")
-    print(f"Bytes billed   : {gib:,.2f} GiB ({tib:.4f} TiB)")
-    print(f"Cost (on-demand): ${usd:,.4f}")
+    sys.exit(2)
 
 
 if __name__ == "__main__":

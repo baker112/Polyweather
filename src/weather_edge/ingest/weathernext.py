@@ -1,4 +1,4 @@
-"""WeatherNext 2 ingestion — GCS/Zarr only. BigQuery is hard-disabled.
+"""WeatherNext 2 ingestion — GCS/Zarr only.
 
 Google DeepMind's diffusion-based ensemble model:
   - 64-member ensemble (`sample` dim)
@@ -23,26 +23,21 @@ The historic and per-init stores use different dim names (`time` is init in
 the former, lead in the latter). _open_and_normalize() renames everything to
 canonical (init_time, prediction_timedelta, sample, lat, lon) before concat.
 
-BigQuery backend — HARD-DISABLED:
-  The library used to support a BigQuery backend via WEATHERNEXT_BACKEND=bigquery.
-  That code path nearly cost £215 (199 TiB scanned) in 2026-05 and has been
-  intentionally disabled at the entrypoints (`ingest_forecasts`, `ingest_historic`)
-  via `_assert_no_bq_backend()`. The BQ helper functions below remain in the file
-  for reference, but no public entrypoint dispatches to them. The associated
-  backfill script (`scripts/backfill_weathernext.py`) is also stubbed.
+BigQuery — REMOVED:
+  The library used to support a BigQuery backend that nearly cost £215
+  (199 TiB scanned) in 2026-05. After the empirical confirmation that GCS
+  egress from gs://weathernext is sponsor-paid (5 GiB test → £0 charge on
+  2026-05-16), BQ was nuked: google-cloud-bigquery removed from
+  pyproject.toml, BQ helpers deleted from this file, BQ scripts stubbed.
+  `_assert_no_bq_backend()` remains as a guard so a stale
+  WEATHERNEXT_BACKEND env var fails loudly rather than silently.
 
-  To re-enable BigQuery (you almost certainly do not want to), you must:
-    1. Delete `_assert_no_bq_backend()` calls in `ingest_forecasts` / `ingest_historic`.
-    2. Restore the env-var dispatch (`if backend == "bigquery": ...`).
-    3. Restore `scripts/backfill_weathernext.py` from git.
-  Three locks, by design.
-
-GCS backend (the only live path):
+GCS backend (the only path):
   Reads from gs://weathernext/. Each (init, station) fetch transfers ~4 GiB
   (chunks span the full lat/lon grid; we pull one chunk per (member, lead)
-  we want). Egress is covered by Google for this public dataset — empirically
-  verified 2026-05-16: 5 GiB test pull from Toronto VPS resulted in £0 Cloud
-  Storage charge. Backfill is free.
+  we want). Egress is sponsor-paid for this public dataset — empirically
+  verified 2026-05-16: 5 GiB test pull from Toronto VPS resulted in £0
+  Cloud Storage charge.
 
 GCS env vars:
   WEATHERNEXT_GCS_BASE            — Zarr collection root (default
@@ -75,41 +70,11 @@ from weather_edge.exceptions import IngestError
 _logger = logging.getLogger(__name__)
 _MODEL = "weathernext"
 
-# Schema (verified 2026-05-13 against the linked Analytics Hub share):
-#   init_time                TIMESTAMP
-#   geography                GEOGRAPHY   (POINT lon/lat of the 0.25° cell centre)
-#   geography_polygon        GEOGRAPHY
-#   forecast                 RECORD REPEATED
-#     time                   TIMESTAMP  (valid time of this lead)
-#     hours                  INT64       (lead hours)
-#     ensemble               RECORD REPEATED
-#       ensemble_member      STRING      ("00".."49")
-#       2m_temperature       FLOAT64     (Kelvin)
-#       ... other variables (winds, MSLP, etc.) ...
-_COL_INIT_TIME = "init_time"
-_COL_GEOG = "geography"
-_COL_FORECAST = "forecast"
-_FCS_VALID_TIME = "time"
-_FCS_ENSEMBLE = "ensemble"
-_ENS_MEMBER = "ensemble_member"
-_ENS_T2M = "`2m_temperature`"  # backticked: identifier starts with a digit
-
-# Bounding box (degrees) around station lat/lon: pull all grid cells inside this
-# half-width. 0.3° at 50°N covers roughly the nearest 4 cells of a 0.25° grid,
-# which is enough for a simple inverse-distance interpolation.
-_BBOX_HALFWIDTH_DEG = 0.3
-
-# Cap forecast lead in BigQuery so we don't scan the full 15-day horizon.
-# The pipeline's EMOS/BMA use lead buckets (24, 48, 72); 96h buffers all of
-# those. Bumping this would let you experiment with longer leads later, at
-# 1× scan-cost growth per ~24h added.
+# Cap forecast lead so we don't load every chunk to 15-day horizon. The pipeline's
+# EMOS/BMA use lead buckets (24, 48, 72); 96h buffers all of those. Bumping this
+# lets you experiment with longer leads later (small extra GCS transfer per added
+# 24h since each chunk is one lead step).
 _MAX_LEAD_HOURS = 96
-
-# Hard ceiling on bytes-billed per BQ query. Default 2 GB ≈ $0.012 — a single-init
-# real-time query scans well under this; anything larger is almost certainly an
-# accident. The backfill script raises this per-chunk after a dry-run estimate.
-_DEFAULT_MAX_BYTES_BILLED_GB = 2.0
-_USD_PER_TIB = 6.25  # BQ on-demand pricing
 
 _DEFAULT_GCS_BASE = "gs://weathernext/weathernext_2_0_0/zarr/"
 
@@ -135,43 +100,12 @@ def _assert_no_bq_backend() -> None:
         )
 
 
-def _max_bytes_billed() -> int:
-    gb = float(os.getenv("WEATHERNEXT_MAX_BYTES_BILLED_GB", _DEFAULT_MAX_BYTES_BILLED_GB))
-    return int(gb * 1024**3)
-
-
-def _bq_client() -> Any:
-    try:
-        from google.cloud import bigquery  # type: ignore[import-untyped]
-    except ImportError as exc:
-        raise IngestError(
-            "google-cloud-bigquery not installed — add to pyproject.toml and reinstall"
-        ) from exc
-    project = os.getenv("WEATHERNEXT_PROJECT")
-    if not project:
-        raise IngestError("WEATHERNEXT_PROJECT env var not set")
-    return bigquery.Client(project=project)
-
-
-def _fq_table() -> str:
-    project = os.getenv("WEATHERNEXT_PROJECT")
-    dataset = os.getenv("WEATHERNEXT_DATASET")
-    table = os.getenv("WEATHERNEXT_TABLE", "weathernext_2_0_0")
-    if not (project and dataset):
-        raise IngestError(
-            "WEATHERNEXT_PROJECT and WEATHERNEXT_DATASET env vars must both be set"
-        )
-    return f"`{project}.{dataset}.{table}`"
-
-
 def ingest_forecasts(init_dt: datetime, station: StationConfig) -> pl.DataFrame:
     """Fetch 64-member WN2 2m temperature for a single init and return per-member daily max.
 
     Columns: model, member_id, init_datetime, valid_date, station, daily_max_c, lead_hours
 
-    Always uses the GCS Zarr backend. BigQuery dispatch is hard-disabled here
-    after the 199 TiB / £215 near-miss in 2026-05. To re-enable BQ you must
-    delete the guard below AND remove the disable in `ingest_historic`.
+    GCS/Zarr only; BigQuery has been removed. See module docstring.
     """
     _assert_no_bq_backend()
     init_utc = init_dt.replace(tzinfo=timezone.utc)
@@ -206,134 +140,6 @@ def ingest_historic(
         station=station,
         init_hours=init_hours,
     )
-
-
-def _bq_query_and_reduce(
-    init_start: datetime,
-    init_end: datetime,
-    station: StationConfig,
-    init_hours: tuple[int, ...] | None = None,
-) -> pl.DataFrame:
-    """Run the BQ aggregation query and assemble the parquet-shaped DataFrame.
-
-    All heavy work (UNNEST, nearest-cell pick, local-timezone bucketing, daily
-    max) runs in BigQuery — Python only sees ~50 members × ~6 valid_dates per
-    init in the result set, so monthly chunks return ~20k rows instead of
-    ~720k. A pure-Python row loop on that scale was the previous bottleneck.
-    """
-    from google.cloud import bigquery  # type: ignore[import-untyped]
-
-    client = _bq_client()
-    table = _fq_table()
-    lat_lo = station.lat - _BBOX_HALFWIDTH_DEG
-    lat_hi = station.lat + _BBOX_HALFWIDTH_DEG
-    lon_lo = station.lon - _BBOX_HALFWIDTH_DEG
-    lon_hi = station.lon + _BBOX_HALFWIDTH_DEG
-
-    hours_clause = ""
-    params = [
-        bigquery.ScalarQueryParameter("init_start", "TIMESTAMP", init_start),
-        bigquery.ScalarQueryParameter("init_end", "TIMESTAMP", init_end),
-        bigquery.ScalarQueryParameter("max_lead", "INT64", _MAX_LEAD_HOURS),
-        bigquery.ScalarQueryParameter("lat_lo", "FLOAT64", lat_lo),
-        bigquery.ScalarQueryParameter("lat_hi", "FLOAT64", lat_hi),
-        bigquery.ScalarQueryParameter("lon_lo", "FLOAT64", lon_lo),
-        bigquery.ScalarQueryParameter("lon_hi", "FLOAT64", lon_hi),
-        bigquery.ScalarQueryParameter("station_lat", "FLOAT64", station.lat),
-        bigquery.ScalarQueryParameter("station_lon", "FLOAT64", station.lon),
-        bigquery.ScalarQueryParameter("tz", "STRING", station.timezone),
-    ]
-    if init_hours:
-        hours_clause = f"AND EXTRACT(HOUR FROM {_COL_INIT_TIME}) IN UNNEST(@init_hours)"
-        params.append(
-            bigquery.ArrayQueryParameter("init_hours", "INT64", list(init_hours))
-        )
-
-    # Strategy (all in SQL):
-    #   1. UNNEST the nested forecast/ensemble arrays inside the bbox+time window.
-    #   2. For each (init, member, valid_time), pick the single nearest grid
-    #      cell — interpolating across 4 cells gives sub-0.1°C gain that EMOS
-    #      bias correction absorbs anyway, not worth the row blowup.
-    #   3. Bucket valid_time into the station's LOCAL date via DATE(ts, @tz).
-    #   4. MAX over the local day → one row per (init, member, local_date).
-    sql = f"""
-        WITH expanded AS (
-          SELECT
-            {_COL_INIT_TIME}    AS init_time,
-            f.{_FCS_VALID_TIME} AS valid_time,
-            e.{_ENS_MEMBER}     AS member,
-            e.{_ENS_T2M}        AS t2m_k,
-            ST_DISTANCE({_COL_GEOG}, ST_GEOGPOINT(@station_lon, @station_lat)) AS dist_m
-          FROM {table},
-          UNNEST({_COL_FORECAST}) AS f,
-          UNNEST(f.{_FCS_ENSEMBLE}) AS e
-          WHERE {_COL_INIT_TIME} BETWEEN @init_start AND @init_end
-            AND f.hours <= @max_lead
-            AND ST_Y({_COL_GEOG}) BETWEEN @lat_lo AND @lat_hi
-            AND ST_X({_COL_GEOG}) BETWEEN @lon_lo AND @lon_hi
-            {hours_clause}
-        ),
-        nearest AS (
-          SELECT init_time, valid_time, member, t2m_k
-          FROM expanded
-          QUALIFY ROW_NUMBER() OVER (
-            PARTITION BY init_time, valid_time, member ORDER BY dist_m
-          ) = 1
-        )
-        SELECT
-          init_time,
-          member,
-          DATE(valid_time, @tz) AS local_date,
-          MAX(t2m_k) - 273.15   AS daily_max_c
-        FROM nearest
-        WHERE t2m_k IS NOT NULL
-        GROUP BY init_time, member, local_date
-    """
-
-    cfg = bigquery.QueryJobConfig(
-        query_parameters=params,
-        use_query_cache=True,             # free re-reads of identical queries within 24h
-        maximum_bytes_billed=_max_bytes_billed(),
-    )
-
-    try:
-        job = client.query(sql, job_config=cfg)
-        rows = list(job.result())
-    except Exception as exc:
-        raise IngestError(f"WeatherNext BigQuery query failed: {exc}") from exc
-
-    billed = getattr(job, "total_bytes_billed", 0) or 0
-    cached = getattr(job, "cache_hit", False)
-    gib = billed / 1024**3
-    usd = (billed / 1024**4) * _USD_PER_TIB
-    _logger.info(
-        "WN2 query: billed=%.2f GiB ($%.4f)%s init=[%s,%s]",
-        gib, usd, " (cache hit)" if cached else "", init_start.isoformat(), init_end.isoformat(),
-    )
-
-    if not rows:
-        raise IngestError(
-            f"WeatherNext: no rows for {station.icao} init in [{init_start}, {init_end}]"
-        )
-
-    tz = zoneinfo.ZoneInfo(station.timezone)
-    rows_out: list[dict[str, Any]] = []
-    for r in rows:
-        init_utc = r["init_time"]
-        if init_utc.tzinfo is None:
-            init_utc = init_utc.replace(tzinfo=timezone.utc)
-        local_day = r["local_date"]  # already a `date` object from BQ DATE()
-        rows_out.append({
-            "model": _MODEL,
-            "member_id": _coerce_member_int(r["member"]),
-            "init_datetime": init_utc,
-            "valid_date": local_day,
-            "station": station.icao,
-            "daily_max_c": float(r["daily_max_c"]),
-            "lead_hours": _lead_hours(init_utc, local_day, tz),
-        })
-
-    return pl.DataFrame(rows_out)
 
 
 def _resolve_uris(
@@ -473,16 +279,16 @@ def _gcs_query_and_reduce(
     station: StationConfig,
     init_hours: tuple[int, ...] | None = None,
 ) -> pl.DataFrame:
-    """GCS/Zarr equivalent of _bq_query_and_reduce.
+    """Open WN2 Zarr stores for [init_start, init_end] and reduce to daily max per member.
 
-    Opens all stores covering [init_start, init_end] via `_open_combined` —
-    handles the historic-vs-per-init layout difference and returns one Dataset
-    with canonical dims. Then: nearest-cell pick, lead cap, local-tz bucketing,
+    Opens all stores covering the window via `_open_combined` — handles the
+    historic-vs-per-init layout difference and returns one Dataset with
+    canonical dims. Then: nearest-cell pick, lead cap, local-tz bucketing,
     daily max per (init, member, local_date).
 
     Per-(init, station) fetch transfers ~4 GiB of chunks (each chunk spans the
-    full lat/lon grid). Egress is free for this public dataset — see module
-    docstring.
+    full lat/lon grid). Egress is sponsor-paid for this public dataset — see
+    module docstring.
     """
     import numpy as np
     import pandas as pd
@@ -592,57 +398,6 @@ def _pick_var(ds: Any, candidates: tuple[str, ...]) -> str:
         f"WeatherNext Zarr missing expected variable — tried {candidates}, "
         f"found {list(ds.data_vars)}. Run scripts/weathernext_gcs_probe.py to inspect."
     )
-
-
-def estimate_historic_bytes(
-    start_date: date,
-    end_date: date,
-    station: StationConfig,
-    init_hours: tuple[int, ...] = (0, 12),
-) -> int:
-    """Dry-run the historic query and return bytes BigQuery would bill.
-
-    Charges nothing — uses `dry_run=True`. Use this before kicking off a
-    multi-year backfill so you can put a USD number on it first.
-    """
-    from google.cloud import bigquery  # type: ignore[import-untyped]
-
-    init_start = datetime(start_date.year, start_date.month, start_date.day, 0, tzinfo=timezone.utc)
-    init_end = datetime(end_date.year, end_date.month, end_date.day, 23, 59, 59, tzinfo=timezone.utc)
-
-    client = _bq_client()
-    table = _fq_table()
-    lat_lo = station.lat - _BBOX_HALFWIDTH_DEG
-    lat_hi = station.lat + _BBOX_HALFWIDTH_DEG
-    lon_lo = station.lon - _BBOX_HALFWIDTH_DEG
-    lon_hi = station.lon + _BBOX_HALFWIDTH_DEG
-
-    params = [
-        bigquery.ScalarQueryParameter("init_start", "TIMESTAMP", init_start),
-        bigquery.ScalarQueryParameter("init_end", "TIMESTAMP", init_end),
-        bigquery.ScalarQueryParameter("max_lead", "INT64", _MAX_LEAD_HOURS),
-        bigquery.ScalarQueryParameter("lat_lo", "FLOAT64", lat_lo),
-        bigquery.ScalarQueryParameter("lat_hi", "FLOAT64", lat_hi),
-        bigquery.ScalarQueryParameter("lon_lo", "FLOAT64", lon_lo),
-        bigquery.ScalarQueryParameter("lon_hi", "FLOAT64", lon_hi),
-        bigquery.ScalarQueryParameter("station_lat", "FLOAT64", station.lat),
-        bigquery.ScalarQueryParameter("station_lon", "FLOAT64", station.lon),
-        bigquery.ScalarQueryParameter("tz", "STRING", station.timezone),
-        bigquery.ArrayQueryParameter("init_hours", "INT64", list(init_hours)),
-    ]
-    sql = f"""
-        SELECT 1 FROM {table},
-        UNNEST({_COL_FORECAST}) AS f,
-        UNNEST(f.{_FCS_ENSEMBLE}) AS e
-        WHERE {_COL_INIT_TIME} BETWEEN @init_start AND @init_end
-          AND f.hours <= @max_lead
-          AND ST_Y({_COL_GEOG}) BETWEEN @lat_lo AND @lat_hi
-          AND ST_X({_COL_GEOG}) BETWEEN @lon_lo AND @lon_hi
-          AND EXTRACT(HOUR FROM {_COL_INIT_TIME}) IN UNNEST(@init_hours)
-    """
-    cfg = bigquery.QueryJobConfig(query_parameters=params, dry_run=True, use_query_cache=False)
-    job = client.query(sql, job_config=cfg)
-    return int(getattr(job, "total_bytes_processed", 0) or 0)
 
 
 def _coerce_member_int(member: Any) -> int:
