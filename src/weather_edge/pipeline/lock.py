@@ -128,34 +128,44 @@ def lock_picks(
     provenance["init_dt"] = init_dt.isoformat()
     if bma_mode_override:
         provenance["bma_mode_override"] = bma_mode_override
+
+    # In wn2_only mode the other models aren't used for the pick. Skip their
+    # ingests entirely — they pull from rate-limited (multiurl) sources and
+    # can serially block the WN2 ingest for minutes if e.g. GEFS is 429'd.
+    effective_bma_mode = bma_mode_override or station.bma_mode
+    skip_non_wn2 = effective_bma_mode == "wn2_only"
+    if skip_non_wn2:
+        provenance["skipped_non_wn2_ingests"] = True
+
     forecast_dfs: list[pl.DataFrame] = []
 
-    try:
-        from weather_edge.ingest import ecmwf
-        df_ecmwf = _load_or_fetch_forecasts("ecmwf", init_dt, station, ecmwf.ingest_forecasts)
-        forecast_dfs.append(df_ecmwf)
-        provenance["ecmwf_members"] = int(df_ecmwf.filter(pl.col("valid_date") == target_date).height)
-    except (IngestError, Exception) as exc:
-        _logger.warning("ECMWF ingest failed: %s", exc)
-        provenance["ecmwf_error"] = str(exc)
+    if not skip_non_wn2:
+        try:
+            from weather_edge.ingest import ecmwf
+            df_ecmwf = _load_or_fetch_forecasts("ecmwf", init_dt, station, ecmwf.ingest_forecasts)
+            forecast_dfs.append(df_ecmwf)
+            provenance["ecmwf_members"] = int(df_ecmwf.filter(pl.col("valid_date") == target_date).height)
+        except (IngestError, Exception) as exc:
+            _logger.warning("ECMWF ingest failed: %s", exc)
+            provenance["ecmwf_error"] = str(exc)
 
-    try:
-        from weather_edge.ingest import gefs
-        df_gefs = _load_or_fetch_forecasts("gefs", init_dt, station, gefs.ingest_forecasts)
-        forecast_dfs.append(df_gefs)
-        provenance["gefs_members"] = int(df_gefs.filter(pl.col("valid_date") == target_date).height)
-    except (IngestError, Exception) as exc:
-        _logger.warning("GEFS ingest failed: %s", exc)
-        provenance["gefs_error"] = str(exc)
+        try:
+            from weather_edge.ingest import gefs
+            df_gefs = _load_or_fetch_forecasts("gefs", init_dt, station, gefs.ingest_forecasts)
+            forecast_dfs.append(df_gefs)
+            provenance["gefs_members"] = int(df_gefs.filter(pl.col("valid_date") == target_date).height)
+        except (IngestError, Exception) as exc:
+            _logger.warning("GEFS ingest failed: %s", exc)
+            provenance["gefs_error"] = str(exc)
 
-    try:
-        from weather_edge.ingest import icon
-        df_icon = _load_or_fetch_forecasts("icon", init_dt, station, icon.ingest_forecasts)
-        forecast_dfs.append(df_icon)
-        provenance["icon_members"] = int(df_icon.filter(pl.col("valid_date") == target_date).height)
-    except (IngestError, Exception) as exc:
-        _logger.warning("ICON ingest failed: %s", exc)
-        provenance["icon_error"] = str(exc)
+        try:
+            from weather_edge.ingest import icon
+            df_icon = _load_or_fetch_forecasts("icon", init_dt, station, icon.ingest_forecasts)
+            forecast_dfs.append(df_icon)
+            provenance["icon_members"] = int(df_icon.filter(pl.col("valid_date") == target_date).height)
+        except (IngestError, Exception) as exc:
+            _logger.warning("ICON ingest failed: %s", exc)
+            provenance["icon_error"] = str(exc)
 
     try:
         from weather_edge.ingest import weathernext
