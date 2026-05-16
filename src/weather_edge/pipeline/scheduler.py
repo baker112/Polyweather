@@ -113,22 +113,45 @@ def _intraday_lock_job(station_id: str) -> None:
     TRADING_ENABLED / LIVE_TRADING flow as the regular lock.
     """
     from weather_edge.pipeline.lock import lock_picks, _most_recent_init
-    from weather_edge.exceptions import AlreadyLockedError
+    from weather_edge.exceptions import AlreadyLockedError, IngestError
 
     now_utc = datetime.now(timezone.utc)
     target_date = now_utc.date()
-    init_dt = _most_recent_init(now_utc, min_lag_hours=4)
+    # Try the freshest init first, fall back to progressively older ones if
+    # WN2 publication latency exceeded our expected lag. Three attempts:
+    # ~6h lag → ~12h lag → ~18h lag.
+    result = None
+    last_exc: Exception | None = None
+    init_dt = None
+    for min_lag in (6, 12, 18):
+        init_dt = _most_recent_init(now_utc, min_lag_hours=min_lag)
+        try:
+            # force=True: an intraday run may follow the same-day regular lock, so
+            # overwrite — the intraday picks are intentionally the fresher view.
+            # Quarter Kelly (0.25) because the mode is new and unbacktested.
+            result = lock_picks(
+                target_date, station_id, now_utc,
+                force=True,
+                bma_mode_override="wn2_only",
+                init_dt_override=init_dt,
+                kelly_multiplier_override=0.25,
+            )
+            break
+        except AlreadyLockedError:
+            raise
+        except IngestError as exc:
+            last_exc = exc
+            _logger.warning(
+                "Intraday %s: init %s not available (%s); retrying with older init",
+                station_id, init_dt.strftime("%Y-%m-%d %HZ"), exc,
+            )
+            continue
+    if result is None:
+        msg = f"all WN2 init attempts failed: {last_exc}"
+        _logger.error("Intraday lock failed %s %s: %s", station_id, target_date, msg)
+        _tg.send(f"❌ <b>Intraday FAILED: {station_id}</b> · {target_date}\n{msg}")
+        return
     try:
-        # force=True: an intraday run may follow the same-day regular lock, so
-        # overwrite — the intraday picks are intentionally the fresher view.
-        # Quarter Kelly (0.25) because the mode is new and unbacktested.
-        result = lock_picks(
-            target_date, station_id, now_utc,
-            force=True,
-            bma_mode_override="wn2_only",
-            init_dt_override=init_dt,
-            kelly_multiplier_override=0.25,
-        )
         lead_h = int((datetime(target_date.year, target_date.month, target_date.day, 12, tzinfo=timezone.utc) - init_dt).total_seconds() // 3600)
         _logger.info(
             "Intraday locked %s %s: mu=%.2f sigma=%.2f picks=%d (init=%s, lead≈%dh)",
@@ -160,7 +183,13 @@ def _intraday_lock_job(station_id: str) -> None:
         _tg.send(f"❌ <b>Intraday FAILED: {station_id}</b> · {target_date}\n{exc}")
 
 
-def _resolve_and_observe_job(station_id: str) -> None:
+def _resolve_and_observe_job(station_id: str, target_date: "date | None" = None) -> None:
+    """Resolve a single (station, date) and settle any executed bets.
+
+    target_date=None defaults to yesterday (the scheduled-cron behaviour).
+    Pass an explicit date to backfill resolution for missed days after
+    scheduler downtime.
+    """
     import asyncio
     from datetime import timedelta
 
@@ -170,7 +199,7 @@ def _resolve_and_observe_job(station_id: str) -> None:
     from weather_edge.store import parquet as store
 
     now_utc = datetime.now(timezone.utc)
-    yesterday = (now_utc - timedelta(days=1)).date()
+    yesterday = target_date if target_date is not None else (now_utc - timedelta(days=1)).date()
     cfg = get_station(station_id)
 
     try:
@@ -1214,6 +1243,49 @@ def start(stations: list[str]) -> None:
             _spawn(f"manual-resolve-{sid}", _resolve_and_observe_job, sid)
         return f"Resolve dispatched for {len(targets)} station(s): {', '.join(targets)}"
 
+    def _cmd_resolve_missed(args: str = "") -> str:
+        """Backfill resolution + settlement for the last N days.
+
+        /resolve_missed             — last 7 days, all stations
+        /resolve_missed 14          — last 14 days
+        /resolve_missed 7 EGLC KLGA — last 7 days, just those stations
+        """
+        from datetime import date as _date, timedelta as _td
+        tokens = args.replace(",", " ").split()
+        days = 7
+        wanted_stations: list[str] = []
+        for tok in tokens:
+            if tok.isdigit():
+                days = max(1, min(int(tok), 30))
+            elif tok.upper() in stations:
+                wanted_stations.append(tok.upper())
+        targets = wanted_stations or list(stations)
+
+        today = datetime.now(timezone.utc).date()
+        dates = [today - _td(days=i) for i in range(1, days + 1)]
+
+        def _run() -> None:
+            _tg.send(
+                f"🔧 <b>Resolve-missed dispatched</b>\n"
+                f"Days: {days} ({dates[-1]} → {dates[0]})\n"
+                f"Stations: {', '.join(targets)}"
+            )
+            n_done = 0
+            for sid in targets:
+                for d in dates:
+                    try:
+                        _resolve_and_observe_job(sid, target_date=d)
+                        n_done += 1
+                    except Exception as exc:
+                        _logger.error("Resolve-missed %s %s failed: %s", sid, d, exc)
+            _tg.send(f"✅ <b>Resolve-missed done</b>: {n_done}/{len(targets) * len(dates)} (station, date) attempts.")
+
+        _spawn("manual-resolve-missed", _run)
+        return (
+            f"Resolve-missed dispatched: {days}d × {len(targets)} station(s). "
+            f"Results follow when done."
+        )
+
     def _cmd_summary(args: str = "") -> str:
         _spawn("manual-summary", _daily_summary_job, list(stations))
         return "Daily summary dispatched."
@@ -1250,6 +1322,7 @@ def start(stations: list[str]) -> None:
         "/ingest": _cmd_ingest,
         "/execute": _cmd_execute,
         "/resolve": _cmd_resolve,
+        "/resolve_missed": _cmd_resolve_missed,
         "/summary": _cmd_summary,
         "/mode": _cmd_mode,
         "/live": _cmd_live,
@@ -1263,7 +1336,7 @@ def start(stations: list[str]) -> None:
         f"Mode: {_current_mode()}\n"
         f"{live_line}"
         f"Stations: {', '.join(stations)}\n"
-        f"Commands: /status /picks /bankroll /pnl /topstations /losers /summary /lock /intraday /ingest /execute /resolve /mode /live /backtest"
+        f"Commands: /status /picks /bankroll /pnl /topstations /losers /summary /lock /intraday /ingest /execute /resolve /resolve_missed /mode /live /backtest"
     )
 
     # Run any missed jobs from earlier today (e.g. after VPS reboot)

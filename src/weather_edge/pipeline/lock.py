@@ -640,15 +640,19 @@ def _most_recent_12z(now_utc: datetime) -> datetime:
     return yesterday.replace(hour=12, minute=0, second=0, microsecond=0)
 
 
-def _most_recent_init(now_utc: datetime, min_lag_hours: int = 4) -> datetime:
+def _most_recent_init(now_utc: datetime, min_lag_hours: int = 6) -> datetime:
     """Return the most recent WN2 init (00/06/12/18 UTC) published at least `min_lag_hours` ago.
 
-    Used by the intraday lock job: at 11:00 UTC with min_lag=4, we'd get the day's
-    06z init (5h old). At 17:00 UTC we'd get 12z (5h old). Falls back to earlier
-    inits if the desired one hasn't published yet.
+    Default `min_lag_hours=6`: empirical WN2 publication latency on GCS exceeds 5
+    hours sometimes (observed 2026-05-16: 12z init not present at 17:00 UTC).
+    6 is the conservative-but-still-fresh choice. Callers can pass a larger
+    value (e.g. 12) for the fallback retry path when the chosen init has not
+    yet published.
 
-    WN2 release latency in practice is ~3-5 hours, so a min_lag of 4 is the
-    conservative-but-fresh sweet spot for an intraday short-lead forecast.
+    Examples (with default min_lag=6):
+      - 12:30 UTC → cutoff 06:30 → 06z init (6.5h old). Lead to 14z peak = 8h.
+      - 17:30 UTC → cutoff 11:30 → 06z init (11.5h old). Lead to 19z peak = 13h.
+      - 18:30 UTC → cutoff 12:30 → 12z init (6.5h old). Lead to 20z peak = 8h.
     """
     now_utc = now_utc.replace(tzinfo=timezone.utc)
     cutoff = now_utc - timedelta(hours=min_lag_hours)
