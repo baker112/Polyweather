@@ -393,6 +393,8 @@ def _compute_peak_bet(
     )
 
     # Find the bracket containing μ. Brackets may have open endpoints (None means ±∞).
+    # Both μ and bracket bounds are in Celsius — market/polymarket.py:_to_celsius()
+    # converts Fahrenheit bracket labels for US stations before they reach here.
     target_bracket = None
     for b in brackets:
         low_ok = b.low is None or mu >= b.low
@@ -402,8 +404,15 @@ def _compute_peak_bet(
             break
 
     if target_bracket is None:
+        bracket_summary = [
+            f"{b.label}=[{b.low if b.low is not None else '−∞'}, {b.high if b.high is not None else '+∞'})"
+            for b in brackets
+        ]
         provenance["wn2_peak_target_bracket"] = None
-        provenance["wn2_peak_skip_reason"] = f"μ={mu:.2f} not in any bracket"
+        provenance["wn2_peak_available_brackets"] = bracket_summary
+        provenance["wn2_peak_skip_reason"] = (
+            f"μ={mu:.2f}°C outside bracket range — available: {bracket_summary}"
+        )
         return []
 
     provenance["wn2_peak_target_bracket"] = target_bracket.label

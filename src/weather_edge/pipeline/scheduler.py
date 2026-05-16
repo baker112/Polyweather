@@ -124,6 +124,31 @@ def _peak_lock_job(station_id: str) -> None:
     _intraday_run(station_id, mode="wn2_peak")
 
 
+def _summarise_no_edge(reason: str | None) -> str:
+    """Condense a verbose no_edge_reason into a single readable line for Telegram."""
+    if not reason:
+        return "all edges below threshold"
+    r = reason
+    if "wn2_peak skipped:" in r:
+        # Already short. Strip the bracket dump tail if present.
+        head = r.split("(available:", 1)[0].strip()
+        return head if head else r
+    if "no_edge — gates:" in r:
+        # Summarise by counting which gate failed most.
+        import re
+        rest = r.split("no_edge — gates:", 1)[1]
+        items = [i.strip() for i in rest.split(";") if i.strip()]
+        counts: dict[str, int] = {}
+        for item in items:
+            # tokens like "liq=$0<$100", "edge=+0.010<0.025", "top=$0.0<$20", "net_edge=..."
+            kind = re.match(r"[^:]+:\s*([a-z_]+)=", item)
+            key = kind.group(1) if kind else "other"
+            counts[key] = counts.get(key, 0) + 1
+        summary = ", ".join(f"{k}×{v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
+        return f"{len(items)} gate failures: {summary}"
+    return r[:160] + ("…" if len(r) > 160 else "")
+
+
 def _intraday_run(station_id: str, mode: str = "wn2_only") -> None:
     """Shared body for _intraday_lock_job and _peak_lock_job.
 
@@ -178,21 +203,21 @@ def _intraday_run(station_id: str, mode: str = "wn2_only") -> None:
         )
         if result.picks:
             lines = [
-                f"{icon} <b>{label} pick: {station_id}</b> · {target_date}",
-                f"   init={init_dt.strftime('%H')}z lead≈{lead_h}h · μ={result.mu:.1f}°C σ={result.sigma:.2f}",
+                f"{icon} <b>{label} {station_id}</b> · {target_date}  μ={result.mu:.1f}°C  σ={result.sigma:.2f}",
             ]
             for p in result.picks:
-                cap_str = f"  cap=${p.max_stake_usdc:.0f}" if p.max_stake_usdc is not None else ""
+                cap_str = f" / cap=${p.max_stake_usdc:.0f}" if p.max_stake_usdc is not None else ""
                 lines.append(
                     f"  {'🟢' if p.side == 'YES' else '🔴'} {p.side} {p.bracket_label}"
-                    f"  model={p.model_prob:.0%}  mkt={p.market_prob:.0%}  edge={p.edge:+.1%}"
-                    f"  kelly={p.kelly_fraction:.1%}{cap_str}"
+                    f"  {p.kelly_fraction:.1%} of bankroll{cap_str}"
+                    f"  ({p.model_prob:.0%} model vs {p.market_prob:.0%} mkt)"
                 )
             _tg.send("\n".join(lines))
         else:
+            short_reason = _summarise_no_edge(result.no_edge_reason)
             _tg.send(
-                f"{icon} <b>{label} no-edge: {station_id}</b> · {target_date} (init={init_dt.strftime('%H')}z)"
-                f"\n{result.no_edge_reason or 'all edges below threshold'}"
+                f"{icon} <b>{label} {station_id}</b> · {target_date}  μ={result.mu:.1f}°C — no pick\n"
+                f"  {short_reason}"
             )
     except AlreadyLockedError:
         _logger.info("%s: already locked %s %s — skipping", label, station_id, target_date)
