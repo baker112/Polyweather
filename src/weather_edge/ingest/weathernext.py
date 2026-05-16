@@ -1,19 +1,35 @@
 """WeatherNext 2 ingestion — GCS/Zarr (default) or BigQuery (opt-in).
 
 Google DeepMind's diffusion-based ensemble model:
-  - ~50-member ensemble
-  - 0.25° grid (~28 km)
+  - 64-member ensemble (`sample` dim)
+  - 0.25° grid (721 lat × 1440 lon, longitudes 0..360)
   - 6-hour init cadence (00/06/12/18 UTC)
-  - 6-hour lead steps to +15 days
+  - 6-hour lead steps to +15 days (60 leads, `prediction_timedelta` dim)
   - Variable name: `2m_temperature` (Kelvin)
 
 Real-time (init_time within last 48h)  → GDM Real-Time Experimental Data ToS.
 Historic (init_time older than 48h)    → CC BY 4.0.
 
+GCS layout (resolver in _resolve_uris):
+  gs://weathernext/weathernext_2_0_0/zarr/
+    ├── 2022_to_2023/predictions.zarr/      ← consolidated 5D, all 1460 inits for 2022
+    ├── 2023_to_2024/predictions.zarr/
+    ├── 2024_to_2025/predictions.zarr/
+    └── 2025_to_present/
+        └── YYYYMMDD_HHhr_01_preds/
+            └── predictions.zarr/             ← consolidated 4D, single init
+
+The historic and per-init stores use different dim names (`time` is init in
+the former, lead in the latter). _open_and_normalize() renames everything to
+canonical (init_time, prediction_timedelta, sample, lat, lon) before concat.
+
 Backends:
-  gcs (default)  — reads `gs://weathernext/weathernext_2_0_0/` as a Zarr store.
-                   Free same-region egress to your Compute Engine VM, $0.02/GiB
-                   cross-region. A single-init read fetches MB, not GB.
+  gcs (default)  — reads from gs://weathernext/. Each (init, station) fetch
+                   transfers ~4 GiB (chunks span the full lat/lon grid; we
+                   pull one chunk per (member, lead) we want). Egress is
+                   covered by Google for this public dataset — empirically
+                   verified 2026-05-16: 5 GiB test pull from Toronto VPS
+                   resulted in £0 Cloud Storage charge. Backfill is free.
   bigquery       — opt-in only via WEATHERNEXT_BACKEND=bigquery. Each query is
                    capped by maximum_bytes_billed. Historically a backfill via
                    this backend nearly cost $1.2k; treat any BQ scan as expensive.
@@ -22,7 +38,9 @@ Backend selector:
   WEATHERNEXT_BACKEND             — "gcs" (default) or "bigquery"
 
 GCS backend env vars:
-  WEATHERNEXT_GCS_URI             — Zarr store URI (default "gs://weathernext/weathernext_2_0_0/")
+  WEATHERNEXT_GCS_BASE            — Zarr collection root (default
+                                    "gs://weathernext/weathernext_2_0_0/zarr/").
+                                    Resolver appends year-range or per-init suffixes.
   GOOGLE_APPLICATION_CREDENTIALS  — service-account JSON (optional on a GCE VM
                                     with the default SA already allowlisted)
 
@@ -92,7 +110,12 @@ _MAX_LEAD_HOURS = 96
 _DEFAULT_MAX_BYTES_BILLED_GB = 2.0
 _USD_PER_TIB = 6.25  # BQ on-demand pricing
 
-_DEFAULT_GCS_URI = "gs://weathernext/weathernext_2_0_0/"
+_DEFAULT_GCS_BASE = "gs://weathernext/weathernext_2_0_0/zarr/"
+
+# Boundary year between historic year-partitioned stores and per-init stores.
+# Inits with year < _PER_INIT_FROM_YEAR live in `<Y>_to_<Y+1>/predictions.zarr`.
+# Inits with year >= _PER_INIT_FROM_YEAR live in `2025_to_present/<dir>/predictions.zarr`.
+_PER_INIT_FROM_YEAR = 2025
 
 
 def _backend() -> str:
@@ -313,34 +336,135 @@ def _bq_query_and_reduce(
     return pl.DataFrame(rows_out)
 
 
-def _open_gcs_zarr() -> Any:
-    """Open the WeatherNext Zarr store on GCS. Single-process — let xarray cache it.
+def _resolve_uris(
+    init_start: datetime,
+    init_end: datetime,
+    init_hours: tuple[int, ...] | None,
+) -> list[tuple[str, str]]:
+    """Return [(uri, kind), ...] covering all inits in [init_start, init_end].
 
-    Uses Application Default Credentials. On a Compute Engine VM with the SA
-    allowlisted, no credential file is required; locally, set
-    GOOGLE_APPLICATION_CREDENTIALS to a JSON key.
+    kind is one of:
+      "historic" — one zarr per year (`YYYY_to_YYYY+1/predictions.zarr`).
+                   Covers all inits for that year; caller must slice after open.
+      "per_init" — one zarr per init time (`2025_to_present/<dir>/predictions.zarr`).
+                   URI itself encodes the date+hour, so we only enumerate the
+                   specific inits we want (4 per day max).
+    """
+    base = os.getenv("WEATHERNEXT_GCS_BASE", _DEFAULT_GCS_BASE).rstrip("/")
+    hours = init_hours if init_hours else (0, 6, 12, 18)
+
+    uris: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    year = init_start.year
+    end_year = init_end.year
+    while year <= end_year:
+        if year < _PER_INIT_FROM_YEAR:
+            uri = f"{base}/{year}_to_{year + 1}/predictions.zarr/"
+            if uri not in seen:
+                uris.append((uri, "historic"))
+                seen.add(uri)
+        else:
+            year_start = max(init_start, datetime(year, 1, 1, tzinfo=timezone.utc))
+            year_end = min(init_end, datetime(year, 12, 31, 23, 59, 59, tzinfo=timezone.utc))
+            day = year_start.date()
+            while day <= year_end.date():
+                for h in hours:
+                    init_dt = datetime(day.year, day.month, day.day, h, tzinfo=timezone.utc)
+                    if init_start <= init_dt <= init_end:
+                        dirname = f"{init_dt.strftime('%Y%m%d')}_{h:02d}hr_01_preds"
+                        uri = f"{base}/2025_to_present/{dirname}/predictions.zarr/"
+                        if uri not in seen:
+                            uris.append((uri, "per_init"))
+                            seen.add(uri)
+                day = day + timedelta(days=1)
+        year += 1
+    return uris
+
+
+def _open_and_normalize(uri: str, kind: str) -> Any:
+    """Open one WN2 Zarr store and rename dims to canonical names.
+
+    Both historic and per-init stores carry a dim called `time`, but it means
+    different things:
+      historic:  `time` is the init axis (datetime64, size 1460); `prediction_timedelta`
+                 is the lead axis.
+      per_init:  `time` is the LEAD axis (timedelta64, size 60); `init_time` is a
+                 scalar coord; there is no `prediction_timedelta` dim.
+
+    This function returns a Dataset where init_time is always a dim and
+    prediction_timedelta is always the lead dim — so caller can concat over a
+    mixed list of stores without special-casing.
+    """
+    import pandas as pd  # type: ignore[import-untyped]
+    import xarray as xr  # type: ignore[import-untyped]
+
+    ds = xr.open_zarr(uri, consolidated=True, chunks={})
+    if kind == "historic":
+        if "time" in ds.dims:
+            ds = ds.rename({"time": "init_time"})
+    elif kind == "per_init":
+        if "time" in ds.dims:
+            ds = ds.rename({"time": "prediction_timedelta"})
+        if "init_time" in ds.coords and "init_time" not in ds.dims:
+            init_val = ds["init_time"].values
+            init_ts = pd.Timestamp(init_val)
+            ds = ds.drop_vars("init_time").expand_dims({"init_time": [init_ts]})
+    else:
+        raise IngestError(f"_open_and_normalize: unknown kind {kind!r}")
+    return ds
+
+
+def _open_combined(
+    init_start: datetime,
+    init_end: datetime,
+    init_hours: tuple[int, ...] | None = None,
+) -> Any:
+    """Open every WN2 Zarr store covering [init_start, init_end] and concat them.
+
+    Returns a single xarray.Dataset with canonical dims (init_time, sample,
+    prediction_timedelta, lat, lon). Lazy — heavy fetch happens at .load().
+
+    Per-init stores (2025+) get their scalar init_time promoted to a size-1 dim
+    so they concat cleanly with historic-store inits.
     """
     try:
         import xarray as xr  # type: ignore[import-untyped]
     except ImportError as exc:
         raise IngestError("xarray not installed — required for GCS backend") from exc
     try:
-        import gcsfs  # type: ignore[import-untyped]  # noqa: F401 (auto-registered by fsspec)
-    except ImportError as exc:
-        raise IngestError("gcsfs not installed — required for GCS backend") from exc
-    try:
+        import gcsfs  # type: ignore[import-untyped]  # noqa: F401 (registered by fsspec)
         import zarr  # type: ignore[import-untyped]  # noqa: F401
     except ImportError as exc:
-        raise IngestError("zarr not installed — required for GCS backend") from exc
+        raise IngestError("gcsfs/zarr not installed — required for GCS backend") from exc
 
-    uri = os.getenv("WEATHERNEXT_GCS_URI", _DEFAULT_GCS_URI)
-    try:
-        return xr.open_zarr(uri, consolidated=True, chunks={})
-    except Exception as exc:
+    uris = _resolve_uris(init_start, init_end, init_hours)
+    if not uris:
         raise IngestError(
-            f"Failed to open WeatherNext Zarr at {uri}: {exc}. "
-            "Verify the Compute Engine SA is allowlisted and run scripts/weathernext_gcs_probe.py."
-        ) from exc
+            f"WeatherNext: no zarr stores resolved for [{init_start}, {init_end}]"
+        )
+
+    parts = []
+    for uri, kind in uris:
+        try:
+            ds = _open_and_normalize(uri, kind)
+        except Exception as exc:
+            _logger.warning("WN2 GCS: skipping %s (%s)", uri, exc)
+            continue
+        if "2m_temperature" in ds.data_vars:
+            ds = ds[["2m_temperature"]]
+        if kind == "historic":
+            ds = ds.sel(init_time=slice(init_start, init_end))
+            if ds.sizes.get("init_time", 0) == 0:
+                continue
+        parts.append(ds)
+
+    if not parts:
+        raise IngestError(
+            f"WeatherNext: no openable zarr stores for [{init_start}, {init_end}]. "
+            "Verify the SA is allowlisted and run scripts/weathernext_gcs_probe.py."
+        )
+
+    return xr.concat(parts, dim="init_time", combine_attrs="override")
 
 
 def _gcs_query_and_reduce(
@@ -351,49 +475,46 @@ def _gcs_query_and_reduce(
 ) -> pl.DataFrame:
     """GCS/Zarr equivalent of _bq_query_and_reduce.
 
-    Same output schema. The Zarr store is chunked by (init_time, ensemble, lead, lat, lon)
-    so per-station per-init reads pull MB rather than GB. Reductions happen in xarray.
+    Opens all stores covering [init_start, init_end] via `_open_combined` —
+    handles the historic-vs-per-init layout difference and returns one Dataset
+    with canonical dims. Then: nearest-cell pick, lead cap, local-tz bucketing,
+    daily max per (init, member, local_date).
 
-    Expected Zarr layout (verify on the VPS first with scripts/weathernext_gcs_probe.py):
-      dims  : (time | init_time, prediction_timedelta | step, latitude, longitude,
-               number | sample | ensemble_member)
-      var   : '2m_temperature' (Kelvin)
-      coords: latitude [-90..90], longitude [0..360) or [-180..180)
-
-    The function auto-detects the actual dim names — if discovery fails the error
-    points at the probe script.
+    Per-(init, station) fetch transfers ~4 GiB of chunks (each chunk spans the
+    full lat/lon grid). Egress is free for this public dataset — see module
+    docstring.
     """
     import numpy as np
     import pandas as pd
 
-    ds = _open_gcs_zarr()
+    ds = _open_combined(init_start, init_end, init_hours)
 
-    init_dim = _pick_dim(ds, ("init_time", "time"))
-    lead_dim = _pick_dim(ds, ("prediction_timedelta", "step", "lead_time", "lead"))
+    init_dim = "init_time"
+    lead_dim = "prediction_timedelta"
     lat_dim = _pick_dim(ds, ("latitude", "lat"))
     lon_dim = _pick_dim(ds, ("longitude", "lon"))
-    member_dim = _pick_dim(ds, ("number", "ensemble_member", "sample", "member", "realization"))
+    member_dim = _pick_dim(ds, ("sample", "number", "ensemble_member", "member", "realization"))
     t2m_var = _pick_var(ds, ("2m_temperature", "t2m", "2t"))
 
-    # Convert station longitude to the bucket's convention (0..360 vs -180..180).
+    # Bucket uses 0..360 longitudes; -180..180 stations need wrapping.
     lon_vals = ds[lon_dim].values
     lon_max = float(np.nanmax(lon_vals))
     station_lon = station.lon % 360 if lon_max > 180 else station.lon
 
-    # Slice init window. xarray's sel with a slice handles exact-init and ranges identically.
-    init_sel = ds.sel({init_dim: slice(init_start, init_end)})
+    # init_hours filtering for historic stores (per-init URIs are pre-filtered
+    # by _resolve_uris). Cheap — operates on a small datetime index.
     if init_hours is not None:
-        init_index = pd.DatetimeIndex(init_sel[init_dim].values)
+        init_index = pd.DatetimeIndex(ds[init_dim].values)
         keep = np.isin(init_index.hour, list(init_hours))
         if not keep.any():
             raise IngestError(
                 f"WeatherNext: no inits in [{init_start}, {init_end}] at hours {init_hours}"
             )
-        init_sel = init_sel.isel({init_dim: np.where(keep)[0]})
+        ds = ds.isel({init_dim: np.where(keep)[0]})
 
-    # Nearest single grid cell — interpolating across 4 cells gives sub-0.1°C gain
-    # that EMOS bias absorbs anyway (same rationale as the BQ path).
-    cell = init_sel[t2m_var].sel(
+    # Nearest single cell — interpolating across 4 cells is a <0.1°C gain that
+    # EMOS bias absorbs anyway (same rationale as the BQ path).
+    cell = ds[t2m_var].sel(
         {lat_dim: station.lat, lon_dim: station_lon},
         method="nearest",
     )
