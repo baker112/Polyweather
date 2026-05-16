@@ -408,11 +408,19 @@ def compute_edges(
         has_book_data = outcome.top_ask_size > 0 or outcome.top_bid_size > 0
         net_edge = abs(edge) - outcome.spread
 
+        # max_raw_prob must apply to whichever side we're betting. A NO bet
+        # when model_prob=0.01 means we're betting at 99% NO confidence —
+        # equally as extreme as a YES bet at 99% YES confidence and just as
+        # likely to be model bias rather than real edge. Previously this gate
+        # only checked the YES probability; that let through "model says 0%,
+        # market says 100%, bet NO at -99% edge" picks where WN2 had simply
+        # under-sampled the afternoon peak.
+        confidence_on_bet_side = bp.model_prob if side == "YES" else (1.0 - bp.model_prob)
         gates = {
             "min_edge": abs(edge) >= thresholds.min_edge,
             "max_spread": outcome.spread <= thresholds.max_spread,
             "min_liquidity": outcome.liquidity >= min_liquidity,
-            "max_raw_prob": bp.model_prob <= thresholds.max_raw_prob,
+            "max_raw_prob": confidence_on_bet_side <= thresholds.max_raw_prob,
             "market_fresh": snapshot.fetched_at >= freshness_cutoff,
             "min_top_size": (not has_book_data) or top_size_usdc >= thresholds.min_top_size_usdc,
             "min_net_edge": net_edge >= thresholds.min_net_edge,
