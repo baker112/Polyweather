@@ -129,11 +129,12 @@ def lock_picks(
     if bma_mode_override:
         provenance["bma_mode_override"] = bma_mode_override
 
-    # In wn2_only mode the other models aren't used for the pick. Skip their
-    # ingests entirely — they pull from rate-limited (multiurl) sources and
-    # can serially block the WN2 ingest for minutes if e.g. GEFS is 429'd.
+    # In wn2_only / wn2_peak modes the other models aren't used for the pick.
+    # Skip their ingests entirely — they pull from rate-limited (multiurl)
+    # sources and can serially block the WN2 ingest for minutes if e.g. GEFS
+    # is 429'd.
     effective_bma_mode = bma_mode_override or station.bma_mode
-    skip_non_wn2 = effective_bma_mode == "wn2_only"
+    skip_non_wn2 = effective_bma_mode in ("wn2_only", "wn2_peak")
     if skip_non_wn2:
         provenance["skipped_non_wn2_ingests"] = True
 
@@ -301,30 +302,46 @@ def lock_picks(
 
     # ── Stage 6: Compute edges ────────────────────────────────────────────────
     brackets = [BracketSpec(label=o.label, low=o.low, high=o.high) for o in snapshot.outcomes]
-    bracket_probs = compute_brackets(dist, brackets)
+
     # Per-station Kelly multiplier (#6) — auto-promotes once station has 50+
     # resolved bets with positive CLV; otherwise uses stations.yaml config value.
     from weather_edge.pipeline.edge_gate import effective_kelly_multiplier
     station_kelly_mult, kelly_reason = effective_kelly_multiplier(station_id)
     provenance["station_kelly_multiplier"] = station_kelly_mult
     provenance["station_kelly_reason"] = kelly_reason
-    candidates = compute_edges(
-        bracket_probs, snapshot, now_utc, station_kelly_mult,
-        station_min_liquidity=station.min_liquidity,
-        predictive_mu=dist.mu,
-        kelly_multiplier_override=kelly_multiplier_override,
-    )
+
+    if effective_bma_mode == "wn2_peak":
+        # Point-forecast strategy: trust μ; bet YES on the bracket containing
+        # it; flat sizing; ignore probabilistic edge calculus.
+        candidates = _compute_peak_bet(
+            dist.mu, brackets, snapshot, now_utc, station.min_liquidity,
+            provenance=provenance,
+        )
+    else:
+        bracket_probs = compute_brackets(dist, brackets)
+        candidates = compute_edges(
+            bracket_probs, snapshot, now_utc, station_kelly_mult,
+            station_min_liquidity=station.min_liquidity,
+            predictive_mu=dist.mu,
+            kelly_multiplier_override=kelly_multiplier_override,
+        )
 
     candidates.sort(key=lambda c: abs(c.edge), reverse=True)
     picks = candidates  # all qualifying brackets
 
     no_edge_reason: str | None = None
     if not picks:
-        failing = _summarise_failures(
-            candidates if candidates else [], bracket_probs, snapshot,
-            station_min_liquidity=station.min_liquidity,
-        )
-        no_edge_reason = f"no_edge — gates: {failing}"
+        if effective_bma_mode == "wn2_peak":
+            # _summarise_failures uses bracket_probs which we don't have in peak mode.
+            no_edge_reason = (
+                f"wn2_peak skipped: {provenance.get('wn2_peak_skip_reason', 'gates failed')}"
+            )
+        else:
+            failing = _summarise_failures(
+                candidates if candidates else [], bracket_probs, snapshot,
+                station_min_liquidity=station.min_liquidity,
+            )
+            no_edge_reason = f"no_edge — gates: {failing}"
         _logger.info("%s %s: %s", station_id, target_date, no_edge_reason)
 
     result = LockedPicks(
@@ -342,6 +359,99 @@ def lock_picks(
     log_event("lock_picks", station_id, "ok",
               (time.monotonic() - pipeline_start) * 1000, n_picks=len(picks))
     return result
+
+
+# ─── Peak-bet (wn2_peak mode) ─────────────────────────────────────────────────
+
+# Flat fraction of bankroll to risk per wn2_peak pick. Conservative default
+# because the strategy assumes zero model uncertainty — if WN2 is wrong on
+# the peak bracket (which it will be on ~50-70% of days at 1°C granularity),
+# the bet loses 100% of stake. 1% per bet → ~10 losses to halve bankroll.
+_PEAK_BET_FRACTION = 0.01
+
+
+def _compute_peak_bet(
+    mu: float,
+    brackets: list[Any],   # list[BracketSpec]
+    snapshot: MarketSnapshot,
+    now_utc: datetime,
+    station_min_liquidity: float | None,
+    provenance: dict[str, Any],
+) -> list[Candidate]:
+    """wn2_peak strategy: bet YES on the single bracket containing μ.
+
+    No probability computation, no edge math, no σ. Just: take the model's
+    predicted peak, find which Polymarket bracket it lands in, bet a flat
+    fraction of bankroll on YES. Skips entirely if the bracket isn't in the
+    market or its liquidity is too thin to fill.
+    """
+    thresholds = load_thresholds()
+    freshness_cutoff = now_utc - timedelta(minutes=thresholds.market_freshness_minutes)
+    min_liquidity = (
+        station_min_liquidity if station_min_liquidity is not None
+        else thresholds.min_liquidity
+    )
+
+    # Find the bracket containing μ. Brackets may have open endpoints (None means ±∞).
+    target_bracket = None
+    for b in brackets:
+        low_ok = b.low is None or mu >= b.low
+        high_ok = b.high is None or mu < b.high
+        if low_ok and high_ok:
+            target_bracket = b
+            break
+
+    if target_bracket is None:
+        provenance["wn2_peak_target_bracket"] = None
+        provenance["wn2_peak_skip_reason"] = f"μ={mu:.2f} not in any bracket"
+        return []
+
+    provenance["wn2_peak_target_bracket"] = target_bracket.label
+    provenance["wn2_peak_predicted_mu"] = round(mu, 2)
+
+    outcome_map = {o.label: o for o in snapshot.outcomes}
+    outcome = outcome_map.get(target_bracket.label)
+    if outcome is None:
+        provenance["wn2_peak_skip_reason"] = f"bracket {target_bracket.label} not in market"
+        return []
+
+    # Side-relevant depth (YES bet → top_ask × best_ask).
+    top_size_usdc = outcome.top_ask_size * (outcome.best_ask if outcome.best_ask > 0 else outcome.mid)
+    has_book_data = outcome.top_ask_size > 0 or outcome.top_bid_size > 0
+
+    gates = {
+        "market_fresh": snapshot.fetched_at >= freshness_cutoff,
+        "min_liquidity": outcome.liquidity >= min_liquidity,
+        "min_top_size": (not has_book_data) or top_size_usdc >= thresholds.min_top_size_usdc,
+        # Intentionally NO min_edge / max_spread / max_raw_prob / min_net_edge.
+        # wn2_peak is an experimental "trust the model" strategy.
+    }
+
+    max_stake_usdc = (
+        top_size_usdc * thresholds.depth_safety_factor
+        if has_book_data and top_size_usdc > 0 else None
+    )
+
+    candidate = Candidate(
+        bracket_label=target_bracket.label,
+        low=target_bracket.low,
+        high=target_bracket.high,
+        model_prob=1.0,  # by construction (we're betting on it as if it's the answer)
+        market_prob=outcome.mid,
+        edge=1.0 - outcome.mid,
+        side="YES",
+        spread=outcome.spread,
+        liquidity=outcome.liquidity,
+        kelly_fraction=_PEAK_BET_FRACTION,
+        max_stake_usdc=round(max_stake_usdc, 2) if max_stake_usdc is not None else None,
+        gates=gates,
+        raw_values={
+            "wn2_peak_mu": mu,
+            "market_mid": outcome.mid,
+            "top_size_usdc": top_size_usdc,
+        },
+    )
+    return [candidate] if all(gates.values()) else []
 
 
 # ─── Edge detection ───────────────────────────────────────────────────────────
@@ -491,10 +601,10 @@ def _stage3_4(
       Phase 2 — BMA mixture (if per-model EMOS params exist for ≥2 models)
       Phase 1 — Pooled EMOS fallback
     """
-    # ── Phase 0: WN2-only short-circuit ─────────────────────────────────────
+    # ── Phase 0: WN2-only short-circuit (also covers wn2_peak; same forecast) ──
     station_cfg = get_station(station_id)
     effective_mode = bma_mode_override or station_cfg.bma_mode
-    if effective_mode == "wn2_only":
+    if effective_mode in ("wn2_only", "wn2_peak"):
         return _wn2_only_distribution(
             station_id, lead_hours, now_utc, target_date, model_values, provenance
         )

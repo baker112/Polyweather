@@ -34,9 +34,14 @@ class StationConfig(BaseModel):
     #   "bma"      — Bayesian model averaging across ECMWF / GEFS / ICON / WN2 (default).
     #   "wn2_only" — Use only WeatherNext 2's 64-member ensemble; ignore other models.
     #                μ/σ come from the WN2 members directly (with WN2-specific EMOS
-    #                applied if cached params exist). Useful for benchmarking the ML
-    #                model in isolation against the BMA blend.
-    bma_mode: Literal["bma", "wn2_only"] = "bma"
+    #                applied if cached params exist). Probabilistic edge detection
+    #                with σ floor + symmetric max_raw_prob gate.
+    #   "wn2_peak" — Point-forecast strategy. Compute predicted peak as the ensemble
+    #                mean of (per-member daily max). Find the Polymarket bracket
+    #                containing it. Bet YES on that single bracket at a flat fraction
+    #                of bankroll (default 1%). No σ floor, no probability-based
+    #                edge gate, no Kelly. Experimental — trust the model entirely.
+    bma_mode: Literal["bma", "wn2_only", "wn2_peak"] = "bma"
     # Optional intraday lock — fire a SECOND lock during the day targeting the SAME
     # day (not D+1) using a short-lead WN2 forecast. Format "HH:MM" UTC. When set,
     # the scheduler registers an extra job at this time that:

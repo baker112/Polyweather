@@ -112,9 +112,30 @@ def _intraday_lock_job(station_id: str) -> None:
     The subsequent execute job (5 min later) places orders via the same
     TRADING_ENABLED / LIVE_TRADING flow as the regular lock.
     """
+    _intraday_run(station_id, mode="wn2_only")
+
+
+def _peak_lock_job(station_id: str) -> None:
+    """Point-forecast peak strategy: same scheduling as intraday but wn2_peak mode.
+
+    Bets YES on the bracket containing WN2's predicted peak (ensemble mean of
+    per-member daily max). Flat sizing, no probability/Kelly logic.
+    """
+    _intraday_run(station_id, mode="wn2_peak")
+
+
+def _intraday_run(station_id: str, mode: str = "wn2_only") -> None:
+    """Shared body for _intraday_lock_job and _peak_lock_job.
+
+    mode = "wn2_only" → probabilistic edge detection at quarter Kelly.
+    mode = "wn2_peak" → point forecast → flat YES on bracket containing μ.
+    """
     from weather_edge.pipeline.lock import lock_picks, _most_recent_init
     from weather_edge.exceptions import AlreadyLockedError, IngestError
 
+    label = "Intraday" if mode == "wn2_only" else "Peak"
+    icon = "⚡" if mode == "wn2_only" else "🎯"
+    kelly_mult = 0.25 if mode == "wn2_only" else None  # peak uses its own flat sizing
     now_utc = datetime.now(timezone.utc)
     target_date = now_utc.date()
     # Try the freshest init first, fall back to progressively older ones if
@@ -126,15 +147,12 @@ def _intraday_lock_job(station_id: str) -> None:
     for min_lag in (6, 12, 18):
         init_dt = _most_recent_init(now_utc, min_lag_hours=min_lag)
         try:
-            # force=True: an intraday run may follow the same-day regular lock, so
-            # overwrite — the intraday picks are intentionally the fresher view.
-            # Quarter Kelly (0.25) because the mode is new and unbacktested.
             result = lock_picks(
                 target_date, station_id, now_utc,
                 force=True,
-                bma_mode_override="wn2_only",
+                bma_mode_override=mode,
                 init_dt_override=init_dt,
-                kelly_multiplier_override=0.25,
+                kelly_multiplier_override=kelly_mult,
             )
             break
         except AlreadyLockedError:
@@ -148,19 +166,19 @@ def _intraday_lock_job(station_id: str) -> None:
             continue
     if result is None:
         msg = f"all WN2 init attempts failed: {last_exc}"
-        _logger.error("Intraday lock failed %s %s: %s", station_id, target_date, msg)
-        _tg.send(f"❌ <b>Intraday FAILED: {station_id}</b> · {target_date}\n{msg}")
+        _logger.error("%s lock failed %s %s: %s", label, station_id, target_date, msg)
+        _tg.send(f"❌ <b>{label} FAILED: {station_id}</b> · {target_date}\n{msg}")
         return
     try:
         lead_h = int((datetime(target_date.year, target_date.month, target_date.day, 12, tzinfo=timezone.utc) - init_dt).total_seconds() // 3600)
         _logger.info(
-            "Intraday locked %s %s: mu=%.2f sigma=%.2f picks=%d (init=%s, lead≈%dh)",
-            station_id, target_date, result.mu, result.sigma, len(result.picks),
+            "%s locked %s %s: mu=%.2f sigma=%.2f picks=%d (init=%s, lead≈%dh)",
+            label, station_id, target_date, result.mu, result.sigma, len(result.picks),
             init_dt.strftime("%Y-%m-%d %HZ"), lead_h,
         )
         if result.picks:
             lines = [
-                f"⚡ <b>Intraday pick: {station_id}</b> · {target_date}",
+                f"{icon} <b>{label} pick: {station_id}</b> · {target_date}",
                 f"   init={init_dt.strftime('%H')}z lead≈{lead_h}h · μ={result.mu:.1f}°C σ={result.sigma:.2f}",
             ]
             for p in result.picks:
@@ -173,14 +191,14 @@ def _intraday_lock_job(station_id: str) -> None:
             _tg.send("\n".join(lines))
         else:
             _tg.send(
-                f"⚡ <b>Intraday no-edge: {station_id}</b> · {target_date} (init={init_dt.strftime('%H')}z)"
+                f"{icon} <b>{label} no-edge: {station_id}</b> · {target_date} (init={init_dt.strftime('%H')}z)"
                 f"\n{result.no_edge_reason or 'all edges below threshold'}"
             )
     except AlreadyLockedError:
-        _logger.info("Intraday: already locked %s %s — skipping", station_id, target_date)
+        _logger.info("%s: already locked %s %s — skipping", label, station_id, target_date)
     except Exception as exc:
-        _logger.error("Intraday lock failed %s %s: %s", station_id, target_date, exc)
-        _tg.send(f"❌ <b>Intraday FAILED: {station_id}</b> · {target_date}\n{exc}")
+        _logger.error("%s lock failed %s %s: %s", label, station_id, target_date, exc)
+        _tg.send(f"❌ <b>{label} FAILED: {station_id}</b> · {target_date}\n{exc}")
 
 
 def _resolve_and_observe_job(station_id: str, target_date: "date | None" = None) -> None:
@@ -1210,7 +1228,6 @@ def start(stations: list[str]) -> None:
         """
         from weather_edge.config import get_station as _gs
         if not args.strip():
-            # default to all stations with intraday configured
             targets = [s for s in stations if _gs(s).intraday_lock_time_utc]
             if not targets:
                 return "No stations have intraday_lock_time_utc set. Pass a station ID explicitly."
@@ -1221,6 +1238,32 @@ def start(stations: list[str]) -> None:
         return (
             f"Intraday lock dispatched for {len(targets)} station(s): {', '.join(targets)}\n"
             f"Forecast source: freshest WN2 init; target=TODAY; sizing=quarter Kelly."
+        )
+
+    def _cmd_peak(args: str = "") -> str:
+        """Manually fire the wn2_peak point-forecast lock for one or more stations.
+
+        /peak             — all intraday-enabled stations
+        /peak EGLC        — just EGLC
+        /peak EGLC KLGA   — multiple
+
+        Bets YES on the single bracket containing WN2's predicted peak (ensemble
+        mean of per-member daily max). Flat 1% of bankroll per bet. No σ floor,
+        no Kelly, no probability-based edge gate. Experimental "trust the model"
+        mode for testing whether WN2's point forecast is profitable on its own.
+        """
+        from weather_edge.config import get_station as _gs
+        if not args.strip():
+            targets = [s for s in stations if _gs(s).intraday_lock_time_utc]
+            if not targets:
+                return "No stations have intraday_lock_time_utc set. Pass a station ID explicitly."
+        else:
+            targets = _resolve_targets(args)
+        for sid in targets:
+            _spawn(f"manual-peak-{sid}", _peak_lock_job, sid)
+        return (
+            f"Peak lock dispatched for {len(targets)} station(s): {', '.join(targets)}\n"
+            f"Strategy: WN2 ensemble-mean of daily max → YES on bracket containing it; flat 1% sizing."
         )
 
     def _cmd_execute(args: str = "") -> str:
@@ -1319,6 +1362,7 @@ def start(stations: list[str]) -> None:
         "/losers": _cmd_losers,
         "/lock": _cmd_lock,
         "/intraday": _cmd_intraday,
+        "/peak": _cmd_peak,
         "/ingest": _cmd_ingest,
         "/execute": _cmd_execute,
         "/resolve": _cmd_resolve,
@@ -1336,7 +1380,7 @@ def start(stations: list[str]) -> None:
         f"Mode: {_current_mode()}\n"
         f"{live_line}"
         f"Stations: {', '.join(stations)}\n"
-        f"Commands: /status /picks /bankroll /pnl /topstations /losers /summary /lock /intraday /ingest /execute /resolve /resolve_missed /mode /live /backtest"
+        f"Commands: /status /picks /bankroll /pnl /topstations /losers /summary /lock /intraday /peak /ingest /execute /resolve /resolve_missed /mode /live /backtest"
     )
 
     # Run any missed jobs from earlier today (e.g. after VPS reboot)
