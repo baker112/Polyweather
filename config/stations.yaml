@@ -47,6 +47,7 @@ RKSI:
   market_slug_pattern: "highest-temperature-in-seoul-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "08:00"  # 17:00 KST — D-1
+  intraday_lock_time_utc: "04:00"  # ~1-2h before Seoul peak ~05-06z; uses 00z WN2 init
   min_liquidity: 25  # Asian markets persistently thin at lock time
 
 ZSPD:

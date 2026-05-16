@@ -89,6 +89,7 @@ def lock_picks(
     force: bool = False,
     bma_mode_override: str | None = None,
     init_dt_override: datetime | None = None,
+    kelly_multiplier_override: float | None = None,
 ) -> LockedPicks:
     """Orchestrate stages 1-6 and write immutable picks file.
 
@@ -100,6 +101,9 @@ def lock_picks(
     init_dt_override: if provided, skips the default `_most_recent_12z` choice
         and uses this init datetime. Used by the intraday lock job to pull the
         freshest available init (e.g. today's 06z) rather than yesterday's 12z.
+    kelly_multiplier_override: if provided, replaces thresholds.kelly_multiplier
+        in stake sizing. Intraday uses 0.25 (quarter Kelly) because the mode is
+        new and untested; regular D-1 locks use the configured 0.5 (half Kelly).
     """
     from weather_edge.logging import log_event
 
@@ -298,6 +302,7 @@ def lock_picks(
         bracket_probs, snapshot, now_utc, station_kelly_mult,
         station_min_liquidity=station.min_liquidity,
         predictive_mu=dist.mu,
+        kelly_multiplier_override=kelly_multiplier_override,
     )
 
     candidates.sort(key=lambda c: abs(c.edge), reverse=True)
@@ -338,8 +343,14 @@ def compute_edges(
     station_kelly_multiplier: float = 1.0,
     station_min_liquidity: float | None = None,
     predictive_mu: float | None = None,
+    kelly_multiplier_override: float | None = None,
 ) -> list[Candidate]:
     thresholds = load_thresholds()
+    kelly_mult = (
+        kelly_multiplier_override
+        if kelly_multiplier_override is not None
+        else thresholds.kelly_multiplier
+    )
     freshness_cutoff = now_utc - timedelta(minutes=thresholds.market_freshness_minutes)
     min_liquidity = (
         station_min_liquidity if station_min_liquidity is not None
@@ -404,7 +415,7 @@ def compute_edges(
             kelly = abs(edge) / outcome.mid if outcome.mid > 0.0 else 0.0
         kelly = (
             min(kelly, thresholds.max_kelly_fraction)
-            * thresholds.kelly_multiplier
+            * kelly_mult
             * station_kelly_multiplier
         )
 

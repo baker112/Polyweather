@@ -121,11 +121,13 @@ def _intraday_lock_job(station_id: str) -> None:
     try:
         # force=True: an intraday run may follow the same-day regular lock, so
         # overwrite — the intraday picks are intentionally the fresher view.
+        # Quarter Kelly (0.25) because the mode is new and unbacktested.
         result = lock_picks(
             target_date, station_id, now_utc,
             force=True,
             bma_mode_override="wn2_only",
             init_dt_override=init_dt,
+            kelly_multiplier_override=0.25,
         )
         lead_h = int((datetime(target_date.year, target_date.month, target_date.day, 12, tzinfo=timezone.utc) - init_dt).total_seconds() // 3600)
         _logger.info(
@@ -1170,6 +1172,28 @@ def start(stations: list[str]) -> None:
             _spawn(f"manual-lock-{sid}", _lock_job, sid)
         return f"Lock dispatched for {len(targets)} station(s): {', '.join(targets)}"
 
+    def _cmd_intraday(args: str = "") -> str:
+        """Manually fire the intraday short-lead lock for one or more stations.
+
+        /intraday               — all stations with intraday_lock_time_utc set
+        /intraday EGLC          — just EGLC (works even if intraday_lock_time_utc unset)
+        /intraday EGLC KLGA     — multiple
+        """
+        from weather_edge.config import get_station as _gs
+        if not args.strip():
+            # default to all stations with intraday configured
+            targets = [s for s in stations if _gs(s).intraday_lock_time_utc]
+            if not targets:
+                return "No stations have intraday_lock_time_utc set. Pass a station ID explicitly."
+        else:
+            targets = _resolve_targets(args)
+        for sid in targets:
+            _spawn(f"manual-intraday-{sid}", _intraday_lock_job, sid)
+        return (
+            f"Intraday lock dispatched for {len(targets)} station(s): {', '.join(targets)}\n"
+            f"Forecast source: freshest WN2 init; target=TODAY; sizing=quarter Kelly."
+        )
+
     def _cmd_execute(args: str = "") -> str:
         if _current_mode() == "off":
             return "Trading is OFF. Enable with /mode dryrun or /mode live first."
@@ -1222,6 +1246,7 @@ def start(stations: list[str]) -> None:
         "/topstations": _cmd_top,
         "/losers": _cmd_losers,
         "/lock": _cmd_lock,
+        "/intraday": _cmd_intraday,
         "/ingest": _cmd_ingest,
         "/execute": _cmd_execute,
         "/resolve": _cmd_resolve,
@@ -1238,7 +1263,7 @@ def start(stations: list[str]) -> None:
         f"Mode: {_current_mode()}\n"
         f"{live_line}"
         f"Stations: {', '.join(stations)}\n"
-        f"Commands: /status /picks /bankroll /pnl /topstations /losers /summary /lock /ingest /execute /resolve /mode /live /backtest"
+        f"Commands: /status /picks /bankroll /pnl /topstations /losers /summary /lock /intraday /ingest /execute /resolve /mode /live /backtest"
     )
 
     # Run any missed jobs from earlier today (e.g. after VPS reboot)
