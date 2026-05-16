@@ -97,6 +97,11 @@ def _lock_job(station_id: str) -> None:
             _tg.send(f"ℹ️ <b>No edge: {station_id}</b> · {target_date}\n{result.no_edge_reason or 'all edges below threshold'}")
     except AlreadyLockedError:
         _logger.info("Already locked %s %s", station_id, target_date)
+        _tg.send(
+            f"ℹ️ <b>Already locked: {station_id}</b> · {target_date}\n"
+            f"  Picks file already exists. Use /picks {station_id} to view, "
+            f"or wait for next scheduled run."
+        )
     except Exception as exc:
         _logger.error("Lock failed %s %s: %s", station_id, target_date, exc)
         _tg.send(f"❌ <b>Lock FAILED: {station_id}</b> · {target_date}\n{exc}")

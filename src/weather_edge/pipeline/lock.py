@@ -614,8 +614,17 @@ def _stage3_4(
     station_cfg = get_station(station_id)
     effective_mode = bma_mode_override or station_cfg.bma_mode
     if effective_mode in ("wn2_only", "wn2_peak"):
+        # wn2_peak uses the 75th percentile of per-member daily max as the
+        # "predicted peak" instead of the ensemble mean. WN2's 6h cadence
+        # systematically under-samples the actual afternoon peak hour (the
+        # observed daily max often lies between two of WN2's 6h-stepped
+        # lead samples). Using a higher quantile biases the prediction
+        # toward the realised peak by ~1°C, partially compensating until
+        # WN2-specific EMOS calibration provides a learned correction.
+        quantile = 0.75 if effective_mode == "wn2_peak" else None
         return _wn2_only_distribution(
-            station_id, lead_hours, now_utc, target_date, model_values, provenance
+            station_id, lead_hours, now_utc, target_date, model_values, provenance,
+            quantile=quantile,
         )
 
     # ── Phase 3: QRF ─────────────────────────────────────────────────────────
@@ -677,13 +686,18 @@ def _wn2_only_distribution(
     target_date: date,
     model_values: dict[str, list[float]],
     provenance: dict[str, Any],
+    quantile: float | None = None,
 ) -> PredictedDistribution:
     """WN2-only path: μ/σ come from the 64-member WN2 ensemble alone.
 
-    Uses WN2-specific EMOS via predict_pdf when cached params exist; otherwise
-    falls back to raw ensemble mean and (ddof=1) std. The σ floor in lock_picks
-    still applies downstream, so a narrow raw ensemble won't break bracket
-    probabilities.
+    quantile=None (default): μ = ensemble mean. EMOS-aware. Used by wn2_only.
+    quantile=q (e.g. 0.75):  μ = ensemble q-th percentile. EMOS is skipped
+                             (no calibrated quantile fit available yet).
+                             Used by wn2_peak to compensate for the 6h-cadence
+                             peak-undershoot bias.
+
+    The σ floor in lock_picks still applies downstream for wn2_only — wn2_peak
+    bypasses bracket-probability math entirely so σ is informational only.
     """
     import numpy as np
 
@@ -692,6 +706,24 @@ def _wn2_only_distribution(
         raise IngestError(
             f"wn2_only mode but only {len(wn2_values)} WeatherNext members "
             f"for {station_id} {target_date} lead={lead_hours}h — needs ≥3"
+        )
+
+    if quantile is not None:
+        mu = float(np.quantile(wn2_values, quantile))
+        sigma = float(np.std(wn2_values, ddof=1)) if len(wn2_values) > 1 else 0.5
+        provenance["mode"] = f"wn2_peak_q{int(quantile*100)}"
+        provenance["wn2_n_members"] = len(wn2_values)
+        provenance["wn2_quantile"] = quantile
+        _logger.info(
+            "Stage 3+4: WN2-peak q%d (members=%d, μ=%.2f, σ=%.2f)",
+            int(quantile * 100), len(wn2_values), mu, sigma,
+        )
+        return PredictedDistribution(
+            mu=mu,
+            sigma=sigma,
+            station=station_id,
+            valid_date=target_date,
+            lead_hours=lead_hours,
         )
 
     raw_emos = store.read_emos_params(station_id, lead_hours, now_utc, model="weathernext")

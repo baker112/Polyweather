@@ -59,6 +59,7 @@ ZSPD:
   market_slug_pattern: "highest-temperature-in-shanghai-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "08:03"  # 16:03 CST — D-1
+  intraday_lock_time_utc: "05:30"  # ~1h before Shanghai peak ~07z; uses 00z WN2 init
   min_liquidity: 25  # Asian markets persistently thin at lock time
 
 RCSS:
@@ -70,6 +71,7 @@ RCSS:
   market_slug_pattern: "highest-temperature-in-taipei-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "08:06"  # 16:06 TST — D-1
+  intraday_lock_time_utc: "05:33"  # ~1h before Taipei peak ~07z; uses 00z WN2 init
   min_liquidity: 25  # Asian markets persistently thin at lock time
 
 VHHH:
@@ -83,6 +85,7 @@ VHHH:
   market_slug_pattern: "highest-temperature-in-hong-kong-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local"
   lock_time_utc: "08:09"  # 16:09 HKT — D-1
+  intraday_lock_time_utc: "05:36"  # ~1h before HK peak ~07z; uses 00z WN2 init
 
 VILK:
   name: Lucknow Chaudhary Charan Singh International Airport
@@ -93,6 +96,7 @@ VILK:
   market_slug_pattern: "highest-temperature-in-lucknow-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "08:12"  # 13:42 IST — D-1
+  intraday_lock_time_utc: "08:00"  # ~1h before Lucknow peak ~09z; uses 00z WN2 init (8h)
   min_liquidity: 25  # Asian markets persistently thin at lock time
 
 # ── European group — lock 19:30-19:33z (12z ECMWF, D-1 local evening) ─────────
@@ -117,6 +121,7 @@ LFPB:
   market_slug_pattern: "highest-temperature-in-paris-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "19:33"  # 21:33 CEST — D-1 evening
+  intraday_lock_time_utc: "11:30"  # ~1h before Paris peak ~13z; uses 06z WN2 init (5.5h)
 
 # ── US group — lock 21:00-21:15z (12z ECMWF, D-1 local afternoon) ──────────────
 
@@ -173,6 +178,7 @@ KBKF:
   market_slug_pattern: "highest-temperature-in-denver-on-{month_lower}-{day}-{year}"
   resolution_field: "daily_max_metar_local_wholedeg"
   lock_time_utc: "21:12"  # 15:12 MDT — D-1 afternoon
+  intraday_lock_time_utc: "19:30"  # ~1h before Denver peak ~21z; uses 12z WN2 init (7.5h)
 
 # MMMX disabled 2026-05-10: 0/3 win rate, −100% ROI, mean CLV −0.57,
 # EMOS coefficients (a=+22, b=+0.22) suggest the linear-Gaussian form does
