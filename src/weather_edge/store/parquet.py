@@ -235,33 +235,48 @@ def read_market_snapshot(station: str, target_date: date) -> dict[str, Any] | No
 
 
 # ─── Picks ────────────────────────────────────────────────────────────────────
+# `mode` is the lock-strategy identifier ("bma" | "intraday" | "peak"). The
+# default "bma" preserves the pre-three-mode-split filename (picks.json) so
+# historic picks remain readable and BMA's evening lock doesn't need a
+# migration. Non-bma strategies write to picks_<mode>.json alongside it so all
+# three modes can co-exist for the same (station, date) without clobbering.
 
-def picks_exist(station: str, target_date: date) -> bool:
+def _picks_filename(mode: str = "bma") -> str:
+    return "picks.json" if mode == "bma" else f"picks_{mode}.json"
+
+
+def picks_exist(station: str, target_date: date, mode: str = "bma") -> bool:
     return (
-        _DATA_DIR / "picks" / f"date={target_date}" / f"station={station}" / "picks.json"
+        _DATA_DIR / "picks" / f"date={target_date}" / f"station={station}" / _picks_filename(mode)
     ).exists()
 
 
-def write_picks(record: dict[str, Any], station: str, target_date: date) -> Path:
+def write_picks(
+    record: dict[str, Any], station: str, target_date: date, mode: str = "bma"
+) -> Path:
     from weather_edge.exceptions import AlreadyLockedError
     path_dir = _ensure(_DATA_DIR / "picks" / f"date={target_date}" / f"station={station}")
-    path = path_dir / "picks.json"
+    path = path_dir / _picks_filename(mode)
     if path.exists():
-        raise AlreadyLockedError(f"Picks already locked for {station} on {target_date}")
+        raise AlreadyLockedError(
+            f"Picks already locked for {station} on {target_date} (mode={mode})"
+        )
     _dump_json(record, path)
     return path
 
 
-def read_picks(station: str, target_date: date) -> dict[str, Any] | None:
-    path = _DATA_DIR / "picks" / f"date={target_date}" / f"station={station}" / "picks.json"
+def read_picks(
+    station: str, target_date: date, mode: str = "bma"
+) -> dict[str, Any] | None:
+    path = _DATA_DIR / "picks" / f"date={target_date}" / f"station={station}" / _picks_filename(mode)
     result = _safe_load_json(path)
     return result if isinstance(result, dict) else None
 
 
-def read_all_picks(station: str) -> list[dict[str, Any]]:
+def read_all_picks(station: str, mode: str = "bma") -> list[dict[str, Any]]:
     base = _DATA_DIR / "picks"
     records = []
-    for p in sorted(base.glob(f"date=*/station={station}/picks.json")):
+    for p in sorted(base.glob(f"date=*/station={station}/{_picks_filename(mode)}")):
         result = _safe_load_json(p)
         if isinstance(result, dict):
             records.append(result)

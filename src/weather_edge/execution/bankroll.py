@@ -7,8 +7,23 @@ from pathlib import Path
 from typing import Any
 
 _PATH = Path(__file__).parents[3] / "data" / "bankroll.json"
+# Legacy single dry bankroll (pre-three-mode-split). Kept as the `mode="bma"`
+# path so the existing paper-bankroll state is preserved through the refactor.
+# Non-bma modes get their own files (see `_dry_path`).
 _DRY_PATH = Path(__file__).parents[3] / "data" / "dry_bankroll.json"
 DRY_INITIAL_USDC = 100.0  # paper-trading bankroll seed
+DRY_MODES = ("bma", "intraday", "peak")
+
+
+def _dry_path(mode: str = "bma") -> Path:
+    """Return the on-disk path for a mode-specific dry (paper) bankroll.
+
+    `mode="bma"` returns the legacy `dry_bankroll.json` so existing state is
+    preserved with no migration. Other modes return `bankroll_dry_<mode>.json`.
+    """
+    if mode == "bma":
+        return _DRY_PATH
+    return Path(__file__).parents[3] / "data" / f"bankroll_dry_{mode}.json"
 
 
 def load() -> dict[str, Any]:
@@ -93,17 +108,21 @@ def settle(b: dict[str, Any], stake: float, pnl: float) -> None:
 # ─── Dry-run (paper) bankroll ──────────────────────────────────────────────────
 # Independent of the live bankroll. Auto-initialises at $DRY_INITIAL_USDC the
 # first time it's loaded so paper-trading P&L can accrue without ceremony.
+# `mode` partitions the dry bankroll per lock-strategy ("bma"|"intraday"|"peak")
+# so per-mode P&L is attributable. Default "bma" keeps the legacy file path.
 
-def _save_dry(b: dict[str, Any]) -> None:
+def _save_dry(b: dict[str, Any], mode: str = "bma") -> None:
     b["last_updated"] = datetime.now(timezone.utc).isoformat()
-    _DRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _dump(b, _DRY_PATH)
+    path = _dry_path(mode)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _dump(b, path)
 
 
-def load_dry() -> dict[str, Any]:
-    if _DRY_PATH.exists():
+def load_dry(mode: str = "bma") -> dict[str, Any]:
+    path = _dry_path(mode)
+    if path.exists():
         try:
-            with open(_DRY_PATH) as f:
+            with open(path) as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError):
             # Dry bankroll is paper-trading only — silently re-seed if corrupt.
@@ -115,18 +134,20 @@ def load_dry() -> dict[str, Any]:
         "total_pnl": 0.0,
         "n_trades": 0,
     }
-    _save_dry(b)
+    _save_dry(b, mode)
     return b
 
 
-def reserve_dry(b: dict[str, Any], amount: float) -> None:
+def reserve_dry(b: dict[str, Any], amount: float, mode: str = "bma") -> None:
     b["reserved_usdc"] = float(b.get("reserved_usdc", 0.0)) + amount
-    _save_dry(b)
+    _save_dry(b, mode)
 
 
-def settle_dry(b: dict[str, Any], stake: float, pnl: float) -> None:
+def settle_dry(
+    b: dict[str, Any], stake: float, pnl: float, mode: str = "bma"
+) -> None:
     b["reserved_usdc"] = max(0.0, float(b.get("reserved_usdc", 0.0)) - stake)
     b["current_usdc"] = float(b["current_usdc"]) + pnl
     b["total_pnl"] = float(b.get("total_pnl", 0.0)) + pnl
     b["n_trades"] = int(b.get("n_trades", 0)) + 1
-    _save_dry(b)
+    _save_dry(b, mode)

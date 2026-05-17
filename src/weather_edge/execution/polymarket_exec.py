@@ -183,18 +183,25 @@ def place_order(
     return record
 
 
+def _exec_dir(station: str, target_date: Any, mode: str = "bma") -> Path:
+    """Per-mode execution directory.
+
+    Default `mode="bma"` returns the legacy flat dir
+    `data/executions/station=X/date=Y/` so existing exec files are still found.
+    Non-bma modes nest under a `<mode>/` subdir so per-mode P&L is attributable.
+    """
+    base = _EXECUTIONS_DIR / f"station={station}" / f"date={target_date}"
+    return base if mode == "bma" else base / mode
+
+
 def save_execution(
     station: str,
     target_date: Any,
     records: list[dict[str, Any]],
+    mode: str = "bma",
 ) -> Path:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-    path = (
-        _EXECUTIONS_DIR
-        / f"station={station}"
-        / f"date={target_date}"
-        / f"{ts}.json"
-    )
+    path = _exec_dir(station, target_date, mode) / f"{ts}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     import math as _math
 
@@ -217,11 +224,16 @@ def save_execution(
     return path
 
 
-def load_executions(station: str, target_date: Any) -> list[dict[str, Any]]:
-    base = _EXECUTIONS_DIR / f"station={station}" / f"date={target_date}"
+def load_executions(
+    station: str, target_date: Any, mode: str = "bma"
+) -> list[dict[str, Any]]:
+    base = _exec_dir(station, target_date, mode)
     if not base.exists():
         return []
     records: list[dict[str, Any]] = []
+    # glob("*.json") (non-recursive) matches the legacy flat-dir scan for
+    # mode="bma" and also keeps the new <mode>/ subdirs isolated from each
+    # other when called with a non-bma mode.
     for p in sorted(base.glob("*.json")):
         # Skip non-execution sidecars (settlement marker, atomic-write tmp,
         # quarantined corrupt files) and tolerate any individual bad file.
