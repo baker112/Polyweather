@@ -274,32 +274,48 @@ def _resolve_and_observe_job(station_id: str, target_date: "date | None" = None)
         import json
         from pathlib import Path
 
-        execs = load_executions(station_id, yesterday)
-        if execs and rec.get("resolved"):
-            clv_path = Path(__file__).parents[3] / "data" / "clv_snapshots" / f"station={station_id}" / f"{yesterday}.json"
-            clv_outcomes: dict[str, float] = {}
-            if clv_path.exists():
-                try:
-                    clv_data = json.loads(clv_path.read_text())
-                    clv_outcomes = {o["label"]: o["mid"] for o in clv_data.get("outcomes", [])}
-                except Exception:
-                    pass
+        if not rec.get("resolved"):
+            return
 
-            # Per-date settlement marker — prevents double-settlement if the
-            # resolve job re-runs (manual /resolve, restart catch-up, etc.).
+        clv_path = Path(__file__).parents[3] / "data" / "clv_snapshots" / f"station={station_id}" / f"{yesterday}.json"
+        clv_outcomes: dict[str, float] = {}
+        if clv_path.exists():
+            try:
+                clv_data = json.loads(clv_path.read_text())
+                clv_outcomes = {o["label"]: o["mid"] for o in clv_data.get("outcomes", [])}
+            except Exception:
+                pass
+
+        # Live bankroll is shared across modes (only one mode can be live at
+        # any time via LIVE_MODE/LIVE_STATIONS); per-mode dry bankrolls track
+        # paper P&L attributable to each strategy.
+        try:
+            bankroll_data = br.load()
+        except FileNotFoundError:
+            bankroll_data = None
+
+        mode_icons = {"bma": "📊", "intraday": "⚡", "peak": "🎯"}
+        all_lines: list[str] = []
+
+        for mode in br.DRY_MODES:
+            execs = load_executions(station_id, yesterday, mode=mode)
+            if not execs:
+                continue
+
+            # Per-(date, mode) settlement marker — prevents double-settlement
+            # on resolve re-runs (manual /resolve, restart catch-up, etc.).
+            # Each mode settles independently so adding intraday/peak settling
+            # later doesn't re-settle bma.
             settled_path = (
                 Path(__file__).parents[3] / "data" / "executions"
-                / f"station={station_id}" / f"date={yesterday}" / "_settled.json"
+                / f"station={station_id}" / f"date={yesterday}"
+                / f"_settled_{mode}.json"
             )
             already_settled = settled_path.exists()
 
-            try:
-                bankroll_data = br.load()
-            except FileNotFoundError:
-                bankroll_data = None
-            dry_bankroll = br.load_dry()
+            dry_bankroll = br.load_dry(mode=mode)
 
-            lines = [f"📋 <b>Result: {station_id}</b> · {yesterday}  →  {resolved_label}"]
+            mode_lines = [f"  {mode_icons.get(mode, '·')} <b>{mode}</b>"]
             settled_records: list[dict] = []
             for e in execs:
                 bracket = e.get("bracket_label", "?")
@@ -313,13 +329,13 @@ def _resolve_and_observe_job(station_id: str, target_date: "date | None" = None)
                 is_dry = bool(e.get("dry_run"))
                 tag = " [dry]" if is_dry else ""
                 icon = "🏆" if win else "💸"
-                line = f"  {icon} {side} {bracket}{tag}  entry={entry:.2f}  P&amp;L=${pnl:+.2f}"
+                line = f"    {icon} {side} {bracket}{tag}  entry={entry:.2f}  P&amp;L=${pnl:+.2f}"
                 clv_value: float | None = None
                 if bracket in clv_outcomes:
                     closing = clv_outcomes[bracket]
                     clv_value = (closing - entry) if side == "YES" else (entry - closing)
                     line += f"  CLV={clv_value:+.3f}"
-                lines.append(line)
+                mode_lines.append(line)
 
                 rec_out = {
                     "bracket_label": bracket,
@@ -337,11 +353,11 @@ def _resolve_and_observe_job(station_id: str, target_date: "date | None" = None)
                 if not already_settled:
                     try:
                         if is_dry:
-                            br.settle_dry(dry_bankroll, stake, pnl)
+                            br.settle_dry(dry_bankroll, stake, pnl, mode=mode)
                         elif bankroll_data is not None:
                             br.settle(bankroll_data, stake, pnl)
                     except Exception as exc:
-                        _logger.warning("Bankroll settle failed: %s", exc)
+                        _logger.warning("Bankroll settle failed (%s): %s", mode, exc)
 
             if not already_settled and settled_records:
                 settled_path.parent.mkdir(parents=True, exist_ok=True)
@@ -349,18 +365,25 @@ def _resolve_and_observe_job(station_id: str, target_date: "date | None" = None)
                 _dj({
                     "resolved_label": resolved_label,
                     "settled_at": now_utc.isoformat(),
+                    "mode": mode,
                     "records": settled_records,
                 }, settled_path)
 
-            # Append running dry-bankroll line so paper-trading P&L is always visible
             if any(e.get("dry_run") for e in execs):
-                lines.append(
-                    f"  📒 dry bankroll: ${dry_bankroll['current_usdc']:.2f}  "
+                mode_lines.append(
+                    f"    📒 dry: ${dry_bankroll['current_usdc']:.2f}  "
                     f"(P&amp;L=${dry_bankroll.get('total_pnl', 0):+.2f}  "
                     f"{dry_bankroll.get('n_trades', 0)} trades)"
                 )
-            if len(lines) > 1:
-                _tg.send("\n".join(lines))
+
+            # Only emit a per-mode block if it had at least one bet beyond
+            # the header (so an empty mode doesn't take up space).
+            if len(mode_lines) > 1:
+                all_lines.extend(mode_lines)
+
+        if all_lines:
+            header = f"📋 <b>Result: {station_id}</b> · {yesterday}  →  {resolved_label}"
+            _tg.send("\n".join([header, *all_lines]))
     except Exception as exc:
         _logger.error("Resolution failed %s %s: %s", station_id, yesterday, exc)
         _tg.send(f"❌ <b>Resolution FAILED: {station_id}</b> · {yesterday}\n{exc}")
