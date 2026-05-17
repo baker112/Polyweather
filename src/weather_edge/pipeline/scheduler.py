@@ -158,14 +158,17 @@ def _intraday_run(station_id: str, mode: str = "wn2_only") -> None:
     """Shared body for _intraday_lock_job and _peak_lock_job.
 
     mode = "wn2_only" → probabilistic edge detection at quarter Kelly.
-    mode = "wn2_peak" → point forecast → flat YES on bracket containing μ.
+    mode = "wn2_peak" → point forecast (p75 of daily max) → YES on bracket
+                       containing μ; quarter-Kelly sizing.
     """
     from weather_edge.pipeline.lock import lock_picks, _most_recent_init
     from weather_edge.exceptions import AlreadyLockedError, IngestError
 
     label = "Intraday" if mode == "wn2_only" else "Peak"
     icon = "⚡" if mode == "wn2_only" else "🎯"
-    kelly_mult = 0.25 if mode == "wn2_only" else None  # peak uses its own flat sizing
+    # Quarter-Kelly for both: intraday is a new probabilistic mode and peak's
+    # 100%-confidence model assumption makes a tighter multiplier essential.
+    kelly_mult = 0.25
     now_utc = datetime.now(timezone.utc)
     target_date = now_utc.date()
     # Try the freshest init first, fall back to progressively older ones if
@@ -363,8 +366,12 @@ def _resolve_and_observe_job(station_id: str, target_date: "date | None" = None)
         _tg.send(f"❌ <b>Resolution FAILED: {station_id}</b> · {yesterday}\n{exc}")
 
 
-def _execute_job(station_id: str) -> None:
-    """Place orders for tomorrow's locked picks.
+def _execute_job(station_id: str, mode: str = "bma") -> None:
+    """Place orders for the latest locked picks of `mode`.
+
+    BMA targets tomorrow (D-1 evening lock for D+1). Intraday/peak target today
+    (same-day short-lead locks). Picks, dry bankroll, and execution records are
+    all scoped per-mode so the three modes don't clobber each other's P&L.
 
     Gated by TRADING_ENABLED (master switch, set via /mode). When disabled, the
     job no-ops so picks are still locked but no orders are placed or simulated.
@@ -382,12 +389,18 @@ def _execute_job(station_id: str) -> None:
     from weather_edge.store import parquet as store
 
     if os.getenv("TRADING_ENABLED", "false").lower() != "true":
-        _logger.info("Trading disabled (TRADING_ENABLED!=true) — skipping execute for %s", station_id)
+        _logger.info(
+            "Trading disabled (TRADING_ENABLED!=true) — skipping execute for %s (mode=%s)",
+            station_id, mode,
+        )
         return
 
     dry_run = not _is_live_for(station_id)
     now_utc = datetime.now(timezone.utc)
-    target_date = (now_utc + timedelta(days=1)).date()
+    # BMA fires D-1 evening for tomorrow's market; intraday/peak fire same-day.
+    target_date = (
+        (now_utc + timedelta(days=1)).date() if mode == "bma" else now_utc.date()
+    )
 
     if not dry_run:
         from weather_edge.pipeline.edge_gate import station_passes_gate
@@ -398,25 +411,28 @@ def _execute_job(station_id: str) -> None:
             passed, reason = True, f"gate-error: {exc}"
         if not passed:
             dry_run = True
-            _logger.warning("Edge gate forced dry-run for %s: %s", station_id, reason)
-            _tg.send(f"⏸ <b>{station_id}</b> auto-paused (live→dry): {reason}")
+            _logger.warning("Edge gate forced dry-run for %s (mode=%s): %s", station_id, mode, reason)
+            _tg.send(f"⏸ <b>{station_id} [{mode}]</b> auto-paused (live→dry): {reason}")
 
-    picks_data = store.read_picks(station_id, target_date)
+    picks_data = store.read_picks(station_id, target_date, mode=mode)
     if not picks_data or not picks_data.get("picks"):
-        _logger.info("No picks to execute for %s %s", station_id, target_date)
+        _logger.info("No %s picks to execute for %s %s", mode, station_id, target_date)
         return
 
     locked = LockedPicks(**picks_data)
 
-    # Dry runs size against a separate paper bankroll (auto-init at $100)
-    # so simulated P&L doesn't pollute the live tracker.
+    # Dry runs size against a per-mode paper bankroll (auto-init at $100)
+    # so simulated P&L is attributable to the strategy.
     if dry_run:
-        bankroll = br.load_dry()
+        bankroll = br.load_dry(mode=mode)
     else:
         try:
             bankroll = br.load()
         except FileNotFoundError:
-            _tg.send(f"❌ <b>Execute FAILED {station_id}:</b> bankroll not initialised\nRun: we init-bankroll --usdc &lt;amount&gt;")
+            _tg.send(
+                f"❌ <b>Execute FAILED {station_id} [{mode}]:</b> bankroll not initialised\n"
+                f"Run: we init-bankroll --usdc &lt;amount&gt;"
+            )
             return
 
     avail = br.available(bankroll)
@@ -432,7 +448,7 @@ def _execute_job(station_id: str) -> None:
         snapshot = asyncio.run(fetch_market(slug, station_id, target_date))
         store.write_market_snapshot(snapshot.model_dump(), station_id, target_date)
     except Exception as exc:
-        _tg.send(f"❌ <b>Execute FAILED {station_id}:</b> market fetch error\n{exc}")
+        _tg.send(f"❌ <b>Execute FAILED {station_id} [{mode}]:</b> market fetch error\n{exc}")
         return
 
     outcome_map = {o.label: o for o in snapshot.outcomes}
@@ -446,27 +462,30 @@ def _execute_job(station_id: str) -> None:
         usdc_stake = round(pick.kelly_fraction * avail, 2)
         if pick.max_stake_usdc is not None and usdc_stake > pick.max_stake_usdc:
             _logger.info(
-                "Downsizing %s: kelly stake $%.2f → depth cap $%.2f",
-                pick.bracket_label, usdc_stake, pick.max_stake_usdc,
+                "Downsizing %s [%s]: kelly stake $%.2f → depth cap $%.2f",
+                pick.bracket_label, mode, usdc_stake, pick.max_stake_usdc,
             )
             usdc_stake = round(pick.max_stake_usdc, 2)
         if usdc_stake < MIN_ORDER_USDC:
-            _logger.info("Skipping %s: stake $%.2f below minimum", pick.bracket_label, usdc_stake)
+            _logger.info(
+                "Skipping %s [%s]: stake $%.2f below minimum",
+                pick.bracket_label, mode, usdc_stake,
+            )
             continue
         try:
             rec = place_order(pick, outcome, usdc_stake, dry_run=dry_run)
             records.append(rec)
             total_staked += usdc_stake
         except Exception as exc:
-            _logger.error("Order failed %s %s: %s", station_id, pick.bracket_label, exc)
-            _tg.send(f"❌ <b>Order FAILED {station_id} {pick.bracket_label}:</b> {exc}")
+            _logger.error("Order failed %s [%s] %s: %s", station_id, mode, pick.bracket_label, exc)
+            _tg.send(f"❌ <b>Order FAILED {station_id} [{mode}] {pick.bracket_label}:</b> {exc}")
 
     if records:
         if dry_run:
-            br.reserve_dry(bankroll, total_staked)
+            br.reserve_dry(bankroll, total_staked, mode=mode)
         else:
             br.reserve(bankroll, total_staked)
-        save_execution(station_id, target_date, records)
+        save_execution(station_id, target_date, records, mode=mode)
 
 
 def _closing_snapshot_job(station_id: str) -> None:
@@ -812,7 +831,7 @@ def start(stations: list[str]) -> None:
         )
         sched.add_job(
             _execute_job, CronTrigger(hour=exec_h, minute=exec_m),
-            args=[station_id], id=f"execute_{station_id}", name=f"Execute {station_id}",
+            args=[station_id, "bma"], id=f"execute_{station_id}", name=f"Execute {station_id}",
         )
         sched.add_job(
             _closing_snapshot_job, CronTrigger(hour=clv_h, minute=clv_m),
@@ -831,9 +850,10 @@ def start(stations: list[str]) -> None:
             station_id, ingest_h, ingest_m, lock_h, lock_m, exec_h, exec_m,
         )
 
-        # Optional intraday short-lead lock — fires once a day, targets TODAY's
-        # daily max using the freshest WN2 init. The subsequent execute job
-        # (5 min after) places orders via the existing TRADING_ENABLED flow.
+        # Optional intraday + peak short-lead locks — fire once a day at
+        # intraday_lock_time_utc, targeting TODAY's daily max using the freshest
+        # WN2 init. Subsequent per-mode execute jobs (5 min after) place orders
+        # against the matching dry/live bankroll.
         if cfg.intraday_lock_time_utc:
             intra_h, intra_m = map(int, cfg.intraday_lock_time_utc.split(":"))
             intra_exec_total_m = intra_h * 60 + intra_m + 5
@@ -845,11 +865,21 @@ def start(stations: list[str]) -> None:
             )
             sched.add_job(
                 _execute_job, CronTrigger(hour=intra_exec_h, minute=intra_exec_m),
-                args=[station_id], id=f"intraday_execute_{station_id}",
+                args=[station_id, "intraday"], id=f"intraday_execute_{station_id}",
                 name=f"Intraday execute {station_id}",
             )
+            sched.add_job(
+                _peak_lock_job, CronTrigger(hour=intra_h, minute=intra_m),
+                args=[station_id], id=f"peak_lock_{station_id}",
+                name=f"Peak lock {station_id}",
+            )
+            sched.add_job(
+                _execute_job, CronTrigger(hour=intra_exec_h, minute=intra_exec_m),
+                args=[station_id, "peak"], id=f"peak_execute_{station_id}",
+                name=f"Peak execute {station_id}",
+            )
             _logger.info(
-                "Scheduled %s intraday: lock@%02d:%02dz execute@%02d:%02dz",
+                "Scheduled %s intraday+peak: lock@%02d:%02dz execute@%02d:%02dz",
                 station_id, intra_h, intra_m, intra_exec_h, intra_exec_m,
             )
 
@@ -1279,9 +1309,9 @@ def start(stations: list[str]) -> None:
         /peak EGLC        — just EGLC
         /peak EGLC KLGA   — multiple
 
-        Bets YES on the single bracket containing WN2's predicted peak (ensemble
-        mean of per-member daily max). Flat 1% of bankroll per bet. No σ floor,
-        no Kelly, no probability-based edge gate. Experimental "trust the model"
+        Bets YES on the single bracket containing WN2's p75 of per-member
+        daily max. Quarter-Kelly sizing (same multiplier as intraday). No σ
+        floor, no probability-based edge gate. Experimental "trust the model"
         mode for testing whether WN2's point forecast is profitable on its own.
         """
         from weather_edge.config import get_station as _gs
@@ -1295,7 +1325,7 @@ def start(stations: list[str]) -> None:
             _spawn(f"manual-peak-{sid}", _peak_lock_job, sid)
         return (
             f"Peak lock dispatched for {len(targets)} station(s): {', '.join(targets)}\n"
-            f"Strategy: WN2 ensemble-mean of daily max → YES on bracket containing it; flat 1% sizing."
+            f"Strategy: WN2 p75 of daily max → YES on bracket containing it; quarter-Kelly sizing."
         )
 
     def _cmd_execute(args: str = "") -> str:

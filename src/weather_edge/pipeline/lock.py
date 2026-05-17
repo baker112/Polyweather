@@ -44,6 +44,23 @@ _logger = logging.getLogger(__name__)
 
 _DEFAULT_LEAD_HOURS = 24  # primary lead bucket for the 12z run targeting D+1
 
+
+def _lock_strategy_for(bma_mode_override: str | None) -> str:
+    """Map the forecast-aggregation override to the lock-strategy identifier
+    used for storage routing (picks file, executions subdir, dry bankroll).
+
+    None         → "bma"       (D-1 evening BMA blend)
+    "wn2_only"   → "intraday"  (same-day WN2-only short-lead)
+    "wn2_peak"   → "peak"      (same-day WN2 p75 point-forecast)
+    """
+    if bma_mode_override is None:
+        return "bma"
+    if bma_mode_override == "wn2_only":
+        return "intraday"
+    if bma_mode_override == "wn2_peak":
+        return "peak"
+    return "bma"
+
 # Floor on the predictive σ before computing bracket probabilities. The pre-2026-05-13
 # /dump analysis showed bot betting NO on the exact resolved bracket ~30% of picks
 # (vs ~17% expected for well-calibrated 6-bracket markets) — symptom of over-narrow
@@ -107,16 +124,27 @@ def lock_picks(
     """
     from weather_edge.logging import log_event
 
-    if store.picks_exist(station_id, target_date):
+    lock_strategy = _lock_strategy_for(bma_mode_override)
+
+    if store.picks_exist(station_id, target_date, mode=lock_strategy):
         if not force:
-            raise AlreadyLockedError(f"Picks already locked for {station_id} on {target_date}")
-        _logger.info("Force re-lock: deleting existing picks for %s %s", station_id, target_date)
-        picks_path = store._DATA_DIR / "picks" / f"date={target_date}" / f"station={station_id}" / "picks.json"
+            raise AlreadyLockedError(
+                f"Picks already locked for {station_id} on {target_date} "
+                f"(mode={lock_strategy})"
+            )
+        _logger.info(
+            "Force re-lock: deleting existing picks for %s %s (mode=%s)",
+            station_id, target_date, lock_strategy,
+        )
+        picks_path = (
+            store._DATA_DIR / "picks" / f"date={target_date}"
+            / f"station={station_id}" / store._picks_filename(lock_strategy)
+        )
         picks_path.unlink(missing_ok=True)
 
     station = get_station(station_id)
 
-    provenance: dict[str, Any] = {}
+    provenance: dict[str, Any] = {"lock_strategy": lock_strategy}
     pipeline_start = time.monotonic()
 
     # ── Stage 1: Ingest forecasts ─────────────────────────────────────────────
@@ -295,7 +323,10 @@ def lock_picks(
             _logger.warning("Market fetch failed: %s", exc)
             log_event("fetch_market", station_id, "error",
                       (time.monotonic() - t2) * 1000, error=str(exc))
-            return _no_pick(target_date, station_id, now_utc, dist, f"market_error: {exc}", provenance)
+            return _no_pick(
+                target_date, station_id, now_utc, dist, f"market_error: {exc}",
+                provenance, lock_strategy=lock_strategy,
+            )
 
     log_event("fetch_market", station_id, "ok",
               (time.monotonic() - t2) * 1000, implied_sum=snapshot.implied_sum)
@@ -312,9 +343,11 @@ def lock_picks(
 
     if effective_bma_mode == "wn2_peak":
         # Point-forecast strategy: trust μ; bet YES on the bracket containing
-        # it; flat sizing; ignore probabilistic edge calculus.
+        # it; quarter-Kelly sizing; skip the probabilistic edge gates.
         candidates = _compute_peak_bet(
             dist.mu, brackets, snapshot, now_utc, station.min_liquidity,
+            station_kelly_multiplier=station_kelly_mult,
+            kelly_multiplier_override=kelly_multiplier_override,
             provenance=provenance,
         )
     else:
@@ -355,19 +388,13 @@ def lock_picks(
         provenance=provenance,
     )
 
-    store.write_picks(result.model_dump(), station_id, target_date)
+    store.write_picks(result.model_dump(), station_id, target_date, mode=lock_strategy)
     log_event("lock_picks", station_id, "ok",
               (time.monotonic() - pipeline_start) * 1000, n_picks=len(picks))
     return result
 
 
 # ─── Peak-bet (wn2_peak mode) ─────────────────────────────────────────────────
-
-# Flat fraction of bankroll to risk per wn2_peak pick. Conservative default
-# because the strategy assumes zero model uncertainty — if WN2 is wrong on
-# the peak bracket (which it will be on ~50-70% of days at 1°C granularity),
-# the bet loses 100% of stake. 1% per bet → ~10 losses to halve bankroll.
-_PEAK_BET_FRACTION = 0.01
 
 
 def _compute_peak_bet(
@@ -376,16 +403,26 @@ def _compute_peak_bet(
     snapshot: MarketSnapshot,
     now_utc: datetime,
     station_min_liquidity: float | None,
+    station_kelly_multiplier: float,
+    kelly_multiplier_override: float | None,
     provenance: dict[str, Any],
 ) -> list[Candidate]:
     """wn2_peak strategy: bet YES on the single bracket containing μ.
 
     No probability computation, no edge math, no σ. Just: take the model's
-    predicted peak, find which Polymarket bracket it lands in, bet a flat
-    fraction of bankroll on YES. Skips entirely if the bracket isn't in the
-    market or its liquidity is too thin to fill.
+    predicted peak, find which Polymarket bracket it lands in, bet quarter
+    Kelly on YES. Sizing matches intraday — the model asserts 100% confidence
+    by construction (raw Kelly = 1.0) so the cap chain is what actually does
+    the work: max_kelly_fraction × kelly_multiplier_override (0.25 from the
+    caller) × station_kelly_multiplier. Skips entirely if the bracket isn't
+    in the market or its liquidity is too thin to fill.
     """
     thresholds = load_thresholds()
+    kelly_mult = (
+        kelly_multiplier_override
+        if kelly_multiplier_override is not None
+        else thresholds.kelly_multiplier
+    )
     freshness_cutoff = now_utc - timedelta(minutes=thresholds.market_freshness_minutes)
     min_liquidity = (
         station_min_liquidity if station_min_liquidity is not None
@@ -441,6 +478,15 @@ def _compute_peak_bet(
         if has_book_data and top_size_usdc > 0 else None
     )
 
+    # Quarter-Kelly sizing. Model claims certainty (model_prob=1.0) so the raw
+    # Kelly numerator (1.0 - market_prob) and denominator (1.0 - market_prob)
+    # cancel to 1.0. The cap × kelly_mult × station_kelly chain bounds it.
+    kelly = (
+        min(1.0, thresholds.max_kelly_fraction)
+        * kelly_mult
+        * station_kelly_multiplier
+    )
+
     candidate = Candidate(
         bracket_label=target_bracket.label,
         low=target_bracket.low,
@@ -451,13 +497,15 @@ def _compute_peak_bet(
         side="YES",
         spread=outcome.spread,
         liquidity=outcome.liquidity,
-        kelly_fraction=_PEAK_BET_FRACTION,
+        kelly_fraction=round(kelly, 4),
         max_stake_usdc=round(max_stake_usdc, 2) if max_stake_usdc is not None else None,
         gates=gates,
         raw_values={
             "wn2_peak_mu": mu,
             "market_mid": outcome.mid,
             "top_size_usdc": top_size_usdc,
+            "kelly_raw": 1.0,
+            "kelly_mult": kelly_mult,
         },
     )
     return [candidate] if all(gates.values()) else []
@@ -894,6 +942,7 @@ def _no_pick(
     dist: PredictedDistribution,
     reason: str,
     provenance: dict[str, Any],
+    lock_strategy: str = "bma",
 ) -> LockedPicks:
     result = LockedPicks(
         date=target_date,
@@ -905,7 +954,7 @@ def _no_pick(
         no_edge_reason=reason,
         provenance=provenance,
     )
-    store.write_picks(result.model_dump(), station_id, target_date)
+    store.write_picks(result.model_dump(), station_id, target_date, mode=lock_strategy)
     return result
 
 
