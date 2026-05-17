@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import pickle
+import threading
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -44,11 +45,12 @@ def _scrub_nonfinite(obj: Any) -> Any:
 def _dump_json(obj: Any, path: Path) -> None:
     """Atomically write JSON with NaN-scrubbing, strict spec, and ISO datetimes.
 
-    Writes to a sibling .tmp file then os.replaces it onto the target so a
-    crash mid-write can't leave a 0-byte or truncated file for the next
-    reader. (Same-filesystem rename is atomic on Linux/Windows.)
+    Writes to a per-writer sibling .tmp file then os.replaces it onto the
+    target. The pid+tid suffix prevents concurrent writers from colliding on
+    the tmp name (intraday and peak lock jobs both write prediction.json
+    simultaneously). Same-filesystem rename is atomic on Linux/Windows.
     """
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(path.suffix + f".tmp.{os.getpid()}.{threading.get_ident()}")
     with open(tmp, "w") as f:
         json.dump(_scrub_nonfinite(obj), f, default=_json_default, indent=2, allow_nan=False)
         f.flush()
