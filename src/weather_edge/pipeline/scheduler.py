@@ -68,11 +68,16 @@ def _ingest_job(station_id: str) -> None:
 
 
 def _lock_job(station_id: str) -> None:
+    """BMA D-1 evening lock for D+1. Success is silent — the lock digest job
+    aggregates picks across all stations at the end of the lock window. Only
+    failures still emit per-station Telegram messages.
+    """
     import asyncio
     from datetime import timedelta
 
     from weather_edge.pipeline.lock import lock_picks
     from weather_edge.exceptions import AlreadyLockedError
+    from weather_edge import telegram_format as tf
 
     now_utc = datetime.now(timezone.utc)
     target_date = (now_utc + timedelta(days=1)).date()
@@ -82,29 +87,11 @@ def _lock_job(station_id: str) -> None:
             "Locked %s %s: mu=%.2f sigma=%.2f picks=%d",
             station_id, target_date, result.mu, result.sigma, len(result.picks),
         )
-        if result.picks:
-            lines = [f"🎯 <b>Pick locked: {station_id}</b> · {target_date}",
-                     f"   μ={result.mu:.1f}°C  σ={result.sigma:.2f}"]
-            for p in result.picks:
-                cap_str = f"  cap=${p.max_stake_usdc:.0f}" if p.max_stake_usdc is not None else ""
-                lines.append(
-                    f"  {'🟢' if p.side == 'YES' else '🔴'} {p.side} {p.bracket_label}"
-                    f"  model={p.model_prob:.0%}  mkt={p.market_prob:.0%}  edge={p.edge:+.1%}"
-                    f"  kelly={p.kelly_fraction:.1%}{cap_str}"
-                )
-            _tg.send("\n".join(lines))
-        else:
-            _tg.send(f"ℹ️ <b>No edge: {station_id}</b> · {target_date}\n{result.no_edge_reason or 'all edges below threshold'}")
     except AlreadyLockedError:
         _logger.info("Already locked %s %s", station_id, target_date)
-        _tg.send(
-            f"ℹ️ <b>Already locked: {station_id}</b> · {target_date}\n"
-            f"  Picks file already exists. Use /picks {station_id} to view, "
-            f"or wait for next scheduled run."
-        )
     except Exception as exc:
         _logger.error("Lock failed %s %s: %s", station_id, target_date, exc)
-        _tg.send(f"❌ <b>Lock FAILED: {station_id}</b> · {target_date}\n{exc}")
+        _tg.send(tf.format_lock_failure("bma", station_id, target_date, str(exc)))
 
 
 def _intraday_lock_job(station_id: str) -> None:
@@ -164,8 +151,10 @@ def _intraday_run(station_id: str, mode: str = "wn2_only") -> None:
     from weather_edge.pipeline.lock import lock_picks, _most_recent_init
     from weather_edge.exceptions import AlreadyLockedError, IngestError
 
+    from weather_edge import telegram_format as tf
+
     label = "Intraday" if mode == "wn2_only" else "Peak"
-    icon = "⚡" if mode == "wn2_only" else "🎯"
+    strategy = "intraday" if mode == "wn2_only" else "peak"
     # Quarter-Kelly for both: intraday is a new probabilistic mode and peak's
     # 100%-confidence model assumption makes a tighter multiplier essential.
     kelly_mult = 0.25
@@ -202,7 +191,7 @@ def _intraday_run(station_id: str, mode: str = "wn2_only") -> None:
     if result is None:
         msg = f"all WN2 init attempts failed: {last_exc}"
         _logger.error("%s lock failed %s %s: %s", label, station_id, target_date, msg)
-        _tg.send(f"❌ <b>{label} FAILED: {station_id}</b> · {target_date}\n{msg}")
+        _tg.send(tf.format_lock_failure(strategy, station_id, target_date, msg))
         return
     try:
         lead_h = int((datetime(target_date.year, target_date.month, target_date.day, 12, tzinfo=timezone.utc) - init_dt).total_seconds() // 3600)
@@ -211,29 +200,11 @@ def _intraday_run(station_id: str, mode: str = "wn2_only") -> None:
             label, station_id, target_date, result.mu, result.sigma, len(result.picks),
             init_dt.strftime("%Y-%m-%d %HZ"), lead_h,
         )
-        if result.picks:
-            lines = [
-                f"{icon} <b>{label} {station_id}</b> · {target_date}  μ={result.mu:.1f}°C  σ={result.sigma:.2f}",
-            ]
-            for p in result.picks:
-                cap_str = f" / cap=${p.max_stake_usdc:.0f}" if p.max_stake_usdc is not None else ""
-                lines.append(
-                    f"  {'🟢' if p.side == 'YES' else '🔴'} {p.side} {p.bracket_label}"
-                    f"  {p.kelly_fraction:.1%} of bankroll{cap_str}"
-                    f"  ({p.model_prob:.0%} model vs {p.market_prob:.0%} mkt)"
-                )
-            _tg.send("\n".join(lines))
-        else:
-            short_reason = _summarise_no_edge(result.no_edge_reason)
-            _tg.send(
-                f"{icon} <b>{label} {station_id}</b> · {target_date}  μ={result.mu:.1f}°C — no pick\n"
-                f"  {short_reason}"
-            )
     except AlreadyLockedError:
         _logger.info("%s: already locked %s %s — skipping", label, station_id, target_date)
     except Exception as exc:
         _logger.error("%s lock failed %s %s: %s", label, station_id, target_date, exc)
-        _tg.send(f"❌ <b>{label} FAILED: {station_id}</b> · {target_date}\n{exc}")
+        _tg.send(tf.format_lock_failure(strategy, station_id, target_date, str(exc)))
 
 
 def _resolve_and_observe_job(station_id: str, target_date: "date | None" = None) -> None:
@@ -294,28 +265,24 @@ def _resolve_and_observe_job(station_id: str, target_date: "date | None" = None)
         except FileNotFoundError:
             bankroll_data = None
 
-        mode_icons = {"bma": "📊", "intraday": "⚡", "peak": "🎯"}
-        all_lines: list[str] = []
-
+        # Settle each mode independently. Per-(date, mode) `_settled_<mode>.json`
+        # marker prevents double-settlement on re-runs (manual /resolve, restart
+        # catch-up, etc.) without coupling the modes — adding intraday/peak
+        # settling later doesn't re-touch bma.
         for mode in br.DRY_MODES:
             execs = load_executions(station_id, yesterday, mode=mode)
             if not execs:
                 continue
 
-            # Per-(date, mode) settlement marker — prevents double-settlement
-            # on resolve re-runs (manual /resolve, restart catch-up, etc.).
-            # Each mode settles independently so adding intraday/peak settling
-            # later doesn't re-settle bma.
             settled_path = (
                 Path(__file__).parents[3] / "data" / "executions"
                 / f"station={station_id}" / f"date={yesterday}"
                 / f"_settled_{mode}.json"
             )
-            already_settled = settled_path.exists()
+            if settled_path.exists():
+                continue
 
             dry_bankroll = br.load_dry(mode=mode)
-
-            mode_lines = [f"  {mode_icons.get(mode, '·')} <b>{mode}</b>"]
             settled_records: list[dict] = []
             for e in execs:
                 bracket = e.get("bracket_label", "?")
@@ -327,15 +294,6 @@ def _resolve_and_observe_job(station_id: str, target_date: "date | None" = None)
                 win = (bracket == resolved_label and side == "YES") or (bracket != resolved_label and side == "NO")
                 pnl = (1.0 / entry - 1) * stake if win else -stake
                 is_dry = bool(e.get("dry_run"))
-                tag = " [dry]" if is_dry else ""
-                icon = "🏆" if win else "💸"
-                line = f"    {icon} {side} {bracket}{tag}  entry={entry:.2f}  P&amp;L=${pnl:+.2f}"
-                clv_value: float | None = None
-                if bracket in clv_outcomes:
-                    closing = clv_outcomes[bracket]
-                    clv_value = (closing - entry) if side == "YES" else (entry - closing)
-                    line += f"  CLV={clv_value:+.3f}"
-                mode_lines.append(line)
 
                 rec_out = {
                     "bracket_label": bracket,
@@ -346,20 +304,22 @@ def _resolve_and_observe_job(station_id: str, target_date: "date | None" = None)
                     "win": win,
                     "pnl": round(pnl, 4),
                 }
-                if clv_value is not None:
-                    rec_out["clv"] = round(clv_value, 4)
+                if bracket in clv_outcomes:
+                    closing = clv_outcomes[bracket]
+                    rec_out["clv"] = round(
+                        (closing - entry) if side == "YES" else (entry - closing), 4
+                    )
                 settled_records.append(rec_out)
 
-                if not already_settled:
-                    try:
-                        if is_dry:
-                            br.settle_dry(dry_bankroll, stake, pnl, mode=mode)
-                        elif bankroll_data is not None:
-                            br.settle(bankroll_data, stake, pnl)
-                    except Exception as exc:
-                        _logger.warning("Bankroll settle failed (%s): %s", mode, exc)
+                try:
+                    if is_dry:
+                        br.settle_dry(dry_bankroll, stake, pnl, mode=mode)
+                    elif bankroll_data is not None:
+                        br.settle(bankroll_data, stake, pnl)
+                except Exception as exc:
+                    _logger.warning("Bankroll settle failed (%s): %s", mode, exc)
 
-            if not already_settled and settled_records:
+            if settled_records:
                 settled_path.parent.mkdir(parents=True, exist_ok=True)
                 from weather_edge.store.parquet import _dump_json as _dj
                 _dj({
@@ -369,21 +329,8 @@ def _resolve_and_observe_job(station_id: str, target_date: "date | None" = None)
                     "records": settled_records,
                 }, settled_path)
 
-            if any(e.get("dry_run") for e in execs):
-                mode_lines.append(
-                    f"    📒 dry: ${dry_bankroll['current_usdc']:.2f}  "
-                    f"(P&amp;L=${dry_bankroll.get('total_pnl', 0):+.2f}  "
-                    f"{dry_bankroll.get('n_trades', 0)} trades)"
-                )
-
-            # Only emit a per-mode block if it had at least one bet beyond
-            # the header (so an empty mode doesn't take up space).
-            if len(mode_lines) > 1:
-                all_lines.extend(mode_lines)
-
-        if all_lines:
-            header = f"📋 <b>Result: {station_id}</b> · {yesterday}  →  {resolved_label}"
-            _tg.send("\n".join([header, *all_lines]))
+        # Per-station resolve messages are suppressed; the resolve digest job
+        # aggregates across all stations once per day. Failures still report.
     except Exception as exc:
         _logger.error("Resolution failed %s %s: %s", station_id, yesterday, exc)
         _tg.send(f"❌ <b>Resolution FAILED: {station_id}</b> · {yesterday}\n{exc}")
@@ -634,135 +581,194 @@ def _current_mode() -> str:
     return "dryrun"
 
 
+# ─── Lock & resolve digests ───────────────────────────────────────────────────
+
+
+def _pnl_for_exec(e: dict, resolved_label: str) -> float:
+    """P&L of one execution given the resolved bracket. Shared by digests."""
+    bracket = e.get("bracket_label", "?")
+    side = e.get("side", "?")
+    entry = float(e.get("price", 0) or 0)
+    stake = float(e.get("usdc_stake", 0) or 0)
+    if entry <= 0:
+        return 0.0
+    win = (bracket == resolved_label and side == "YES") or (
+        bracket != resolved_label and side == "NO"
+    )
+    return (1.0 / entry - 1) * stake if win else -stake
+
+
+def _lock_digest_job(stations: list[str], mode: str) -> None:
+    """One consolidated message per (lock window, mode) instead of per-station.
+
+    BMA digest summarises tomorrow's picks (D-1 evening lock). Intraday/peak
+    digests summarise today's picks. Failures already speak for themselves.
+    """
+    from datetime import timedelta
+    from weather_edge.execution import bankroll as br
+    from weather_edge.store import parquet as store
+    from weather_edge import telegram_format as tf
+
+    now = datetime.now(timezone.utc)
+    target_date = (now + timedelta(days=1)).date() if mode == "bma" else now.date()
+
+    rows: list[dict] = []
+    for sid in stations:
+        data = store.read_picks(sid, target_date, mode=mode)
+        if data is None:
+            continue
+        rows.append({
+            "sid": sid,
+            "mu": data.get("mu"),
+            "picks": [
+                {
+                    "side": p.get("side"),
+                    "bracket_label": p.get("bracket_label"),
+                    "usdc_stake": None,  # not known until execute fires
+                }
+                for p in (data.get("picks") or [])
+            ],
+        })
+
+    if not rows:
+        # No picks at all yet — silently skip. Avoids spamming an empty digest
+        # if the digest fires before any lock has run (shouldn't happen in
+        # production but is a defensive guard for catch-up scenarios).
+        return
+
+    bankroll = br.load_dry(mode=mode)
+    _tg.send(tf.format_lock_digest(mode, target_date, rows, bankroll=bankroll))
+
+
+def _resolve_digest_job(stations: list[str], target_date: "date | None" = None) -> None:
+    """One consolidated resolution message for the day across all modes.
+
+    Reads each mode's _settled_<mode>.json marker (written by the per-station
+    resolve jobs) so all the per-bet P&L numbers come from the canonical
+    record on disk rather than being recomputed.
+    """
+    import json
+    from datetime import timedelta
+    from pathlib import Path
+
+    from weather_edge.execution import bankroll as br
+    from weather_edge.store import parquet as store
+    from weather_edge import telegram_format as tf
+
+    now = datetime.now(timezone.utc)
+    td = target_date if target_date is not None else (now - timedelta(days=1)).date()
+
+    blocks: list[dict] = []
+    day_totals = {"bma": 0.0, "intraday": 0.0, "peak": 0.0}
+    has_any = False
+    for sid in stations:
+        rec = store.read_resolution(sid, td)
+        if not (isinstance(rec, dict) and rec.get("resolved")):
+            continue
+        modes_blob: list[dict] = []
+        for mode in br.DRY_MODES:
+            marker = (
+                Path(__file__).parents[3] / "data" / "executions"
+                / f"station={sid}" / f"date={td}" / f"_settled_{mode}.json"
+            )
+            if not marker.exists():
+                continue
+            try:
+                payload = json.loads(marker.read_text())
+            except Exception:
+                continue
+            recs = payload.get("records") or []
+            picks_out = []
+            for r in recs:
+                picks_out.append({
+                    "side": r.get("side"),
+                    "bracket_label": r.get("bracket_label"),
+                    "pnl": r.get("pnl", 0.0),
+                })
+                day_totals[mode] += float(r.get("pnl", 0.0))
+            modes_blob.append({"mode": mode, "picks": picks_out})
+        if not modes_blob:
+            continue
+        has_any = True
+        blocks.append({
+            "sid": sid,
+            "resolved_label": rec.get("resolved_label"),
+            "modes": modes_blob,
+        })
+
+    if not has_any:
+        return
+    _tg.send(tf.format_resolution_digest(td, blocks, day_totals))
+
+
 # ─── Daily summary ────────────────────────────────────────────────────────────
 
 def _daily_summary_job(stations: list[str]) -> None:
-    """Send a consolidated Telegram digest: yesterday P&L + bankroll + tomorrow's picks."""
+    """Combined yesterday P&L + bankroll + tomorrow's BMA picks digest."""
     from datetime import timedelta
+    from pathlib import Path
+    import json
 
     from weather_edge.execution import bankroll as br
     from weather_edge.execution.polymarket_exec import load_executions
-    from weather_edge.models import LockedPicks
     from weather_edge.store import parquet as store
+    from weather_edge import telegram_format as tf
 
     now = datetime.now(timezone.utc)
     yesterday = (now - timedelta(days=1)).date()
     tomorrow = (now + timedelta(days=1)).date()
+    today = now.date()
 
-    mode = _current_mode()
-    mode_icon = {"off": "⏸", "dryrun": "🔵", "live": "🟢", "partial": "🟡"}.get(mode, "❓")
-    lines = [f"📊 <b>Daily Summary</b> · {now.strftime('%Y-%m-%d %H:%M')}z  {mode_icon} {mode}"]
-
-    # Yesterday P&L per station (show dry-run results when no live bets exist)
-    def _pnl_for(e: dict, resolved_label: str) -> float:
-        bracket = e.get("bracket_label", "?")
-        side = e.get("side", "?")
-        entry = float(e.get("price", 0) or 0)
-        stake = float(e.get("usdc_stake", 0) or 0)
-        if entry <= 0:
-            return 0.0
-        win = (bracket == resolved_label and side == "YES") or (bracket != resolved_label and side == "NO")
-        return (1.0 / entry - 1) * stake if win else -stake
-
-    lines.append("\n<b>Yesterday P&amp;L</b>")
-    total_live_pnl = 0.0
-    total_dry_pnl = 0.0
-    any_bets = False
-    any_dry = False
+    # Per-mode yesterday stats
+    per_mode: dict[str, dict] = {m: {"resolved": 0, "total": 0, "pnl": 0.0, "staked": 0.0}
+                                  for m in br.DRY_MODES}
     for sid in stations:
         try:
             rec = store.read_resolution(sid, yesterday)
         except Exception:
             rec = None
-        try:
-            execs = [e for e in load_executions(sid, yesterday) if isinstance(e, dict)]
-        except Exception:
-            execs = []
-        live_execs = [e for e in execs if not e.get("dry_run")]
-        dry_execs = [e for e in execs if e.get("dry_run")]
-        if not (live_execs or dry_execs):
-            continue
-        any_bets = True
         resolved = bool(rec and rec.get("resolved"))
         resolved_label = (rec or {}).get("resolved_label", "")
-
-        if live_execs:
+        for mode in br.DRY_MODES:
+            try:
+                execs = [e for e in load_executions(sid, yesterday, mode=mode)
+                         if isinstance(e, dict)]
+            except Exception:
+                execs = []
+            if not execs:
+                continue
+            per_mode[mode]["total"] += 1
             if resolved:
-                pnl = sum(_pnl_for(e, resolved_label) for e in live_execs)
-                total_live_pnl += pnl
-                icon = "🏆" if pnl >= 0 else "💸"
-                lines.append(f"  {icon} {sid}  →  {resolved_label}  P&amp;L=${pnl:+.2f}")
-            else:
-                lines.append(f"  ⏳ {sid}: pending")
-        if dry_execs:
-            any_dry = True
-            if resolved:
-                pnl = sum(_pnl_for(e, resolved_label) for e in dry_execs)
-                total_dry_pnl += pnl
-                icon = "🏆" if pnl >= 0 else "💸"
-                lines.append(f"  {icon} {sid} [dry]  →  {resolved_label}  P&amp;L=${pnl:+.2f}")
-            else:
-                lines.append(f"  ⏳ {sid} [dry]: pending")
-    if not any_bets:
-        lines.append("  No bets yesterday")
-    else:
-        if mode == "live":
-            lines.append(f"  <b>Live total: ${total_live_pnl:+.2f}</b>")
-        if any_dry:
-            lines.append(f"  <b>Dry total: ${total_dry_pnl:+.2f}</b>")
+                per_mode[mode]["resolved"] += 1
+                for e in execs:
+                    per_mode[mode]["pnl"] += _pnl_for_exec(e, resolved_label)
+                    per_mode[mode]["staked"] += float(e.get("usdc_stake", 0) or 0)
 
-    # Bankroll
-    lines.append("\n<b>Bankroll</b>")
-    try:
-        b = br.load()
-        avail = b['current_usdc'] - b.get('reserved_usdc', 0)
-        lines.append(
-            f"  💰 live: ${b['current_usdc']:.2f}  "
-            f"(avail=${avail:.2f}  P&amp;L=${b.get('total_pnl', 0):+.2f}  {b.get('n_trades', 0)} trades)"
-        )
-    except FileNotFoundError:
-        lines.append("  💰 live: not initialised")
-    db = br.load_dry()
-    db_avail = db['current_usdc'] - db.get('reserved_usdc', 0)
-    lines.append(
-        f"  📒 dry:  ${db['current_usdc']:.2f}  "
-        f"(avail=${db_avail:.2f}  P&amp;L=${db.get('total_pnl', 0):+.2f}  {db.get('n_trades', 0)} trades)"
-    )
+    # Bankrolls
+    bankrolls = {m: br.load_dry(mode=m) for m in br.DRY_MODES}
 
-    # Tomorrow's picks
-    lines.append(f"\n<b>Picks for {tomorrow}</b>")
-    any_picks = False
+    # Tomorrow's BMA picks
+    rows: list[dict] = []
     for sid in stations:
-        data = store.read_picks(sid, tomorrow)
+        data = store.read_picks(sid, tomorrow, mode="bma")
         if data is None:
             continue
-        try:
-            locked = LockedPicks(**data)
-        except Exception:
-            continue
-        if locked.picks:
-            any_picks = True
-            for p in locked.picks:
-                lines.append(
-                    f"  🎯 {sid}  {'🟢' if p.side == 'YES' else '🔴'} {p.side} {p.bracket_label}"
-                    f"  edge={p.edge:+.1%}  kelly={p.kelly_fraction:.1%}"
-                )
-    if not any_picks:
-        lines.append("  No picks yet (locks fire later today)")
+        rows.append({
+            "sid": sid,
+            "mu": data.get("mu"),
+            "picks": [
+                {"side": p.get("side"), "bracket_label": p.get("bracket_label")}
+                for p in (data.get("picks") or [])
+            ],
+        })
 
-    # Edge-gate status (auto-pause flag per station)
-    from weather_edge.pipeline.edge_gate import station_passes_gate
-    lines.append("\n<b>Edge gate</b>")
-    for sid in stations:
-        try:
-            passed, reason = station_passes_gate(sid, tomorrow)
-        except Exception as exc:
-            lines.append(f"  ❓ {sid}: gate error ({exc})")
-            continue
-        icon = "✅" if passed else "⏸"
-        lines.append(f"  {icon} {sid}: {reason}")
-
-    _tg.send("\n".join(lines))
+    _tg.send(tf.format_daily_summary(
+        today=today, yesterday=yesterday, tomorrow=tomorrow,
+        mode_status=_current_mode(),
+        per_mode_yesterday=per_mode,
+        bankrolls_by_mode=bankrolls,
+        bma_tomorrow_picks=rows,
+    ))
 
 
 # ─── Catch-up ──────────────────────────────────────────────────────────────────
@@ -826,6 +832,12 @@ def start(stations: list[str]) -> None:
 
     from weather_edge.config import get_station as _get_station
 
+    # Track latest lock time per mode so digests can fire after the last
+    # station's lock finishes. Resolve digest needs the latest resolve too.
+    latest_bma_lock_min = 0
+    latest_intra_lock_min = -1
+    latest_resolve_min = 0
+
     for i, station_id in enumerate(stations):
         cfg = _get_station(station_id)
         lock_h, lock_m = map(int, cfg.lock_time_utc.split(":"))
@@ -864,6 +876,8 @@ def start(stations: list[str]) -> None:
             _resolve_and_observe_job, CronTrigger(hour=resolve_h, minute=resolve_m),
             args=[station_id], id=f"resolve_{station_id}", name=f"Resolve {station_id}",
         )
+        latest_bma_lock_min = max(latest_bma_lock_min, lock_h * 60 + lock_m)
+        latest_resolve_min = max(latest_resolve_min, resolve_h * 60 + resolve_m)
         sched.add_job(
             _refit_job, CronTrigger(day_of_week="sun", hour=3, minute=0),
             args=[station_id], id=f"refit_{station_id}", name=f"Refit {station_id}",
@@ -905,8 +919,50 @@ def start(stations: list[str]) -> None:
                 "Scheduled %s intraday+peak: lock@%02d:%02dz execute@%02d:%02dz",
                 station_id, intra_h, intra_m, intra_exec_h, intra_exec_m,
             )
+            latest_intra_lock_min = max(latest_intra_lock_min, intra_h * 60 + intra_m)
 
-    # Daily consolidated digest: yesterday P&L + bankroll + tomorrow's picks
+    # ── Per-mode lock digests ────────────────────────────────────────────────
+    # Each digest fires 10 min after the last station's lock in that window
+    # (5 min execute + 5 min headroom for slow async fills). Reads the picks
+    # files written by the per-station locks; suppressed if nothing locked.
+    def _digest_time(lock_min: int, offset: int = 10) -> tuple[int, int]:
+        total = (lock_min + offset) % (24 * 60)
+        return divmod(total, 60)
+
+    bma_dh, bma_dm = _digest_time(latest_bma_lock_min)
+    sched.add_job(
+        _lock_digest_job, CronTrigger(hour=bma_dh, minute=bma_dm),
+        args=[stations, "bma"], id="bma_lock_digest", name="BMA lock digest",
+    )
+    _logger.info("Scheduled BMA lock digest at %02d:%02dz", bma_dh, bma_dm)
+
+    if latest_intra_lock_min >= 0:
+        intra_dh, intra_dm = _digest_time(latest_intra_lock_min)
+        sched.add_job(
+            _lock_digest_job, CronTrigger(hour=intra_dh, minute=intra_dm),
+            args=[stations, "intraday"], id="intraday_lock_digest",
+            name="Intraday lock digest",
+        )
+        sched.add_job(
+            _lock_digest_job, CronTrigger(hour=intra_dh, minute=intra_dm),
+            args=[stations, "peak"], id="peak_lock_digest",
+            name="Peak lock digest",
+        )
+        _logger.info(
+            "Scheduled intraday+peak lock digests at %02d:%02dz",
+            intra_dh, intra_dm,
+        )
+
+    # Resolve digest fires 20 min after the last resolve cron so async API
+    # fetches and per-mode marker writes have time to land.
+    rd_h, rd_m = _digest_time(latest_resolve_min, offset=20)
+    sched.add_job(
+        _resolve_digest_job, CronTrigger(hour=rd_h, minute=rd_m),
+        args=[stations], id="resolve_digest", name="Resolve digest",
+    )
+    _logger.info("Scheduled resolve digest at %02d:%02dz", rd_h, rd_m)
+
+    # Daily summary at 08:30z — yesterday recap + tomorrow's BMA picks
     sched.add_job(
         _daily_summary_job, CronTrigger(hour=8, minute=30),
         args=[stations], id="daily_summary", name="Daily summary",
@@ -942,88 +998,65 @@ def start(stations: list[str]) -> None:
         return "\n".join(lines)
 
     def _picks(args: str = "") -> str:
+        """One-liner per station for the next BMA lock window.
+
+        For per-mode drill-down on a single station use `/pick STATION [mode]`.
+        """
         from datetime import timedelta
-        from weather_edge.config import get_station as _gs
-        from weather_edge.models import LockedPicks
         from weather_edge.store import parquet as store
+        from weather_edge import telegram_format as tf
         now = datetime.now(timezone.utc)
         target_date = (now + timedelta(days=1)).date()
-        lines = [f"Picks for {target_date} (now {now.strftime('%H:%M')}z):"]
+
+        rows: list[dict] = []
         for sid in stations:
-            cfg = _gs(sid)
-            lock_h, lock_m = map(int, cfg.lock_time_utc.split(":"))
-            lock_dt = now.replace(hour=lock_h, minute=lock_m, second=0, microsecond=0)
-            data = store.read_picks(sid, target_date)
+            data = store.read_picks(sid, target_date, mode="bma")
             if data is None:
-                mins_until = int((lock_dt - now).total_seconds() / 60)
-                if mins_until > 0:
-                    lines.append(f"  {sid}: not locked yet (lock at {cfg.lock_time_utc}z, {mins_until}m away)")
-                else:
-                    lines.append(f"  {sid}: lock overdue — try /lock {sid}")
+                rows.append({"sid": sid, "mu": None, "picks": []})
                 continue
-            locked = LockedPicks(**data)
-            locked_at = locked.locked_at.strftime("%H:%M") if locked.locked_at else "?"
-            if locked.picks:
-                lines.append(f"  {sid} (locked {locked_at}z, mu={locked.mu:.1f}C):")
-                for p in locked.picks:
-                    lines.append(f"    {p.side} {p.bracket_label}  edge={p.edge:+.3f}  kelly={p.kelly_fraction*100:.1f}%")
-            else:
-                lines.append(f"  {sid} (locked {locked_at}z): no edge — {locked.no_edge_reason or 'all below threshold'}")
-        return "\n".join(lines)
+            rows.append({
+                "sid": sid,
+                "mu": data.get("mu"),
+                "picks": [
+                    {"side": p.get("side"), "bracket_label": p.get("bracket_label")}
+                    for p in (data.get("picks") or [])
+                ],
+            })
+        # Reuse the lock-digest formatter for a consistent look.
+        return tf.format_lock_digest("bma", target_date, rows, bankroll=None)
 
     def _bankroll(args: str = "") -> str:
         from weather_edge.execution import bankroll as br
-        lines: list[str] = ["Bankroll"]
+        from weather_edge import telegram_format as tf
+
+        bankrolls: dict[str, dict] = {}
+        for m in br.DRY_MODES:
+            try:
+                bankrolls[m] = br.load_dry(mode=m)
+            except Exception as exc:
+                _logger.warning("Unreadable %s dry bankroll: %s", m, exc)
         try:
-            b = br.load()
-            avail = br.available(b)
-            lines += [
-                f"  Live:",
-                f"    Current: ${b['current_usdc']:.2f}",
-                f"    Reserved: ${b.get('reserved_usdc', 0):.2f}",
-                f"    Available: ${avail:.2f}",
-                f"    Total P&L: ${b.get('total_pnl', 0):+.2f}",
-                f"    Trades: {b.get('n_trades', 0)}",
-            ]
+            live = br.load()
         except FileNotFoundError:
-            lines.append("  Live: not initialised (we init-bankroll --usdc <amount>)")
-        except Exception as exc:
-            # Corrupt JSON, permission errors, etc. — show in-band, don't
-            # crash the dispatcher (otherwise the whole reply is an error).
-            lines.append(f"  Live: ⚠️ unreadable — {exc}")
-        try:
-            db = br.load_dry()
-            lines += [
-                f"  Dry (paper, ${br.DRY_INITIAL_USDC:.0f} seed):",
-                f"    Current: ${db['current_usdc']:.2f}",
-                f"    Reserved: ${db.get('reserved_usdc', 0):.2f}",
-                f"    Available: ${br.available(db):.2f}",
-                f"    Total P&L: ${db.get('total_pnl', 0):+.2f}",
-                f"    Trades: {db.get('n_trades', 0)}",
-            ]
-        except Exception as exc:
-            lines.append(f"  Dry: ⚠️ unreadable — {exc}")
-        return "\n".join(lines)
+            live = None
+        return tf.format_bankroll(bankrolls, live)
 
     def _pnl(args: str = "") -> str:
+        """Per-mode resolved P&L over the last N days (default 7)."""
         from datetime import timedelta
+        from weather_edge.execution import bankroll as br
         from weather_edge.execution.polymarket_exec import load_executions
         from weather_edge.store import parquet as _store
+        from weather_edge import telegram_format as tf
+
+        days = _parse_days(args)
         now = datetime.now(timezone.utc)
 
-        def _pnl_for(e: dict, label: str) -> float:
-            entry = float(e.get("price", 0) or 0)
-            stake = float(e.get("usdc_stake", 0) or 0)
-            if entry <= 0:
-                return 0.0
-            br_l = e.get("bracket_label", "?")
-            sd = e.get("side", "?")
-            win = (br_l == label and sd == "YES") or (br_l != label and sd == "NO")
-            return (1.0 / entry - 1) * stake if win else -stake
-
-        live = {"n": 0, "staked": 0.0, "pnl": 0.0}
-        dry = {"n": 0, "staked": 0.0, "pnl": 0.0}
-        for days_ago in range(1, 8):
+        per_mode: dict[str, dict] = {
+            m: {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0}
+            for m in br.DRY_MODES
+        }
+        for days_ago in range(1, days + 1):
             d = (now - timedelta(days=days_ago)).date()
             for sid in stations:
                 try:
@@ -1033,31 +1066,23 @@ def start(stations: list[str]) -> None:
                 if not (isinstance(rec, dict) and rec.get("resolved")):
                     continue
                 label = rec.get("resolved_label", "")
-                try:
-                    execs = load_executions(sid, d)
-                except Exception:
-                    continue
-                for e in execs:
-                    # Defensive: load_executions used to extend with dict keys
-                    # when a file held a single-record dict, yielding str items.
-                    if not isinstance(e, dict):
+                for mode in br.DRY_MODES:
+                    try:
+                        execs = load_executions(sid, d, mode=mode)
+                    except Exception:
                         continue
-                    bucket = dry if e.get("dry_run") else live
-                    bucket["n"] += 1
-                    bucket["staked"] += float(e.get("usdc_stake", 0) or 0)
-                    bucket["pnl"] += _pnl_for(e, label)
-
-        def _block(name: str, b: dict) -> list[str]:
-            out = [f"{name}: trades={b['n']} staked=${b['staked']:.2f} P&L=${b['pnl']:+.2f}"]
-            if b["staked"] > 0:
-                out.append(f"  ROI: {b['pnl']/b['staked']*100:+.1f}%")
-            return out
-
-        lines = ["P&L last 7 days (resolved bets):"]
-        lines += _block("  Live", live)
-        lines += _block("  Dry ", dry)
-        lines.append("\n(Use /bankroll for settled totals)")
-        return "\n".join(lines)
+                    bucket = per_mode[mode]
+                    for e in execs:
+                        if not isinstance(e, dict):
+                            continue
+                        bucket["n"] += 1
+                        stake = float(e.get("usdc_stake", 0) or 0)
+                        pnl = _pnl_for_exec(e, label)
+                        bucket["staked"] += stake
+                        bucket["pnl"] += pnl
+                        if pnl > 0:
+                            bucket["wins"] += 1
+        return tf.format_pnl(days, per_mode)
 
     def _station_breakdown(days: int) -> dict[str, dict]:
         from weather_edge.pipeline.reporting import station_breakdown
@@ -1438,9 +1463,41 @@ def start(stations: list[str]) -> None:
             return f"Unknown mode '{target}'. Use: off | dryrun | live"
         return f"Mode set to <b>{_current_mode()}</b>. Effective immediately; persisted to .env."
 
+    def _cmd_pick(args: str = "") -> str:
+        """Verbose drill-down for one (station, mode): `/pick STATION [mode]`.
+
+        Defaults to mode=bma and the next BMA target date (D+1). Pass an
+        explicit mode (bma|intraday|peak) to inspect that strategy's picks.
+        Intraday/peak target today's market; bma targets tomorrow's.
+        """
+        from datetime import timedelta
+        from weather_edge.execution import bankroll as br
+        from weather_edge.store import parquet as store
+        from weather_edge import telegram_format as tf
+
+        tokens = args.replace(",", " ").split()
+        if not tokens:
+            return (
+                "Usage: /pick STATION [bma|intraday|peak]\n"
+                f"Stations: {', '.join(stations)}"
+            )
+        sid = tokens[0].upper()
+        if sid not in stations:
+            return f"Unknown station '{sid}'. Known: {', '.join(stations)}"
+        mode = "bma"
+        for t in tokens[1:]:
+            if t.lower() in br.DRY_MODES:
+                mode = t.lower()
+                break
+        now = datetime.now(timezone.utc)
+        target_date = (now + timedelta(days=1)).date() if mode == "bma" else now.date()
+        data = store.read_picks(sid, target_date, mode=mode)
+        return tf.format_pick_detail(sid, mode, target_date, data)
+
     _tg.start_command_listener({
         "/status": _status,
         "/picks": _picks,
+        "/pick": _cmd_pick,
         "/bankroll": _bankroll,
         "/pnl": _pnl,
         "/topstations": _cmd_top,
@@ -1458,14 +1515,10 @@ def start(stations: list[str]) -> None:
         "/backtest": _cmd_backtest,
         "/dump": _cmd_dump,
     })
-    whitelist = _live_stations()
-    live_line = f"Live stations: {', '.join(sorted(whitelist))}\n" if whitelist else ""
     _tg.send(
-        f"🚀 <b>Scheduler started</b> · {len(stations)} stations\n"
-        f"Mode: {_current_mode()}\n"
-        f"{live_line}"
-        f"Stations: {', '.join(stations)}\n"
-        f"Commands: /status /picks /bankroll /pnl /topstations /losers /summary /lock /intraday /peak /ingest /execute /resolve /resolve_missed /mode /live /backtest"
+        f"🚀 Polyweather online · {len(stations)} stations · mode={_current_mode()}\n"
+        "Commands: /status /picks /pick /bankroll /pnl /summary /lock /intraday /peak "
+        "/execute /resolve /resolve_missed /mode /live /backtest /topstations /losers /dump"
     )
 
     # Run any missed jobs from earlier today (e.g. after VPS reboot)
