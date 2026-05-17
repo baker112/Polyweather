@@ -82,10 +82,26 @@ def _bankroll_block() -> dict[str, Any]:
         out["live"] = br.load()
     except Exception as exc:
         out["live"] = {"error": str(exc)}
-    try:
-        out["dry"] = br.load_dry()
-    except Exception as exc:
-        out["dry"] = {"error": str(exc)}
+    # Per-mode dry bankrolls. Check existence first because load_dry() would
+    # auto-init to $100 on first call, and a dump should never mutate state.
+    dry: dict[str, Any] = {}
+    for mode in br.DRY_MODES:
+        path = br._dry_path(mode)
+        if not path.exists():
+            dry[mode] = None
+            continue
+        try:
+            dry[mode] = br.load_dry(mode=mode)
+        except Exception as exc:
+            dry[mode] = {"error": str(exc)}
+    # Pre-split snapshot if the migration was run — useful for historic compare.
+    archive = _DATA_DIR / "dry_bankroll.pre_split.bak.json"
+    if archive.exists():
+        try:
+            dry["pre_split_archive"] = json.loads(archive.read_text())
+        except Exception as exc:
+            dry["pre_split_archive"] = {"error": str(exc)}
+    out["dry"] = dry
     return out
 
 
@@ -146,35 +162,67 @@ def _summarise_snapshot(snap: dict[str, Any]) -> dict[str, Any]:
 
 
 def _history_block(stations: list[str], start: date, end: date) -> dict[str, Any]:
+    """Per-station history bundle keyed by lock strategy (bma/intraday/peak).
+
+    Resolutions and market snapshots are shared across modes (the resolved
+    bracket and the market state don't depend on which strategy bet on it),
+    so those live at the station root. Picks, executions, and settlement
+    markers split per-mode so offline analysis can attribute P&L by strategy.
+    """
+    from weather_edge.execution import bankroll as br
     from weather_edge.execution.polymarket_exec import load_executions
     from weather_edge.store import parquet as store
 
     out: dict[str, Any] = {}
     for sid in stations:
         try:
-            picks = store.read_all_picks(sid)
-        except Exception as exc:
-            picks = []
-            _logger.warning("read_all_picks(%s) failed: %s", sid, exc)
-        try:
             resolutions = store.read_all_resolutions(sid)
         except Exception as exc:
             resolutions = []
             _logger.warning("read_all_resolutions(%s) failed: %s", sid, exc)
-
-        # Picks JSON has "target_date" (D+1); resolutions have "date".
-        picks_w = _filter_by_date(picks, start, end, "target_date") or _filter_by_date(picks, start, end, "date")
         resolutions_w = _filter_by_date(resolutions, start, end, "date")
 
-        executions: list[dict[str, Any]] = []
+        # Picks per mode. Walk read_all_picks(mode=...) and date-filter.
+        picks_by_mode: dict[str, list[dict[str, Any]]] = {}
+        for mode in br.DRY_MODES:
+            try:
+                picks = store.read_all_picks(sid, mode=mode)
+            except Exception as exc:
+                picks = []
+                _logger.warning("read_all_picks(%s, %s) failed: %s", sid, mode, exc)
+            # Tag each pick with its mode for downstream analysis convenience.
+            for p in picks:
+                p.setdefault("_mode", mode)
+            picks_by_mode[mode] = (
+                _filter_by_date(picks, start, end, "target_date")
+                or _filter_by_date(picks, start, end, "date")
+            )
+
+        executions_by_mode: dict[str, list[dict[str, Any]]] = {m: [] for m in br.DRY_MODES}
+        settlements_by_mode: dict[str, list[dict[str, Any]]] = {m: [] for m in br.DRY_MODES}
         snapshots: list[dict[str, Any]] = []
         n_days = (end - start).days + 1
         for offset in range(n_days):
             d = start + timedelta(days=offset)
-            try:
-                executions.extend(load_executions(sid, d))
-            except Exception as exc:
-                _logger.warning("load_executions(%s, %s) failed: %s", sid, d, exc)
+            for mode in br.DRY_MODES:
+                try:
+                    for e in load_executions(sid, d, mode=mode):
+                        executions_by_mode[mode].append({**e, "_date": d.isoformat(), "_mode": mode})
+                except Exception as exc:
+                    _logger.warning("load_executions(%s, %s, %s) failed: %s", sid, d, mode, exc)
+                marker = (
+                    _DATA_DIR / "executions" / f"station={sid}"
+                    / f"date={d}" / f"_settled_{mode}.json"
+                )
+                if marker.exists():
+                    try:
+                        settlements_by_mode[mode].append({
+                            "date": d.isoformat(),
+                            **json.loads(marker.read_text()),
+                        })
+                    except Exception as exc:
+                        _logger.warning("settled marker read failed (%s %s %s): %s",
+                                        sid, d, mode, exc)
             try:
                 snap = store.read_market_snapshot(sid, d)
             except Exception:
@@ -185,9 +233,10 @@ def _history_block(stations: list[str], start: date, end: date) -> dict[str, Any
                 snapshots.append(trimmed)
 
         out[sid] = {
-            "picks": picks_w,
+            "picks": picks_by_mode,
             "resolutions": resolutions_w,
-            "executions": executions,
+            "executions": executions_by_mode,
+            "settlements": settlements_by_mode,
             "market_snapshots_sample": snapshots,
         }
     return out
@@ -340,52 +389,104 @@ def _backtest_latest(stations: list[str]) -> dict[str, Any]:
     return out
 
 
+def _decorate_bucket(b: dict[str, float | int]) -> dict[str, Any]:
+    n = int(b["n"])
+    staked = float(b["staked"])
+    return {
+        "n": n,
+        "wins": int(b["wins"]),
+        "staked": staked,
+        "pnl": float(b["pnl"]),
+        "win_rate": (int(b["wins"]) / n) if n else None,
+        "roi": (float(b["pnl"]) / staked) if staked > 0 else None,
+        "mean_clv": (float(b["clv_sum"]) / int(b["clv_n"])) if int(b["clv_n"]) > 0 else None,
+        "clv_n": int(b["clv_n"]),
+    }
+
+
+def _sum_buckets(*buckets: dict) -> dict:
+    keys = ("n", "wins", "staked", "pnl", "clv_sum", "clv_n")
+    out = {k: 0 for k in keys}
+    for b in buckets:
+        for k in keys:
+            out[k] += b.get(k, 0)
+    return out
+
+
 def _performance_block(stations: list[str], days: int) -> dict[str, Any]:
-    """Decorate station_breakdown with derived ROI/win_rate/mean_clv and combined+totals."""
+    """All-modes combined per-station/totals view (back-compat with old dumps).
+
+    Pairs with `_performance_by_mode_block` below — they read the same
+    underlying data, just aggregated differently. Keep both so an analyst can
+    diff total bot performance against per-strategy attribution in one pass.
+    """
     from weather_edge.pipeline.reporting import station_breakdown
     raw = station_breakdown(stations, days)
 
-    def _decorate(b: dict[str, float | int]) -> dict[str, Any]:
-        n = int(b["n"])
-        staked = float(b["staked"])
-        return {
-            "n": n,
-            "wins": int(b["wins"]),
-            "staked": staked,
-            "pnl": float(b["pnl"]),
-            "win_rate": (int(b["wins"]) / n) if n else None,
-            "roi": (float(b["pnl"]) / staked) if staked > 0 else None,
-            "mean_clv": (float(b["clv_sum"]) / int(b["clv_n"])) if int(b["clv_n"]) > 0 else None,
-            "clv_n": int(b["clv_n"]),
-        }
-
     per_station: dict[str, Any] = {}
-    totals_live = {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0, "clv_sum": 0.0, "clv_n": 0}
-    totals_dry = {"n": 0, "wins": 0, "staked": 0.0, "pnl": 0.0, "clv_sum": 0.0, "clv_n": 0}
+    totals_live = _sum_buckets()
+    totals_dry = _sum_buckets()
     for sid, d in raw.items():
         live = d["live"]
         dry = d["dry"]
-        combined: dict[str, float | int] = {
-            k: live[k] + dry[k] for k in ("n", "wins", "staked", "pnl", "clv_sum", "clv_n")
-        }
+        combined = _sum_buckets(live, dry)
         per_station[sid] = {
-            "live": _decorate(live),
-            "dry": _decorate(dry),
-            "combined": _decorate(combined),
+            "live": _decorate_bucket(live),
+            "dry": _decorate_bucket(dry),
+            "combined": _decorate_bucket(combined),
         }
-        for k in totals_live:
-            totals_live[k] += live[k]
-            totals_dry[k] += dry[k]
+        totals_live = _sum_buckets(totals_live, live)
+        totals_dry = _sum_buckets(totals_dry, dry)
 
-    totals_combined = {k: totals_live[k] + totals_dry[k] for k in totals_live}
     return {
         "per_station": per_station,
         "totals": {
-            "live": _decorate(totals_live),
-            "dry": _decorate(totals_dry),
-            "combined": _decorate(totals_combined),
+            "live": _decorate_bucket(totals_live),
+            "dry": _decorate_bucket(totals_dry),
+            "combined": _decorate_bucket(_sum_buckets(totals_live, totals_dry)),
         },
     }
+
+
+def _performance_by_mode_block(stations: list[str], days: int) -> dict[str, Any]:
+    """Per-mode performance attribution: the heart of the three-mode comparison.
+
+    Returns {per_station: {sid: {mode: {live, dry, combined}}},
+             totals_by_mode: {mode: {live, dry, combined}}}.
+    """
+    from weather_edge.execution import bankroll as br
+    from weather_edge.pipeline.reporting import station_breakdown_by_mode
+
+    raw = station_breakdown_by_mode(stations, days)
+
+    per_station: dict[str, Any] = {}
+    totals_by_mode: dict[str, dict] = {
+        m: {"live": _sum_buckets(), "dry": _sum_buckets()} for m in br.DRY_MODES
+    }
+    for sid, modes in raw.items():
+        per_station[sid] = {}
+        for mode in br.DRY_MODES:
+            live = modes[mode]["live"]
+            dry = modes[mode]["dry"]
+            per_station[sid][mode] = {
+                "live": _decorate_bucket(live),
+                "dry": _decorate_bucket(dry),
+                "combined": _decorate_bucket(_sum_buckets(live, dry)),
+            }
+            totals_by_mode[mode]["live"] = _sum_buckets(totals_by_mode[mode]["live"], live)
+            totals_by_mode[mode]["dry"] = _sum_buckets(totals_by_mode[mode]["dry"], dry)
+
+    decorated_totals: dict[str, Any] = {}
+    for mode in br.DRY_MODES:
+        live = totals_by_mode[mode]["live"]
+        dry = totals_by_mode[mode]["dry"]
+        decorated_totals[mode] = {
+            "live": _decorate_bucket(live),
+            "dry": _decorate_bucket(dry),
+            "combined": _decorate_bucket(_sum_buckets(live, dry)),
+        }
+
+    return {"per_station": per_station, "totals_by_mode": decorated_totals}
 
 
 def build_state_dump(
@@ -417,6 +518,7 @@ def build_state_dump(
         "runtime": _runtime_block(),
         "bankroll": _bankroll_block(),
         "performance": _performance_block(stations, days),
+        "performance_by_mode": _performance_by_mode_block(stations, days),
         "history": _history_block(stations, start, end),
         "calibration": _calibration_block(stations),
         "forecast_cache_inventory": _forecast_cache_inventory(stations, start, end),
