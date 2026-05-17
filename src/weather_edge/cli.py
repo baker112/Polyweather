@@ -595,6 +595,47 @@ def init_bankroll_cmd(
     _console.print(f"  File: data/bankroll.json")
 
 
+@app.command("init-bankroll-dry")
+def init_bankroll_dry_cmd(
+    mode: Annotated[str, typer.Option("--mode", help="bma | intraday | peak")] = "bma",
+    usdc: Annotated[float, typer.Option("--usdc", help="Starting USDC amount")] = 100.0,
+    force: Annotated[bool, typer.Option("--force", help="Overwrite if file exists")] = False,
+) -> None:
+    """Initialise a per-mode dry (paper) bankroll at $usdc.
+
+    Without --force the command refuses to clobber an existing file so
+    accumulated paper P&L isn't lost by accident. Use the migration script
+    `scripts/reset_three_mode_bankrolls.py` for the one-time three-mode
+    split (it archives the old singleton first).
+    """
+    from weather_edge.execution import bankroll as br
+
+    if mode not in br.DRY_MODES:
+        _console.print(
+            f"[red]Unknown mode '{mode}'. Choose from: {', '.join(br.DRY_MODES)}[/red]"
+        )
+        raise typer.Exit(1)
+
+    path = br._dry_path(mode)
+    if path.exists() and not force:
+        _console.print(
+            f"[yellow]{path.name} already exists. Use --force to overwrite.[/yellow]"
+        )
+        raise typer.Exit(1)
+
+    b: dict = {
+        "initial_usdc": usdc,
+        "current_usdc": usdc,
+        "reserved_usdc": 0.0,
+        "total_pnl": 0.0,
+        "n_trades": 0,
+    }
+    br._save_dry(b, mode=mode)
+    _console.print(
+        f"[green]Dry bankroll '{mode}' initialised: ${usdc:.2f} → {path}[/green]"
+    )
+
+
 @app.command("setup-clob")
 def setup_clob_cmd() -> None:
     """Derive Polymarket CLOB API credentials from POLYMARKET_PK and print env vars.
